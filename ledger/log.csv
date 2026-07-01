@@ -1,0 +1,5 @@
+时间,用例ID,动作,原状态,新状态,证据,备注
+2026-07-01 11:27,CUT-CORE-01,开始执行,待执行,执行中,,按 RUNBOOK 端到端执行
+2026-07-01 11:30,CUT-CORE-01,完成执行,执行中,已完成/通过,evidence/20260701/CUT-CORE-01,裁剪→保存主路径通过；MediaStore 确认输出，PID过滤无崩溃
+2026-07-01 13:48,CUT-CORE-01,双机矩阵-Pixab,执行中,通过(9B051FFAZ002M1 Pixel4 1080x2280),evidence/20260701/CUT-CORE-01/9B051FFAZ002M1,并行跑；选择器点击；MediaStore确认输出 AudioCutter_*.mp3
+2026-07-01 13:48,CUT-CORE-01,双机矩阵-Sam,执行中,通过(R5CN308X8LZ SM-G9880 1080x2400),evidence/20260701/CUT-CORE-01/R5CN308X8LZ,并行跑；不同分辨率同套选择器；输出 AudioCutter_ins_*.mp3 00:09

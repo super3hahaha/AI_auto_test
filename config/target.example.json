@@ -1,0 +1,19 @@
+{
+  "package": "com.example.app",
+  "serial": "",
+  "db_name": "app.db",
+  "evidence_root": "evidence",
+  "date": "",
+  "sheet_id": "",
+  "doc_id": "",
+
+  "_说明": {
+    "package": "被测 App 包名，adbkit 全靠它 run-as / launch / clear",
+    "serial": "多设备时填 adb devices 里的序列号；单设备留空",
+    "db_name": "App 私有目录 databases/ 下的主 sqlite 文件名；不做 DB 断言可留空",
+    "evidence_root": "证据根目录，相对项目根",
+    "date": "留空=用今天(YYYYMMDD)；复现历史某轮时可固定",
+    "sheet_id": "Google Sheet 的 ID（URL 中 /d/ 和 /edit 之间那段）；sheets_sync 用",
+    "doc_id": "Google Doc 图文报告的 ID；可选"
+  }
+}

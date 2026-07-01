@@ -1,0 +1,8 @@
+config/target.json
+config/service_account.json
+evidence/*/
+!evidence/.gitkeep
+__pycache__/
+*.pyc
+
+.DS_Store

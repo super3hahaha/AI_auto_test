@@ -1,7 +1,0 @@
-用例ID,步骤,证据类型,文件/链接,截图预览,断言,结果,采集时间,备注
-CUT-CORE-01,01-home,截图,evidence/20260701/CUT-CORE-01/screenshots/01-home.png,首页,首页可见「音频裁剪」入口,通过,2026-07-01 11:30,入口存在
-CUT-CORE-01,03-editor,截图+UI树,evidence/20260701/CUT-CORE-01/screenshots/03-editor.png,剪辑器,波形+可拖动起止手柄；选区 起00:06.8/止00:31.0，时长00:24.2，标「已选中」,通过,2026-07-01 11:30,剪辑器状态
-CUT-CORE-01,04-saveas,截图+UI树,evidence/20260701/CUT-CORE-01/screenshots/04-saveas.png,另存为,「另存为」对话框：格式MP3(原始)、比特率128kbps、保存按钮,通过,2026-07-01 11:30,导出参数
-CUT-CORE-01,05-result,截图+UI树,evidence/20260701/CUT-CORE-01/screenshots/05-result.png,结果页,保存后显示「音频已保存」，新文件 AudioCutter_*.mp3，379.7kB｜00:24（时长=选区）,通过,2026-07-01 11:30,保存成功
-CUT-CORE-01,MediaStore,文件系统独立确认,content://media/external/audio/media,,最新音频=AudioCutter_...111425_1.mp3，size=388841B，date_added 最新,通过,2026-07-01 11:30,绕开DB的黑盒文件断言
-CUT-CORE-01,crash-scan,logcat(按PID过滤),evidence/20260701/CUT-CORE-01/logs/,,App PID=22276 的 logcat 无 FATAL/ANR/AndroidRuntime,通过,2026-07-01 11:30,"PID过滤,排除系统噪音"

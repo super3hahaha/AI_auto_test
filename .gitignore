@@ -1,8 +1,24 @@
 config/target.json
 config/service_account.json
+config/oauth_client.json
+config/oauth_token.json
 evidence/*/
 !evidence/.gitkeep
+.dumpcache/
 __pycache__/
 *.pyc
 
 .DS_Store
+
+# 真实素材（版权/不可再生）不入库；每个协作者本地自备，见 assets/README.md
+assets/*
+!assets/README.md
+
+# ledger 是本机执行产物（可由 cases/*.yaml 重新汇编 + 团队看板是 Google Sheet 才是共享真值）
+# 多人各自本机跑测试会互相冲突，一律不进 git
+ledger/*
+!ledger/.gitkeep
+
+# 仓库定位是通用框架：只留 CUT-CORE-01.yaml + flow_cut_save.sh 一组最小示例。
+# regression.yaml 是完整的 MP3 Cutter 回归用例集，业务内容太重，不进库（本机留着自用）。
+cases/regression.yaml

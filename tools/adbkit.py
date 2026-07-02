@@ -15,11 +15,12 @@
     python3 tools/adbkit.py --case RG-NU-01 logscan onboarding
     python3 tools/adbkit.py seed seeds/three-cycles.sql
 """
-import argparse, json, os, subprocess, sys, shlex, datetime, pathlib, re, time
+import argparse, json, os, shutil, subprocess, sys, shlex, datetime, pathlib, re, time
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CFG_PATHS = [ROOT / "config/target.json", ROOT / "config/target.example.json"]
+CACHE_ROOT = ROOT / ".dumpcache"
 
 
 def load_cfg():
@@ -31,13 +32,27 @@ def load_cfg():
 
 CFG = load_cfg()
 PKG = CFG["package"]
+MAIN_ACTIVITY = CFG.get("main_activity", "")
 DB = CFG.get("db_name", "")
 SERIAL = CFG.get("serial", "")
 EVID_ROOT = ROOT / CFG.get("evidence_root", "evidence")
+APP = CFG.get("app_name") or PKG.split(".")[-1]
+_VER = None
 
 
 def today():
     return CFG.get("date") or datetime.date.today().strftime("%Y%m%d")
+
+
+def app_version():
+    """版本号：优先 config.app_version；否则查设备一次并缓存。"""
+    global _VER
+    if CFG.get("app_version"):
+        return CFG["app_version"]
+    if _VER is None:
+        m = re.search(r"versionName=(\S+)", shell(f"dumpsys package {PKG}").stdout or "")
+        _VER = m.group(1) if m else "unknown"
+    return _VER
 
 
 def adb(*args, capture=False, stdout_file=None):
@@ -55,7 +70,8 @@ def shell(remote, capture=True):
 
 
 def evid_dir(case, sub):
-    d = EVID_ROOT / today() / case / sub
+    # 证据按 应用/版本/日期/用例 归档（版本为主轴，日期是同版本下的轮次）
+    d = EVID_ROOT / _safe(APP) / _safe(app_version()) / today() / case / sub
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -73,7 +89,11 @@ def cmd_devices(args):
 
 
 def cmd_launch(args):
-    print(shell(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1").stdout)
+    # 优先 am start 显式启动页（比 monkey 可靠）；无 main_activity 时回退 monkey
+    if MAIN_ACTIVITY:
+        print(shell(f"am start -n {PKG}/{MAIN_ACTIVITY}").stdout)
+    else:
+        print(shell(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1").stdout)
 
 
 def cmd_reset(args):
@@ -82,12 +102,17 @@ def cmd_reset(args):
 
 
 def cmd_ui(args):
-    """uiautomator dump → 拉 XML 到证据目录。这是大脑"看屏"的主要依据。"""
+    """uiautomator dump → 拉 XML 到证据目录。这是大脑"看屏"的主要依据。
+    默认顺手把这次 dump 也存进 .dumpcache/<step>（screen_id 默认取 step 名，--cache 可换个名字）——
+    主循环探路阶段的每次 dump 因此自动预热缓存，以后这条路径固化成脚本时可直接 --from-cache 复用，
+    不用固化那天再冷启动一次。"""
     case = need_case(args)
     step = args.name
     shell("uiautomator dump /sdcard/uidump.xml")
     out = evid_dir(case, "ui") / f"{step}.xml"
     adb("pull", "/sdcard/uidump.xml", str(out))
+    if out.exists():
+        shutil.copyfile(out, _cache_path(args.cache_screen or step))
     # 同时打印到 stdout，方便大脑直接读控件树
     print(out.read_text(errors="replace") if out.exists() else "[ui] dump 失败")
     print(f"\n[ui] 已保存 {out}", file=sys.stderr)
@@ -124,9 +149,19 @@ def _scratch(name):
     return f"/tmp/adbkit-{_safe(SERIAL)}-{name}"
 
 
-def _dump_tree():
+def _cache_path(screen_id):
+    """dump 复用缓存路径，按 应用/版本/设备 分槽，同槽同屏（见 decisions.md #9）。
+    只要还是同一 App 版本 + 同一设备，缓存就可信——可以是同一次运行内紧邻的下一条命令用，
+    也可以是今天探路种下、以后固化脚本再读；换版本/换设备会落到不同目录，天然不会读串。"""
+    d = CACHE_ROOT / _safe(APP) / _safe(app_version()) / _safe(SERIAL)
+    d.mkdir(parents=True, exist_ok=True)
+    return d / f"{_safe(screen_id)}.xml"
+
+
+def _dump_tree(cache_screen=None):
     """dump 当前界面 UI 树并解析为节点列表（不落证据目录，纯用于定位）。
-    临时文件按 serial 隔离，支持多设备并行。"""
+    临时文件按 serial 隔离，支持多设备并行。cache_screen 给定时，顺手把这次 dump
+    存进 .dumpcache/<screen_id>，供紧接着的下一条命令 --from-cache 复用，省一次重复 dump。"""
     dev = f"/sdcard/_sel_{_safe(SERIAL)}.xml"
     tmp = _scratch("sel.xml")
     if os.path.exists(tmp):
@@ -135,6 +170,8 @@ def _dump_tree():
     adb("pull", dev, tmp)
     if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
         sys.exit(f"[dump] 拉取 UI 树失败（serial={SERIAL or '默认'}）。设备在线吗？先 `adb devices` 确认。")
+    if cache_screen:
+        shutil.copyfile(tmp, _cache_path(cache_screen))
     try:
         return _nodes_from(tmp)
     except ET.ParseError:
@@ -161,15 +198,25 @@ def _match_nodes(nodes, attr, value, partial):
     return hits
 
 
-def _find(by, value, index=0, partial=False, from_xml=None, timeout=0.0, interval=0.5):
+def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cache=None,
+          timeout=0.0, interval=0.5):
     """by ∈ {id,text,desc}。返回 (全部匹配, 第 index 个) 的中心坐标。
     - from_xml：从已有 dump 定位（省去重新 dump，同屏多次点击复用）。
+    - from_cache：screen_id，命中 .dumpcache 则等价 from_xml（免 dump）；未命中则照常活 dump，
+      并把这次结果顺手写进该缓存槽（下次/下一条命令再用就能命中）。
+    - cache：screen_id，活 dump 时顺手把这次结果写进该缓存槽（不影响本次是否复用旧缓存）。
     - timeout>0：找不到时轮询等待（每 interval 秒重新 dump），治"界面还没加载完"这类瞬时失败。
-      from_xml 是静态文件，不轮询。"""
+      from_xml/命中的 from_cache 是静态文件，不轮询。"""
     attr = {"id": "resource-id", "text": "text", "desc": "content-desc"}[by]
+    if from_cache and not from_xml:
+        cp = _cache_path(from_cache)
+        if cp.exists():
+            from_xml = str(cp)
+        else:
+            cache = cache or from_cache
     start = time.monotonic()
     while True:
-        nodes = _nodes_from(from_xml) if from_xml else _dump_tree()
+        nodes = _nodes_from(from_xml) if from_xml else _dump_tree(cache_screen=cache)
         hits = _match_nodes(nodes, attr, value, partial)
         if hits:
             break
@@ -185,14 +232,16 @@ def _find(by, value, index=0, partial=False, from_xml=None, timeout=0.0, interva
 
 def cmd_find(args):
     """只定位、不点击：打印匹配到的元素中心坐标，供调试。"""
-    hits, _ = _find(args.by, args.value, 0, args.partial, args.from_xml)
+    hits, _ = _find(args.by, args.value, partial=args.partial, from_xml=args.from_xml,
+                     from_cache=args.from_cache)
     for i, (c, v, b) in enumerate(hits):
         print(f"  [{i}] {args.by}={v}  center={c}  bounds={b}")
 
 
 def _tap_selector(by, args):
-    hits, (center, v, b) = _find(by, args.value, args.index, args.partial,
-                                 args.from_xml, args.timeout, args.interval)
+    hits, (center, v, b) = _find(by, args.value, index=args.index, partial=args.partial,
+                                 from_xml=args.from_xml, from_cache=args.from_cache,
+                                 timeout=args.timeout, interval=args.interval)
     if len(hits) > 1:
         print(f"[warn] {by}={args.value!r} 有 {len(hits)} 个匹配，点第 {args.index} 个 ({v})", file=sys.stderr)
     shell(f"input tap {center[0]} {center[1]}")
@@ -200,10 +249,23 @@ def _tap_selector(by, args):
 
 
 def cmd_waitfor(args):
-    """轮询等待某元素出现（治瞬时/加载慢）。找到=exit0，超时=exit非0，供大脑判断是否重试或记失败。"""
-    _, (center, v, b) = _find(args.by, args.value, 0, args.partial,
-                              None, max(args.timeout, 0.5), args.interval)
+    """轮询等待某元素出现（治瞬时/加载慢）。找到=exit0，超时=exit非0，供大脑判断是否重试或记失败。
+    --cache 给定时，命中那一刻的 dump 顺手存进 .dumpcache，供紧接着的 tapid/taptext --from-cache 复用。"""
+    _, (center, v, b) = _find(args.by, args.value, partial=args.partial, cache=args.cache_screen,
+                              timeout=max(args.timeout, 0.5), interval=args.interval)
     print(f"[waitfor] 出现 {args.by}={v} @ {center}")
+
+
+def cmd_dismiss(args):
+    """若某弹窗标志元素(如评分框 lib_rate_button)在屏，点弹窗外(默认顶部)关闭它。
+    用于开跑前清掉间歇弹出的评分/提示框，避免打断流程。"""
+    attr = {"id": "resource-id", "text": "text", "desc": "content-desc"}[args.by]
+    hits = _match_nodes(_dump_tree(), attr, args.value, True)
+    if hits:
+        shell(f"input tap {args.x} {args.y}")
+        print(f"[dismiss] 检测到 {args.by}={args.value}，已点外部({args.x},{args.y})关闭")
+    else:
+        print(f"[dismiss] 无 {args.by}={args.value}，跳过")
 
 
 def cmd_tapid(args):
@@ -318,8 +380,9 @@ def cmd_logscan(args):
 
 def cmd_output_check(args):
     """查 MediaStore 里最新的音频文件，独立验证"输出确实生成"（非 debug 包读不了 DB 时的黑盒断言）。
-    --expect <子串>：断言最新文件名含该串，不含则 exit 非0。"""
-    proj = "_display_name:_size:duration:date_added"
+    --expect <子串>：断言最新文件名含该串，不含则 exit 非0。
+    带 _data（设备端真实文件路径），方便证据里直接给出可在设备上核对的绝对路径，不只是 MediaStore 元数据。"""
+    proj = "_display_name:_size:duration:date_added:_data"
     uri = "content://media/external/audio/media"
     r = shell(f'content query --uri {uri} --projection {proj} --sort "date_added DESC"')
     rows = [l.strip() for l in (r.stdout or "").splitlines() if l.strip().startswith("Row:")]
@@ -335,6 +398,22 @@ def cmd_output_check(args):
         if args.expect not in newest:
             sys.exit(f"[output-check] ✗ 最新音频不含 {args.expect!r}：{newest[:140]}")
         print(f"[output-check] ✓ 最新音频含 {args.expect!r}")
+
+
+def cmd_privls(args):
+    """列出 App 私有存储（内部 files/ 经 run-as + 外部 app 专属目录）。
+    用于验证"下载/输出落在私有目录而非 MediaStore"的场景：下载前后各跑一次，diff 出新文件。"""
+    sub = args.path
+    internal = shell(f"run-as {PKG} ls -Rl {sub}").stdout
+    ext_path = f"/sdcard/Android/data/{PKG}"
+    external = shell(f"ls -Rl {ext_path}").stdout
+    out = (f"== 内部私有 (run-as {sub}) ==\n{internal}\n"
+           f"== 外部 app 目录 ({ext_path}) ==\n{external}")
+    print(out)
+    if args.case:
+        d = evid_dir(args.case, "private")
+        (d / f"{args.label}.txt").write_text(out)
+        print(f"[privls] 已存 {d / (args.label + '.txt')}", file=sys.stderr)
 
 
 def cmd_alarm(args):
@@ -357,7 +436,10 @@ def build_parser():
     sub.add_parser("launch").set_defaults(fn=cmd_launch)
     sub.add_parser("reset").set_defaults(fn=cmd_reset)
 
-    s = sub.add_parser("ui"); s.add_argument("name"); s.set_defaults(fn=cmd_ui)
+    s = sub.add_parser("ui"); s.add_argument("name")
+    s.add_argument("--cache", dest="cache_screen", default=None,
+                   help="缓存槽名，默认用 <name>（不传就自动按 step 名存进 .dumpcache，供固化脚本 --from-cache 复用）")
+    s.set_defaults(fn=cmd_ui)
     s = sub.add_parser("shot"); s.add_argument("name"); s.set_defaults(fn=cmd_shot)
     s = sub.add_parser("tap"); s.add_argument("x"); s.add_argument("y"); s.set_defaults(fn=cmd_tap)
     # 按选择器点击：坐标从当前设备 UI 树现算，天然跨分辨率
@@ -367,6 +449,8 @@ def build_parser():
         s.add_argument("--index", type=int, default=0, help="多个匹配时点第几个(默认0)")
         s.add_argument("--partial", action="store_true", help="子串匹配而非精确")
         s.add_argument("--from", dest="from_xml", default=None, help="从已有 UI dump(xml) 定位，省去重新 dump")
+        s.add_argument("--from-cache", dest="from_cache", default=None,
+                       help="按 screen_id 查 .dumpcache；命中则免 dump，未命中则活 dump 并顺手写入该缓存槽")
         s.add_argument("--timeout", type=float, default=0.0, help="找不到时轮询等待秒数(默认0=单次)")
         s.add_argument("--interval", type=float, default=0.5, help="轮询间隔秒(默认0.5)")
         s.set_defaults(fn=fn)
@@ -375,14 +459,23 @@ def build_parser():
     s.add_argument("value")
     s.add_argument("--partial", action="store_true")
     s.add_argument("--from", dest="from_xml", default=None, help="从已有 UI dump(xml) 定位")
+    s.add_argument("--from-cache", dest="from_cache", default=None, help="按 screen_id 查 .dumpcache 定位")
     s.set_defaults(fn=cmd_find)
     s = sub.add_parser("waitfor")
     s.add_argument("by", choices=["id", "text", "desc"])
     s.add_argument("value")
     s.add_argument("--partial", action="store_true")
+    s.add_argument("--cache", dest="cache_screen", default=None,
+                   help="命中后把这次 dump 存进 .dumpcache/<screen_id>，供紧接着的 tapid/taptext --from-cache 复用")
     s.add_argument("--timeout", type=float, default=8.0, help="最长等待秒(默认8)")
     s.add_argument("--interval", type=float, default=0.5)
     s.set_defaults(fn=cmd_waitfor)
+    s = sub.add_parser("dismiss")
+    s.add_argument("value", help="弹窗标志元素(默认按 id 子串匹配)")
+    s.add_argument("--by", choices=["id", "text", "desc"], default="id")
+    s.add_argument("--x", type=int, default=540)
+    s.add_argument("--y", type=int, default=240)
+    s.set_defaults(fn=cmd_dismiss)
     s = sub.add_parser("text"); s.add_argument("value"); s.set_defaults(fn=cmd_text)
     s = sub.add_parser("key"); s.add_argument("code"); s.set_defaults(fn=cmd_key)
     s = sub.add_parser("swipe")
@@ -393,6 +486,10 @@ def build_parser():
     s = sub.add_parser("sql"); s.add_argument("query"); s.set_defaults(fn=cmd_sql)
     s = sub.add_parser("seed"); s.add_argument("file"); s.set_defaults(fn=cmd_seed)
     s = sub.add_parser("sp"); s.add_argument("label"); s.set_defaults(fn=cmd_sp)
+    s = sub.add_parser("privls")
+    s.add_argument("path", nargs="?", default="files", help="内部私有子路径(默认 files)")
+    s.add_argument("--label", default="privls", help="存证文件名(配合 --case)")
+    s.set_defaults(fn=cmd_privls)
     s = sub.add_parser("logscan"); s.add_argument("label"); s.set_defaults(fn=cmd_logscan)
     s = sub.add_parser("output-check")
     s.add_argument("--expect", help="断言最新音频文件名含此子串")

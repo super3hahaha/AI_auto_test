@@ -22,3 +22,4 @@
   notes: >
     非 debug 包，仅做黑盒断言（UI 文案 + 输出列表 + 崩溃扫描），不导 DB/SP。
     保存成功提示的确切文案、输出文件命名（形如 AudioCutter_*.mp3）待执行时确认。
+  frozen_script: flows/flow_cut_save.sh

@@ -6,6 +6,9 @@
   "date": "",
   "sheet_id": "",
   "doc_id": "",
+  "image_folder_id": "",
+  "board_title": "",
+  "report_title": "",
 
   "_说明": {
     "package": "被测 App 包名，adbkit 全靠它 run-as / launch / clear",
@@ -14,6 +17,9 @@
     "evidence_root": "证据根目录，相对项目根",
     "date": "留空=用今天(YYYYMMDD)；复现历史某轮时可固定",
     "sheet_id": "Google Sheet 的 ID（URL 中 /d/ 和 /edit 之间那段）；sheets_sync 用",
-    "doc_id": "Google Doc 图文报告的 ID；可选"
+    "doc_id": "Google Doc 图文报告的 ID；doc_report 首次运行会自动新建并回填，无需手填",
+    "image_folder_id": "证据截图上传到的 Drive 文件夹 ID；doc_report 自动创建并回填",
+    "board_title": "看板表标题前缀，留空默认「AI+ADB 自动化测试执行看板」；new_run.py 建表用",
+    "report_title": "Doc 图文报告标题前缀，留空默认「AI+ADB 自动化测试 · 执行报告」；doc_report.py 建 Doc 用"
   }
 }

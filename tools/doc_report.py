@@ -266,15 +266,32 @@ def upload_png(drive, folder_id, local_path, drive_name, cache):
 
 
 # ============================ 组装报告内容 ============================
-def case_key_evidence(cid, evidence_rows):
+def case_key_evidence(cid, evidence_rows, current_link="", queue_shot=""):
     """挑这条用例"截图预览"列里标了「关键」的证据行，不分证据类型——截图只是其中一种，
     MediaStore/logs/db/sp 这类文本证据只要能直接支撑判定结论，一样算关键（见 decisions.md #12）。
     列名沿用"截图预览"不改，但标注含义已经扩展成通用的"进不进 Doc 报告"。
+
+    `evidence.csv` 是按时间追加的历史流水，一条用例被重跑多次会积累多轮证据行——只按用例ID筛
+    会把历史轮次（换版本/换设备/中间调试出的旧截图）也一起选中，报告里同一条用例出现好几张
+    内容重复甚至互相矛盾的"关键截图"（2026-07-02 踩过：CUT-CORE-01 跑了 7 轮，report 里一次性
+    塞进 5 张 05-result.png）。`current_link` 传 `queue.csv` 该用例当前的"证据链接"（本轮证据目录
+    前缀），按前缀过滤只保留当前这一轮的证据，历史轮次自然被排除在外，不用额外清理 evidence.csv。
+
+    `queue_shot` 传 `queue.csv` 该用例的"关键截图"列（`case_result.py --shot` 写入的那张，
+    Sheet 的"测试队列" tab 直接展示的就是它）——始终排第一张，保证 Doc 和 Sheet 看到的"头图"
+    是同一张，不会出现 Sheet 显示 A、Doc 显示 B 这种两处"关键"各说各话的情况（2026-07-02 用户
+    提出）。`evidence.csv` 里额外标"关键"的截图（比如问题现场+确认截图的 before/after 对比）
+    仍然会跟在后面一起展示，不是排他关系，只是加个保证第一张对齐 Sheet 的锚点。
+
     返回 (关键截图路径列表, 关键文本证据行列表)。"""
     key_rows = [r for r in evidence_rows
-                if r.get("用例ID") == cid and "关键" in (r.get("截图预览") or "")]
+                if r.get("用例ID") == cid and "关键" in (r.get("截图预览") or "")
+                and (not current_link or r.get("文件/链接", "").startswith(current_link))]
     pics = [str(ROOT / r["文件/链接"]) for r in key_rows
             if r.get("文件/链接", "").endswith(".png") and (ROOT / r["文件/链接"]).exists()]
+    if queue_shot and (ROOT / queue_shot).exists():
+        shot_path = str(ROOT / queue_shot)
+        pics = [shot_path] + [p for p in pics if p != shot_path]
     texts = [r for r in key_rows if not r.get("文件/链接", "").endswith(".png")]
     return pics, texts
 
@@ -297,7 +314,6 @@ def build_report(b, drive, folder_id, want_images):
     queue = read_csv("queue")
     structure = read_csv("structure")
     issues = read_csv("issues")
-    logs = read_csv("log")
     evidence = read_csv("evidence")
     cfg = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -399,7 +415,7 @@ def build_report(b, drive, folder_id, want_images):
         cid = r.get("用例ID", "")
         b.heading(f"{cid} · {r.get('模块','')}", 3)
         b.para([("证据目录：", {"color": GREY}), (r.get("证据链接", ""), {"color": GREY})])
-        pics, key_texts = case_key_evidence(cid, evidence)
+        pics, key_texts = case_key_evidence(cid, evidence, r.get("证据链接", ""), r.get("关键截图", ""))
         if not pics and not key_texts:
             pics = case_screenshots_fallback(r.get("证据链接", ""))  # 该用例还没按新规标注，退回旧逻辑
         if want_images:
@@ -419,18 +435,6 @@ def build_report(b, drive, folder_id, want_images):
                 b.para([("　证据文件：", {"color": GREY}), (t["文件/链接"], {"color": GREY, "italic": True})])
         b.newline()
 
-    # ---- 状态变更时间线 ----
-    b.heading("⑥ 状态变更时间线（log.csv）", 2)
-    for r in logs[-20:]:
-        b.bullet([
-            (f"{r.get('时间','')}  ", {"color": GREY}),
-            (f"[{r.get('用例ID','')}] {r.get('动作','')}", {"bold": True}),
-            (f"　{r.get('原状态','')} → {r.get('新状态','')}", {"color": BLUE}),
-        ])
-        if r.get("备注"):
-            b.para([("　" + r["备注"], {"color": GREY, "italic": True})])
-
-    b.newline()
     b.para([("本报告由 tools/doc_report.py 自动生成，覆盖式刷新——请勿在 Doc 内手改（会被下次覆盖）。"
              "用例增删改走「对话 → cases/*.yaml → compile_cases.py」。", {"color": GREY, "italic": True})])
 

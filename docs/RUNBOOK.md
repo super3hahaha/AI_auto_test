@@ -30,7 +30,7 @@
 | 导 DB（前后 diff） | `... --case <ID> db <label>` |
 | 导 shared_prefs | `... --case <ID> sp <label>` |
 | 崩溃扫描（按 App PID 过滤，排系统噪音） | `... --case <ID> logscan <label>` |
-| 输出文件校验（查 MediaStore，非 debug 也能验） | `... [--case <ID>] output-check --expect <名字子串>` |
+| 输出文件校验（查 MediaStore，非 debug 也能验，`--expect` 命中后自动带 `_size>0`/`duration` 非空的完整性检查） | `... [--case <ID>] output-check --expect <名字子串>` |
 | 提醒/alarm 态 | `... --case <ID> alarm <label>` |
 | 重置 App / 启动 | `... reset` / `... launch` |
 
@@ -62,11 +62,12 @@
 1. **选用例**：从 `ledger/queue.csv` 找第一个 `当前状态=待执行` 且优先级最高（P0>P1>P2>P3）的行。
 2. **挂号（开工）**：往 `ledger/log.csv` 追加一行 `动作=开始执行, 原状态=待执行, 新状态=执行中`；把 queue 该行 `当前状态` 改成 `执行中`、填 `开始时间`。
 3. **判断走脚本还是主循环**：看该行 `固化脚本` 列——非空（如 `flows/flow_cut_save.sh`）就直接跑这个脚本（无 AI 逐屏推理，快）；为空就走下面 4-5 步主循环。这一列由 `cases/*.yaml` 里的 `frozen_script` 字段编译而来，别手改 queue 里的这一格，改就去改 YAML 再 `compile_cases.py`。脚本跑挂了（选择器找不到）说明 UI 变了，回退主循环重探，然后把新脚本路径更新回 YAML（见 `flow-freeze.md`）。
+   > **硬规则：跑固化脚本一律用 `python3 tools/run_flow.py <用例ID> <脚本路径> [serial]`，永远不要直接 `bash flows/xxx.sh`**——包括"顺手冒烟检查"这类看起来不算正式执行的场合。直接 `bash` 跑完全裸跑，不会往 `log.csv`/`queue.csv` 写任何东西，事后极难想起来补登记（2026-07-02 踩过：图省事直接 `bash` 跑了一次冒烟，跑完当成"检查过了"就往下走，账本和看板上完全没留痕，用户事后追问才发现）。`run_flow.py` 自动计时、自动写开始/完成时间戳到 `log.csv`、回填 `queue.csv`，判定仍需人工看 `output-check`/`logscan` 后补一行"判定确认"（见下方结果分档）。
 4. **造前置态**（如需）：写 `seeds/<用例>.sql` → `adbkit seed`。构造精确初始状态，别靠手点一路走过去。
 5. **驱动 + 采集**（`固化脚本` 为空时才走这步）：**每到一个界面 `ui <step>` dump 一次**（既为决策也为存证）→ **用 `tapid`/`taptext`/`tapdesc --from <刚才的 ui xml>` 按选择器点击**（坐标由工具从 bounds 现算，天然跨分辨率；`--from` 复用同一份 dump，同屏多次点击不重复 dump——dump ≈ 2s 是最贵动作，tap ≈ 0.04s）。**不要手敲坐标、不要把坐标写进用例**；没有 id/text/desc 才用裸 `tap X Y` 兜底。界面变化后再 dump 下一屏。`text`/`key`/`swipe` 补充操作；关键节点 `shot`、`logscan`（非 debug 包无 `db`/`sp`）。每采一份证据，追加一行到 `ledger/evidence.csv`（含"断言"和"结果"）。
    > `ui <step>` 默认会把这次 dump 顺手存进 `.dumpcache/<app>/<version>/<serial>/<step>.xml`（不用额外传参）。这条路径以后固化成 `flows/flow_*.sh` 时，脚本里同名 `--from-cache <step>` 能直接命中探索阶段就有的缓存，不用固化那天重新预热——写脚本时优先复用探索阶段的 `step` 名字当 screen_id。
 
-   **"文件/链接"列必须是可点开定位到证据实体的具体文件路径**（`screenshots/xxx.png` / `logs/xxx.txt` / `ui/xxx.xml`），**不能写证据目录、不能写裸 `content://` URI**。MediaStore 类断言（如"文件系统独立确认新文件已生成"）必须先跑 `adbkit.py --case <ID> output-check --expect <名字子串>` 把查询结果落到 `logs/output-check.txt`，再把这份文件路径填进证据行——不要直接把 `content query` 的输出文字抄进备注了事。`output-check` 的查询字段带 `_data`（设备端真实绝对路径，如 `/storage/emulated/0/Music/...`），写"断言"文案时顺手把这个路径也带上，方便不开文件就知道产物具体落在设备哪里。用 `case_result.py --evi` 时每行都带上文件路径字段（`步骤|类型|文件路径|断言|结果`），漏填会被自动标记"证据文件缺失"。
+   **"文件/链接"列必须是可点开定位到证据实体的具体文件路径**（`screenshots/xxx.png` / `logs/xxx.txt` / `ui/xxx.xml`），**不能写证据目录、不能写裸 `content://` URI**。MediaStore 类断言（如"文件系统独立确认新文件已生成"）必须先跑 `adbkit.py --case <ID> output-check --expect <名字子串>` 把查询结果落到 `logs/output-check.txt`，再把这份文件路径填进证据行——不要直接把 `content query` 的输出文字抄进备注了事。**只要按这条规则老老实实带 `--expect` 跑，`_size>0`/`duration` 非空的完整性检查会自动生效，不用额外再操心"这条用例要不要顺手查一下大小"——凡是产物类用例都天然覆盖到，见 `docs/decisions.md` #15。**`output-check` 的查询字段带 `_data`（设备端真实绝对路径，如 `/storage/emulated/0/Music/...`），写"断言"文案时顺手把这个路径也带上，方便不开文件就知道产物具体落在设备哪里。用 `case_result.py --evi` 时每行都带上文件路径字段和"关键/过程留痕"标注（`步骤|类型|文件路径|断言|结果|关键标记`，6 段），漏填文件路径会被自动标记"证据文件缺失"，漏填关键标记会打印警告且这行截图预览留空（doc_report.py 兜底逻辑生效，不保证选中——2026-07-02 踩过一次：把"关键，供报告用"误写进了第 5 段"结果"而不是第 6 段，导致 CUT-EDGE-01 的关键截图完全没生效，Doc 报告退回目录里按文件名排序的前几张，选中了一张探路时的中间态截图，已修复 `case_result.py` 让第 6 段真正落进"截图预览"列）。
 
    **每屏都存证，但不是每行都进 Doc 报告**——`ledger/evidence.csv` 的"截图预览"列不只管截图，**每一行证据（不限 `证据类型`：screenshots/MediaStore/logs/db/sp 都算）**都要标注是不是"关键"（决定 `doc_report.py` 会不会把它写进图文报告，见 `decisions.md` #12），自己判断，标准：**直接支撑通过/失败结论的**（结果页截图、报错/异常现场、MediaStore 确认新文件生成、DB/SP diff 证明数据正确、before-after 对比）→ 写"关键，供报告用"；**纯过程留痕/辅助信息的**（中间导航截图、无异常的确认弹窗）→ 写"过程留痕，仅本地"。截图类关键会插图，其余类型关键会把"断言"文字摘录进 Doc 正文。别图省事全标关键，也别漏标——不标等于按旧逻辑兜底（`doc_report.py` 找不到任何关键行时会退回目录里前 6 张截图，文本类证据则完全不会出现在 Doc 里）。
 6. **判定**：见下方结果分档。多源交叉：UI + DB + SP + 系统态（+ 有源码时读源码）。

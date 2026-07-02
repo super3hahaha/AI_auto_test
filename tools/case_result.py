@@ -2,10 +2,14 @@
 """case_result —— 一条用例收工回写（队列 + 状态日志 + 证据链）。
 
 用法：
-  python3 tools/case_result.py <用例ID> <结果> <证据目录> "<一句话结论>" [--evi "步骤|类型|文件路径|断言|结果" ...]
+  python3 tools/case_result.py <用例ID> <结果> <证据目录> "<一句话结论>" [--evi "步骤|类型|文件路径|断言|结果|关键标记" ...]
 结果 ∈ 通过/失败/阻塞/覆盖缺口/需复核。
 每条 --evi 必须自带"文件路径"字段，指向具体文件（screenshots/xxx.png、logs/xxx.txt、ui/xxx.xml），
 不能留空或写目录——否则人工核查时无法定位到证据实体。找不到具体文件就写"证据文件缺失"，别拿证据目录充数。
+第 6 段"关键标记"写进 evidence.csv 的"截图预览"列，决定这行证据进不进 doc_report.py 的图文报告
+（见 decisions.md #12）：直接支撑通过/失败结论的写"关键，供报告用"；纯过程留痕/辅助信息写
+"过程留痕，仅本地"。省略这段会留空，doc_report.py 找不到任何关键行时会兜底退回目录里前 6 张
+截图（按文件名排序，不代表判定价值），所以每条证据都应该显式标注，别漏填。
 不含 compile/sync —— 收工后另跑 compile_cases.py + sheets_sync.py。
 """
 import csv, json, subprocess, sys, argparse, datetime, pathlib
@@ -52,7 +56,8 @@ def main():
     ap.add_argument("evidence"); ap.add_argument("note")
     ap.add_argument("--shot", default="", help="关键截图路径")
     ap.add_argument("--issue", default="", help="问题ID")
-    ap.add_argument("--evi", action="append", default=[], help="证据行: 步骤|类型|文件路径|断言|结果")
+    ap.add_argument("--evi", action="append", default=[],
+                    help="证据行: 步骤|类型|文件路径|断言|结果|关键标记（关键标记：关键，供报告用 / 过程留痕，仅本地）")
     ap.add_argument("--coverage", default=None,
                     help="覆盖「历史覆盖情况」文案；不传则现查设备版本+debuggable 自动生成")
     a = ap.parse_args()
@@ -80,13 +85,16 @@ def main():
         w = csv.writer(f)
         for e in a.evi:
             parts = e.split("|")
-            while len(parts) < 5:
+            while len(parts) < 6:
                 parts.append("")
-            step, typ, file_path, assertion, res = parts[:5]
+            step, typ, file_path, assertion, res, key_flag = parts[:6]
             if not file_path:
                 print(f"[case_result] 警告：证据行 {step!r} 未指定具体文件路径，将记为“证据文件缺失”")
                 file_path = "证据文件缺失"
-            w.writerow([a.case, step, typ, file_path, "", assertion, res, now, ""])
+            if not key_flag:
+                print(f"[case_result] 警告：证据行 {step!r} 未标注「关键/过程留痕」，截图预览列留空"
+                      f"（doc_report.py 会按旧逻辑兜底，不保证选中这张）")
+            w.writerow([a.case, step, typ, file_path, key_flag, assertion, res, now, ""])
     print(f"[case_result] {a.case} → 已完成/{a.result}（证据{len(a.evi)}条）")
 
 

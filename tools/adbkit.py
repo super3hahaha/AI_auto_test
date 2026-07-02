@@ -378,10 +378,19 @@ def cmd_logscan(args):
         print("\n".join(hits[:20]))
 
 
+def _field(row, name):
+    """从 `content query` 输出的一行里取字段值（如 `_size=0`），取不到返回 None。"""
+    m = re.search(rf"\b{re.escape(name)}=([^,]*)", row)
+    return m.group(1).strip() if m else None
+
+
 def cmd_output_check(args):
     """查 MediaStore 里最新的音频文件，独立验证"输出确实生成"（非 debug 包读不了 DB 时的黑盒断言）。
     --expect <子串>：断言最新文件名含该串，不含则 exit 非0。
-    带 _data（设备端真实文件路径），方便证据里直接给出可在设备上核对的绝对路径，不只是 MediaStore 元数据。"""
+    带 _data（设备端真实文件路径），方便证据里直接给出可在设备上核对的绝对路径，不只是 MediaStore 元数据。
+    --expect 命中后默认还会做一层完整性检查（_size>0 且 duration 非空/非0）——只看文件名存在
+    抓不住"文件生成了但是空壳/损坏"这类静默失败（BUG-CUT-EDGE-01 就是这样：文件名、日期都正常，
+    _size=0/duration=NULL）。确实需要断言"应该是空文件"的场景用 --allow-empty 跳过这层检查。"""
     proj = "_display_name:_size:duration:date_added:_data"
     uri = "content://media/external/audio/media"
     r = shell(f'content query --uri {uri} --projection {proj} --sort "date_added DESC"')
@@ -398,6 +407,16 @@ def cmd_output_check(args):
         if args.expect not in newest:
             sys.exit(f"[output-check] ✗ 最新音频不含 {args.expect!r}：{newest[:140]}")
         print(f"[output-check] ✓ 最新音频含 {args.expect!r}")
+        if not args.allow_empty:
+            size_s, dur_s = _field(newest, "_size"), _field(newest, "duration")
+            size = int(size_s) if size_s and size_s.lstrip("-").isdigit() else 0
+            dur_ok = dur_s not in (None, "NULL", "0")
+            problems = [f"_size={size_s}"] if size <= 0 else []
+            if not dur_ok:
+                problems.append(f"duration={dur_s}")
+            if problems:
+                sys.exit(f"[output-check] ✗ 文件存在但疑似空壳/损坏（{', '.join(problems)}）：{newest[:140]}")
+            print(f"[output-check] ✓ 完整性检查通过（_size={size_s}, duration={dur_s}）")
 
 
 def cmd_privls(args):
@@ -494,6 +513,8 @@ def build_parser():
     s = sub.add_parser("output-check")
     s.add_argument("--expect", help="断言最新音频文件名含此子串")
     s.add_argument("--n", type=int, default=3, help="列出最近 N 个(默认3)")
+    s.add_argument("--allow-empty", action="store_true",
+                    help="跳过 _size>0/duration 非空的完整性检查（仅用于明确预期空/异常输出的场景）")
     s.set_defaults(fn=cmd_output_check)
     s = sub.add_parser("alarm"); s.add_argument("label"); s.set_defaults(fn=cmd_alarm)
     return p

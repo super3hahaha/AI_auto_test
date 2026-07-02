@@ -43,6 +43,22 @@ python3 tools/sheets_sync.py
 
 > fresh clone（新机器/新协作者）注意：`ledger/`、`assets/`（除 README）、`config/target.json` 等凭证文件都不进 git，是每人本机自备/生成的。`bash seeds/gen_assets.sh` 补生成类素材 → 自备 `real_tagged.ogg` 与真实歌曲（见 `assets/README.md`）→ `bash seeds/push_media.sh <serial>` 推到设备 → `python3 tools/preflight.py` 自检就位。
 
+## 用例 ID 命名规则
+
+`cases/*.yaml` 里每条用例的 `id` 字段遵循 **`模块前缀-子类别-序号`** 三段式（见 `cases/_TEMPLATE.yaml`），换被测 App 时也照这个模式起名：
+
+- **模块前缀**：所属功能模块的英文缩写。如 `CUT` = 音频裁剪（Cut）、`MERGE` = 音频合并、`MIX` = 音频混合、`SPLIT` = 音频拆分。
+- **子类别**：这条用例具体测什么方向，几个常见词：
+  - `CORE` —— **核心路径**（happy path）：这个模块最基本、最主要的功能链路，回归里最该先跑通、最该稳定的一条（通常配 `category: 冒烟/核心路径`，是优先固化成 `flows/flow_*.sh` 冒烟脚本的候选）。
+  - `EDGE` —— **边界/异常输入**（edge case）：故意喂给 App 不常见或超出常规范围的输入（如非标准采样率），验证异常分支的健壮性，不是主路径。
+  - `FMT` —— **格式矩阵**（format）：同一功能在多种文件格式（mp3/wav/aac/flac/ogg 等）下是否都正常。
+  - `COUNT` —— **数量边界**：输入数量在 0/1/多个/上限等边界值下的行为。
+  - `RESULT` —— **结果页通用校验**：保存结果页的文件名/大小/时长等字段正确性，跨模块复用的校验清单。
+  - `MODE` —— **模式/选项分支**：同一功能下不同保存模式/选项（如"保存所有片段" vs "保存为单一文件"）。
+- **序号**：同一模块+子类别下的第几条，从 `01` 开始，全局（同一模块前缀内）唯一，不要撞车。
+
+例：`CUT-CORE-01` = 音频裁剪模块的核心路径用例第 1 条；`CUT-EDGE-01` = 音频裁剪模块的边界/异常输入用例第 1 条。新起子类别词不强制局限于上面这几个，只要在 `cases/*.yaml` 里保持"一眼看出测的是什么方向"就行。
+
 ## 换一个被测 App（框架复用）
 
 `cases/CUT-CORE-01.yaml`、`flows/flow_cut_save.sh` 是 MP3 Cutter 的最小示例，留着给你看一条用例从定义到固化脚本的完整跑法。换新 App 时：
@@ -85,13 +101,18 @@ python3 tools/doc_report.py --new        # 另建一份新 Doc
 覆盖式刷新（同 sheets_sync）：既存 Doc 先清空再重画，**别在 Doc 里手改**。生成后会把链接回写进 `summary.csv`，
 再跑 `sheets_sync.py` 即可让看板摘要也带上 Doc 链接。
 
-## 状态
+## 证据类型说明
 
-- [x] ADB 工具层（选择器点击 / dump 复用 / 等待重试 / 多设备 / PID崩溃扫描 / MediaStore输出校验）
-- [x] 账本 schema（7 tab）+ 执行协议 RUNBOOK
-- [x] Sheets 同步适配器 + 首次同步（服务账号 + 云端看板已通）
-- [x] Google Doc 图文报告生成器（`doc_report.py`，OAuth + Docs/Drive API，内嵌截图）
-- [x] 用例生成 skill（`adb-testcase-gen`：一句话→真机探查→YAML）+ 编译器
-- [x] 端到端跑通 P0（真机 CUT-CORE-01 通过；双设备并行矩阵通过）
-- [ ] 持续灌用例、扩大回归覆盖
-- [ ] 可选：uiautomator2 后端、证据打包上云、矩阵证据分设备段
+`ledger/evidence.csv` 的"证据类型"列记录每一条证据是怎么采到的、能证明什么，对应 `adbkit.py` 的不同子命令：
+
+| 证据类型 | 采集命令 | 是什么 / 能证明什么 | 是否要求 debuggable |
+|---|---|---|---|
+| `screenshots` | `shot` | 界面截图，验证 UI 呈现是否符合预期（页面文案、控件状态、结果提示等） | 否 |
+| `MediaStore` | `output-check` | 查询 **Android 系统级媒体索引库**（`content://media/external/audio/media`，不是 App 自己的数据），验证音频/视频等产物是否真的生成、`_size`/`duration` 是否合理（`--expect` 命中后默认带完整性检查）、路径（`_data`）是否符合预期。系统公共 provider，`adb shell` 直接能查，不需要 `run-as` | 否——非 debug 包也能用，是本项目验证"产物确实生成且正确"的主要黑盒手段 |
+| `logs` | `logscan` | 按 App 进程 PID 过滤的 logcat 崩溃扫描，验证有无 FATAL / ANR / AndroidRuntime / SQLiteException / NativeCrash | 否 |
+| `db` | `db` | 导出 App 私有 SQLite 数据库做前后 diff，验证数据是否正确写入、有没有被污染/覆盖 | 是（需 `run-as`） |
+| `sp` | `sp` | 导出 App 私有 SharedPreferences，验证开关位/配置字段是否符合预期 | 是（需 `run-as`） |
+| `privls` | `privls` | 列出 App 私有存储目录（内部 `files/` 或外部专属目录），常配合操作前后 diff，用于验证"下载/输出落在私有目录而非 MediaStore"这类场景 | 是（需 `run-as`） |
+| `alarm` | `alarm` | 检查提醒/闹钟排程状态，验证系统级 reminder 是否真正设置/取消 | 视具体实现而定 |
+
+判定优先级：非 debug 包（大多数 release 包）只能用 `screenshots`/`MediaStore`/`logs`，`db`/`sp`/`privls` 这三类需要 App 是 debuggable 才能用 `run-as` 读到。详见 `docs/RUNBOOK.md`「判定要读多源」和「`证据类型=MediaStore` 具体包含哪些情况」两节。

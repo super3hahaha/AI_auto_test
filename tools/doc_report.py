@@ -352,42 +352,8 @@ def build_report(b, drive, folder_id, want_images):
                   (str(val), {"bold": True, "color": color} if color else {"bold": True})])
     b.newline()
 
-    # ---- 2. 执行清单 + 状态追踪 ----
-    b.heading("② 执行清单与状态追踪", 2)
-    for r in queue:
-        res, st = r.get("执行结果", ""), r.get("当前状态", "")
-        mark, color = RESULT_MARK.get(res) or STATUS_MARK.get(st) or ("☐", GREY)
-        head = f"{mark} [{r.get('用例ID','')}] "
-        tail = f"{r.get('优先级','')} · {r.get('模块','')} · {r.get('测试目的','') or r.get('一句话测试目标','')}"
-        runs = [(head, {"bold": True, "color": color}), (tail, {})]
-        status_bits = []
-        if st:
-            status_bits.append(st)
-        if res:
-            status_bits.append(res)
-        if r.get("结束时间"):
-            status_bits.append(f"完成于 {r['结束时间']}")
-        elif r.get("开始时间"):
-            status_bits.append(f"开始于 {r['开始时间']}")
-        if status_bits:
-            runs.append(("　→ " + " / ".join(status_bits), {"color": color}))
-        b.bullet(runs)
-    b.newline()
-
-    # ---- 3. 结构视图 / 覆盖 ----
-    b.heading("③ 结构视图（模块覆盖）", 2)
-    for r in structure:
-        b.bullet([
-            (f"{r.get('模块','')}", {"bold": True}),
-            (f"（{r.get('用例数量','')} 用例 · {r.get('优先级','')}）：", {"color": GREY}),
-            (r.get("覆盖用例", ""), {}),
-        ])
-        if r.get("测试目的"):
-            b.para([("　测试点：" + r["测试目的"], {"color": GREY, "italic": True})])
-    b.newline()
-
-    # ---- 4. 问题清单 ----
-    b.heading("④ 问题清单 / 覆盖缺口", 2)
+    # ---- 2. 问题清单 ----
+    b.heading("② 问题清单", 2)
     if not issues:
         b.para([("暂无问题记录。", {"color": GREY})])
     for r in issues:
@@ -397,6 +363,7 @@ def build_report(b, drive, folder_id, want_images):
             (f"[{r.get('问题ID','')}] ", {"bold": True, "color": sev_color}),
             (f"{sev} · ", {"color": sev_color}),
             (r.get("标题", ""), {"bold": True}),
+            (f"　用例：{r.get('用例ID','')}", {"color": TEAL}),
             (f"　状态：{r.get('状态','')}", {"color": GREY}),
         ])
         for label, key in [("预期", "预期结果"), ("实际", "实际结果"), ("备注", "负责人备注")]:
@@ -404,8 +371,8 @@ def build_report(b, drive, folder_id, want_images):
                 b.para([(f"　{label}：{r[key]}", {"color": GREY})])
     b.newline()
 
-    # ---- 5. 证据图（图文核心）----
-    b.heading("⑤ 关键证据（截图 + MediaStore/日志摘录）", 2)
+    # ---- 3. 证据图（图文核心）----
+    b.heading("③ 关键证据（截图 + MediaStore/日志摘录）", 2)
     executed = [r for r in queue if r.get("证据链接")]
     if not want_images:
         b.para([("（本次以 --no-images 生成，未嵌入截图；证据目录见下方链接）", {"color": GREY, "italic": True})])
@@ -434,6 +401,40 @@ def build_report(b, drive, folder_id, want_images):
             if t.get("文件/链接"):
                 b.para([("　证据文件：", {"color": GREY}), (t["文件/链接"], {"color": GREY, "italic": True})])
         b.newline()
+
+    # ---- 4. 执行清单 + 状态追踪 ----
+    b.heading("④ 执行清单与状态追踪", 2)
+    for r in queue:
+        res, st = r.get("执行结果", ""), r.get("当前状态", "")
+        mark, color = RESULT_MARK.get(res) or STATUS_MARK.get(st) or ("☐", GREY)
+        head = f"{mark} [{r.get('用例ID','')}] "
+        tail = f"{r.get('优先级','')} · {r.get('模块','')} · {r.get('测试目的','') or r.get('一句话测试目标','')}"
+        runs = [(head, {"bold": True, "color": color}), (tail, {})]
+        status_bits = []
+        if st:
+            status_bits.append(st)
+        if res:
+            status_bits.append(res)
+        if r.get("结束时间"):
+            status_bits.append(f"完成于 {r['结束时间']}")
+        elif r.get("开始时间"):
+            status_bits.append(f"开始于 {r['开始时间']}")
+        if status_bits:
+            runs.append(("　→ " + " / ".join(status_bits), {"color": color}))
+        b.bullet(runs)
+    b.newline()
+
+    # ---- 5. 结构视图 / 覆盖 ----
+    b.heading("⑤ 结构视图（模块覆盖）", 2)
+    for r in structure:
+        b.bullet([
+            (f"{r.get('模块','')}", {"bold": True}),
+            (f"（{r.get('用例数量','')} 用例 · {r.get('优先级','')}）：", {"color": GREY}),
+            (r.get("覆盖用例", ""), {}),
+        ])
+        if r.get("测试目的"):
+            b.para([("　测试点：" + r["测试目的"], {"color": GREY, "italic": True})])
+    b.newline()
 
     b.para([("本报告由 tools/doc_report.py 自动生成，覆盖式刷新——请勿在 Doc 内手改（会被下次覆盖）。"
              "用例增删改走「对话 → cases/*.yaml → compile_cases.py」。", {"color": GREY, "italic": True})])

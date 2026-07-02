@@ -101,10 +101,24 @@
 ## 判定要读多源（不要只看截图）
 
 - **UI 树/截图**：页面呈现是否符合预期。
+- **MediaStore diff**：`output-check` 查询结果，见下方「`证据类型=MediaStore` 具体包含哪些情况」——非 debug 包也能用的黑盒断言，是这个项目验证"产物确实生成且正确"的主要手段。
 - **DB diff**：动作前后 `db` 导出对比，看有没有脏数据 / 字段被错误覆盖。
 - **SP diff**：开关位、bitmask、通知模型。
 - **系统态**：`logscan`（有无 FATAL/ANR/SQLiteException）、`alarm`（提醒是否真排程/取消）。
 - **源码断言**（能拿到源码时）：读实现确认 UI 行为是否符合代码语义，并把 bug 根因下沉到具体方法/行号。拿不到源码就跳过这层，只做前四层。
+
+## `证据类型=MediaStore` 具体包含哪些情况（2026-07-02 定义）
+
+`ledger/evidence.csv` 的"证据类型"列写 `MediaStore` 时，专指走 `content query`（即 `adbkit.py output-check`）拿到的、独立于 UI 的黑盒证据。具体覆盖：
+
+1. **产物存在性确认**——某个操作（裁剪/合并/混合/拆分/下载）后，新文件确实出现在 MediaStore 里（`output-check --expect <名字子串>` 命中）。
+2. **产物完整性确认**——`_size>0`、`duration` 非 `NULL`/`0`（`output-check --expect` 命中后默认自带，见 `decisions.md` #15）；反过来证明"产物是空壳/损坏"（如 `BUG-CUT-EDGE-01` 的 `_size=0`）也算这一类。
+3. **产物属性与预期比对**——`duration` 是否约等于选区长度、`_size` 是否符合比特率×时长的合理范围、`_display_name` 命名是否符合规则（如重复保存正确带 `(2)`/`(3)` 序号而不是覆盖旧文件）。
+4. **落盘路径确认**——`_data` 字段给出设备端绝对路径，交叉核实文件真的落在预期目录（如 `/storage/emulated/0/Music/Mp3CutterTest/AudioCutter/`），不是散落别处或根本没写盘。
+5. **数量类断言**——一次操作产出多个文件时（如"拆分-保存所有片段"），确认 MediaStore 里新增的文件条数符合预期。
+6. **before/after 对比**——操作前后各查一次，diff 出到底新增了哪些记录（用于"没有产生预期外的多余文件"这类断言）。
+
+**不属于** MediaStore 类型、该归到别的证据类型：UI 截图 → `screenshots`；`logcat` 崩溃扫描 → `logs`；App 私有 SQLite → `db`；SharedPreferences → `sp`；App 私有文件目录（`run-as`/`privls`） → 单独归类，不算 MediaStore（MediaStore 只查公共媒体库，查不到私有目录）。判断标准很直接：**只要是走 `content query`/`output-check` 拿到的结果，就是 MediaStore 类型**。
 
 ## 预期从哪来（oracle 真值）
 

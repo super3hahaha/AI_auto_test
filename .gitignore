@@ -22,3 +22,6 @@ ledger/*
 # 仓库定位是通用框架：只留 CUT-CORE-01.yaml + flow_cut_save.sh 一组最小示例。
 # regression.yaml 是完整的 MP3 Cutter 回归用例集，业务内容太重，不进库（本机留着自用）。
 cases/regression.yaml
+
+# 同理，regression.yaml 里业务用例对应的固化脚本也不进库，只留 flow_cut_save.sh 这一份示例。
+flows/flow_cut_edge_wav40000.sh

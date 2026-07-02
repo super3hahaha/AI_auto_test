@@ -90,6 +90,7 @@
 - **背景（2026-07-02，用户明确要求）**：这个仓库是要给别人复用的通用 ADB 自动化测试框架，不是"MP3 Cutter 专用测试项目"。之前 `cases/regression.yaml`（220 行，完整 MP3 Cutter 回归用例集）已经写进了仓库，加上 `tools/new_run.py` 里硬编码的默认看板标题「MP3Cutter 模拟器回归测试执行看板」、`cases/_TEMPLATE.yaml` 示例里用真实用例 ID `CUT-CORE-01`/模块名"音频裁剪"，都是具体业务内容渗进了框架代码/文档，量偏多，且换个 App 复用时容易让人误以为这些是"框架要求"而不是"示例"。
 - **决定**：只保留 `cases/CUT-CORE-01.yaml` + `flows/flow_cut_save.sh` 这一组最小示例（用例定义→固化脚本→执行，跑通给人看完整链路），量控制住、不铺开。`cases/regression.yaml` 加进 `.gitignore`，不进库（本机继续留着自用）。`tools/new_run.py` 的默认标题、`cases/_TEMPLATE.yaml` 的示例 ID/模块名都换成通用占位（`AI+ADB 自动化测试执行看板` / `MODULE-CASE-01` / "示例模块"），`config/target.example.json` 补充 `board_title`/`report_title` 两个可选字段，让"换 App 时要改什么"一目了然，不用去翻代码找硬编码默认值。
 - **推论**：`docs/gotchas.md`/`docs/decisions.md`/`docs/flow-freeze.md` 里少量用 MP3 Cutter 具体命令/案例做说明性示例（如"实例：MP3Cutter 2.3.4H 与 2.3.5A..."）保留——这些是解释框架机制用的最小示例，不是业务用例集，量很小，不算违反本条。以后再往文档里加说明性例子时，同样把量控制在"够说明一个点"，别整段搬运具体业务细节。
+- **踩坑（2026-07-02）**：给 `cases/regression.yaml` 里的 `CUT-EDGE-01`（业务用例，本就不进库）配了固化脚本 `flows/flow_cut_edge_wav40000.sh`，写完之后没意识到这条脚本同样是具体业务内容，直接 `git add` 提交推送上去了，违反了本条"只留一份最小示例"——用户发现后要求撤回。已修：`git rm --cached` 撤销跟踪（本地文件保留），`.gitignore` 里跟 `cases/regression.yaml` 同款加了一条 `flows/flow_cut_edge_wav40000.sh`。**教训**：`cases/regression.yaml` 里任何用例配的固化脚本，只要那条用例本身不进库，配套脚本也不进库——判断"要不要进 git"应该跟着它所属的用例走，而不是默认新写的脚本都跟 `flow_cut_save.sh` 一样是示例。
 
 ## 15. `output-check --expect` 命中后默认再做一层完整性检查（_size>0 + duration 非空）
 

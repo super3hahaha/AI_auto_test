@@ -15,7 +15,7 @@
     python3 tools/adbkit.py --case RG-NU-01 logscan onboarding
     python3 tools/adbkit.py seed seeds/three-cycles.sql
 """
-import argparse, json, os, shutil, subprocess, sys, shlex, datetime, pathlib, re, time
+import argparse, csv, json, os, shutil, subprocess, sys, shlex, datetime, pathlib, re, time
 import xml.etree.ElementTree as ET
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -36,6 +36,7 @@ MAIN_ACTIVITY = CFG.get("main_activity", "")
 DB = CFG.get("db_name", "")
 SERIAL = CFG.get("serial", "")
 EVID_ROOT = ROOT / CFG.get("evidence_root", "evidence")
+EVID_LEDGER = ROOT / "ledger/evidence.csv"  # 采证即登记的账本（每次采集自动追加一行）
 APP = CFG.get("app_name") or PKG.split(".")[-1]
 _VER = None
 
@@ -82,6 +83,29 @@ def need_case(args):
     return args.case
 
 
+def _append_evidence(case, step, etype, abs_path, assertion="", result=""):
+    """采证即登记：把这次采集追加进 ledger/evidence.csv，默认标「过程留痕，仅本地」。
+    幂等——同一 (用例ID, 文件路径) 已登记就跳过（重跑不产生重复行）。
+    关键性不在这里判断：由人在判定环节用 case_result --evi 按文件路径升级为「关键，供报告用」。"""
+    header = ["用例ID", "步骤", "证据类型", "文件/链接", "截图预览", "断言", "结果", "采集时间", "备注"]
+    try:
+        rel = str(pathlib.Path(abs_path).resolve().relative_to(ROOT))
+    except ValueError:
+        rel = str(abs_path)
+    rows = list(csv.reader(open(EVID_LEDGER, encoding="utf-8"))) if EVID_LEDGER.exists() else []
+    if not rows:
+        rows = [header]
+    i_id, i_fp = header.index("用例ID"), header.index("文件/链接")
+    for r in rows[1:]:
+        if len(r) > i_fp and r[i_id] == case and r[i_fp] == rel:
+            return  # 已登记，幂等跳过
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    rows.append([case, step, etype, rel, "过程留痕，仅本地", assertion, result, now, "自动登记"])
+    EVID_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+    with open(EVID_LEDGER, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(rows)
+
+
 # ---------- 子命令 ----------
 
 def cmd_devices(args):
@@ -124,6 +148,7 @@ def cmd_shot(args):
     shell("screencap -p /sdcard/_shot.png")
     adb("pull", "/sdcard/_shot.png", str(out))
     print(f"[shot] {out}")
+    _append_evidence(case, args.name, "screenshots", out)  # 采证即登记（默认过程留痕，关键性人工升级）
 
 
 def cmd_tap(args):
@@ -374,6 +399,9 @@ def cmd_logscan(args):
             if any(k in ln for k in KW) and (pid or PKG in ln)]
     out.write_text("\n".join(hits))
     print(f"[logscan] {scope}，{len(hits)} 条命中 → {out}")
+    _append_evidence(case, args.label, "logs", out,
+                     assertion=f"logscan {scope}，{len(hits)} 条崩溃/异常命中",
+                     result=("有崩溃/异常" if hits else "无崩溃"))
     if hits:
         print("\n".join(hits[:20]))
 
@@ -401,7 +429,10 @@ def cmd_output_check(args):
     for l in top:
         print(" ", l[:160])
     if args.case:
-        (evid_dir(args.case, "logs") / "output-check.txt").write_text("\n".join(rows[: args.n]))
+        oc_out = evid_dir(args.case, "logs") / "output-check.txt"
+        oc_out.write_text("\n".join(rows[: args.n]))
+        _append_evidence(args.case, "output-check", "MediaStore", oc_out,
+                         assertion=(f"最新产物: {rows[0][:110]}" if rows else ""))
     if args.expect:
         newest = rows[0]
         if args.expect not in newest:

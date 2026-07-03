@@ -96,6 +96,16 @@ def main():
 
     print(f"\n[run_flow] {a.case} 耗时 {elapsed:.1f}秒，exit={result.returncode}，已写入 log.csv/queue.csv")
     print("[run_flow] 别忘了：这里只记了耗时和是否跑崩，通过/失败判定还得自己跑 output-check/logscan 确认后更新")
+
+    # 脚本跑时 adbkit 已把每张截图/output-check/logscan 采证即登记（默认「过程留痕」）。
+    # 这里列出本轮该用例的证据清单，提示判定后把关键的用 case_result --evi 升级为「关键，供报告用」。
+    ev = ROOT / "ledger/evidence.csv"
+    if ev.exists():
+        mine = [r for r in csv.DictReader(open(ev, encoding="utf-8")) if r.get("用例ID") == a.case]
+        if mine:
+            print(f"\n[run_flow] 本轮已自动登记 {len(mine)} 条证据（默认「过程留痕」）——判定后把关键的用 case_result --evi 升级：")
+            for r in mine:
+                print(f"    [{r.get('证据类型','')}] {r.get('文件/链接','')}  ({r.get('截图预览','')})")
     sys.exit(result.returncode)
 
 

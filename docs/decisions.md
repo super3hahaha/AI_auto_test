@@ -117,3 +117,10 @@
 - **为什么建文件必须 OAuth 不用 SA**：服务账号无 Drive 存储配额，建 Sheet/上传图片都 403。所以 `new_run` 建表、`doc_report` 建 Doc/传图全走 OAuth（用户本人），建完再把 Sheet 共享给 SA（Editor），`sheets_sync` 才用 SA 写数据。→ **所有云端产物归 OAuth 那个账号，不是 SA**。
 - **多账号 token**：token 按 `config/oauth_token.<account>.json` 命名，`target.json.oauth_account` 选用哪个（留空=默认 `oauth_token.json`）。`new_run`/`doc_report` 各有一份 `_oauth_token_path()` 按它拼路径；多 token 共存、切换免重授权。`.gitignore` 改 `config/oauth_token*` 通配防漏。
 - **换账号的边界**：新账号访问不到旧账号建的文件——换后要清 `target.json` 的 `doc_id`/`image_folder_id`（让在新账号 Drive 重建），`sheet_id` 想归新账号得 `new_run` 重建。企业 Workspace 账号还需同意屏幕测试用户 + 管理员放行第三方 app + 允许外部共享（inshot 已验证全通）。操作细节见 `docs/gotchas.md`。
+
+## 19. 采证即登记下沉 adbkit：登记（机械·不漏）与关键判断（人工·升级）解耦
+
+- **背景（2026-07-03，用户发现）**：固化脚本模式跑完，`evidence.csv` 只有人工登记的关键几条，脚本采的过程截图全漏（在本地不在账本）。根因是登记只靠事后人工 `case_result --evi`，固化脚本不走这步——采集入口统一（adbkit）但登记入口分裂（人工）。
+- **决定**：把「采证即登记」下沉到 adbkit 采集命令（`shot`/`output-check`/`logscan` 采证后自动追加 `evidence.csv`，默认「过程留痕，仅本地」，按文件路径幂等）。因为「采集必经 adbkit」是本项目硬架构（adbkit 是唯一碰设备的层），登记塞进 adbkit 就对主循环 / 固化脚本两种模式都生效、一处实现共享，不漏一张。
+- **关键判断保持人工**：登记（机械保证不漏）与关键性（语义判断）解耦——adbkit 自动登记的都默认「过程留痕」占位，人在判定环节用 `case_result --evi` 按文件路径 **upsert 升级**为「关键，供报告用」+ 精确断言（同路径升级不新增，避免重复）。`run_flow` 跑完打印证据清单提示判定。
+- **前提**：这套「不漏」依赖「采集必经 adbkit」纪律——若绕过 adbkit 直接 `adb screencap`，那张仍会漏（但那本就违反架构）。

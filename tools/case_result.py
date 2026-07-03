@@ -81,21 +81,38 @@ def main():
         csv.writer(f).writerow([now, a.case, "完成执行", old or "执行中",
                                 f"已完成/{a.result}", a.evidence, a.note])
 
-    with open(EVID, "a", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        for e in a.evi:
-            parts = e.split("|")
-            while len(parts) < 6:
-                parts.append("")
-            step, typ, file_path, assertion, res, key_flag = parts[:6]
-            if not file_path:
-                print(f"[case_result] 警告：证据行 {step!r} 未指定具体文件路径，将记为“证据文件缺失”")
-                file_path = "证据文件缺失"
-            if not key_flag:
-                print(f"[case_result] 警告：证据行 {step!r} 未标注「关键/过程留痕」，截图预览列留空"
-                      f"（doc_report.py 会按旧逻辑兜底，不保证选中这张）")
-            w.writerow([a.case, step, typ, file_path, key_flag, assertion, res, now, ""])
-    print(f"[case_result] {a.case} → 已完成/{a.result}（证据{len(a.evi)}条）")
+    # --evi：按 (用例ID, 文件路径) upsert——adbkit 采证时已自动登记（默认「过程留痕」），
+    # 这里按文件路径找到那行、升级成关键标记/精确断言；没有对应行才新增。避免与自动登记重复。
+    header = ["用例ID", "步骤", "证据类型", "文件/链接", "截图预览", "断言", "结果", "采集时间", "备注"]
+    erows = list(csv.reader(open(EVID, encoding="utf-8"))) if EVID.exists() else []
+    if not erows:
+        erows = [header]
+    eh = erows[0]
+    ei = {name: i for i, name in enumerate(eh)}
+    upd = new = 0
+    for e in a.evi:
+        parts = e.split("|")
+        while len(parts) < 6:
+            parts.append("")
+        step, typ, file_path, assertion, res, key_flag = parts[:6]
+        if not file_path:
+            print(f"[case_result] 警告：证据行 {step!r} 未指定具体文件路径，将记为“证据文件缺失”")
+            file_path = "证据文件缺失"
+        if not key_flag:
+            print(f"[case_result] 警告：证据行 {step!r} 未标注「关键/过程留痕」")
+        hit = next((r for r in erows[1:]
+                    if len(r) > ei["文件/链接"] and r[ei["用例ID"]] == a.case and r[ei["文件/链接"]] == file_path), None)
+        if hit:
+            hit[ei["步骤"]] = step; hit[ei["证据类型"]] = typ
+            hit[ei["截图预览"]] = key_flag; hit[ei["断言"]] = assertion
+            hit[ei["结果"]] = res; hit[ei["备注"]] = "人工升级"
+            upd += 1  # 采集时间保留 adbkit 采证时的原值
+        else:
+            erows.append([a.case, step, typ, file_path, key_flag, assertion, res, now, "人工登记"])
+            new += 1
+    with open(EVID, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(erows)
+    print(f"[case_result] {a.case} → 已完成/{a.result}（证据 升级{upd}条 / 新增{new}条）")
 
 
 if __name__ == "__main__":

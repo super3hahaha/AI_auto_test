@@ -124,3 +124,15 @@
 - **决定**：把「采证即登记」下沉到 adbkit 采集命令（`shot`/`output-check`/`logscan` 采证后自动追加 `evidence.csv`，默认「过程留痕，仅本地」，按文件路径幂等）。因为「采集必经 adbkit」是本项目硬架构（adbkit 是唯一碰设备的层），登记塞进 adbkit 就对主循环 / 固化脚本两种模式都生效、一处实现共享，不漏一张。
 - **关键判断由执行大脑做**：登记（机械保证不漏）与关键性（语义判断）解耦——adbkit 自动登记的都默认「过程留痕」占位，**执行大脑（Claude）在判定环节**用 `case_result --evi` 按文件路径 **upsert 升级**为「关键，供报告用」+ 精确断言（同路径升级不新增，避免重复）。这是执行大脑判定工作的一部分，不需要用户手动。`run_flow` 跑完打印证据清单提示执行大脑判定。
 - **前提**：这套「不漏」依赖「采集必经 adbkit」纪律——若绕过 adbkit 直接 `adb screencap`，那张仍会漏（但那本就违反架构）。
+
+## 20. 固化脚本不需要为 dump 单独存证：能连续拿到后续 shot，本身就是选择器命中的证明
+
+- **背景（2026-07-03，讨论"waitfor/tapid 里的 dump 要不要落成证据"时提出）**：`_dump_tree()`（`waitfor`/`tapid`/`taptext`/`tapdesc`/`find` 内部走的都是这条路径）明确"不落证据目录，纯用于定位"——不管这次是现场 dump 还是读 `--from-cache` 命中，都不会出现在 `evidence.csv` 里。当时的疑问：固化脚本执行过程中没有 Claude 在循环里看着，如果连 dump 都不存，会不会导致每一步"到底选择器有没有真的命中"变得无法审计？
+- **结论：不需要额外存证**。dump 只证明"这一步选择器命中、坐标算对了"，这件事已经被后续动作间接验证：脚本开了 `set -e`，`waitfor`（没加 `|| true` 兜底的那些）一超时找不到元素就直接非零退出整个脚本；能连续拿到 `01-home → 02-picker → 03-editor → 04-saveas → 05-result` 每个检查点的 `shot`，本身就证明中间每一次 `taptext`/`tapid` 都点对了——反证：哪一步选择器失效，压根走不到下一张 shot，`run_flow.py` 会记到非零退出码。所以不需要给 `cmd_ui`/`_dump_tree` 接 `_append_evidence`，这不是遗漏，是设计上刻意的轻量判定（呼应 #8）。
+- **边界（唯一的审计盲点，跟 dump 存不存证是两个话题）**：这个论证只覆盖"必经路径"上的 `waitfor`。脚本里那几个 best-effort 兜底点击——`tapdesc 同意 --timeout 6 >/dev/null 2>&1 || true`、`tapid permission_allow_button ... || true` 这类——点没点中完全不留痕，就算没点中也不会让脚本失败（被 `|| true` 吞掉），出了问题事后无法复盘"当时这个弹窗到底出没出现/点没点中"。如果要补，应该是给这几行加一句轻量 log 或证据登记，而不是去动 dump 缓存机制。
+
+## 21. 证据路径的设备段由 adbkit 按 --serial 加，--case 只填纯用例ID；固化脚本 shot 带步骤说明+结果
+
+- **背景（2026-07-03，「采证即登记」#19 上线后暴露）**：固化脚本历史写法 `CASE="CUT-CORE-01/$S"` 把 serial 掺进 `--case` 来实现"证据按设备分子目录"。旧机制下没事（截图只落盘、`evidence.csv` 靠人工 `case_result --evi` 填干净用例ID），但 #19 让 adbkit 采证即自动登记后，用例ID 直接取自 `--case` → `evidence.csv` 里变成 `CUT-CORE-01/9B051…`，跟 board/queue 的 `CUT-CORE-01` 对不上、成孤儿行，`sheets_sync`/`doc_report`/`run_flow` 清单全按纯ID匹配都看不到。
+- **决定**：`--case` 语义收敛为**纯用例ID**；证据路径的设备段由 `evid_dir` 按 `SERIAL`（`--serial` 或 config.serial）自动加——非空 → `.../case/<serial>/sub`，空 → `.../case/sub`。多设备矩阵跑的目录隔离由这层设备段天然保证（对齐 RUNBOOK「多设备」节：分片跑不需要、矩阵跑才分层，现在自动分层不用手动掺）。固化脚本 `CASE="CUT-CORE-01"`，绝不掺 serial。
+- **附带（同批）**：`adbkit shot` 加 `note`（步骤说明 → `evidence.csv` 断言列）+ `--result`（默认「通过」= 这步走到并截到图，失败分支如 `05-fail` 传「失败」→ 结果列）。这样固化脚本采证的证据也带断言+结果（步骤级、不精细），跟主循环手写的只差详细程度；关键的仍由执行大脑判定时 `case_result --evi` 升级。参照用户给的 Period Calendar 报告风格。

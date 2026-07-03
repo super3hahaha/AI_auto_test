@@ -71,8 +71,15 @@ def shell(remote, capture=True):
 
 
 def evid_dir(case, sub):
-    # 证据按 应用/版本/日期/用例 归档（版本为主轴，日期是同版本下的轮次）
-    d = EVID_ROOT / _safe(APP) / _safe(app_version()) / today() / case / sub
+    # 证据按 应用/版本/日期/用例 归档（版本为主轴，日期是同版本下的轮次）；
+    # SERIAL 非空时再按设备分一层子目录 .../case/<serial>/sub——多设备矩阵跑各存各的不撞，
+    # 单设备(config.serial 空且没传 --serial)时省掉设备段。
+    # 用例ID 只放 case，serial 段由这里按 --serial 自动加，绝不掺进 --case
+    # （否则 evidence.csv 的用例ID 列会被 serial 污染，跟 queue/board 对不上）。
+    d = EVID_ROOT / _safe(APP) / _safe(app_version()) / today() / case
+    if SERIAL:
+        d = d / _safe(SERIAL)
+    d = d / sub
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -148,7 +155,8 @@ def cmd_shot(args):
     shell("screencap -p /sdcard/_shot.png")
     adb("pull", "/sdcard/_shot.png", str(out))
     print(f"[shot] {out}")
-    _append_evidence(case, args.name, "screenshots", out)  # 采证即登记（默认过程留痕，关键性人工升级）
+    _append_evidence(case, args.name, "screenshots", out, assertion=getattr(args, "note", "") or "",
+                     result=getattr(args, "shot_result", "通过"))  # note→断言列；result→结果列（默认「通过」=这步走到了）
 
 
 def cmd_tap(args):
@@ -490,7 +498,10 @@ def build_parser():
     s.add_argument("--cache", dest="cache_screen", default=None,
                    help="缓存槽名，默认用 <name>（不传就自动按 step 名存进 .dumpcache，供固化脚本 --from-cache 复用）")
     s.set_defaults(fn=cmd_ui)
-    s = sub.add_parser("shot"); s.add_argument("name"); s.set_defaults(fn=cmd_shot)
+    s = sub.add_parser("shot"); s.add_argument("name")
+    s.add_argument("note", nargs="?", default="", help="这步的一句话说明，写进证据断言列（不用精细，如「进入选择音频列表」）")
+    s.add_argument("--result", dest="shot_result", default="通过", help="这步结果，默认「通过」（截到图=走到了）；失败分支截图传「失败/需复核」")
+    s.set_defaults(fn=cmd_shot)
     s = sub.add_parser("tap"); s.add_argument("x"); s.add_argument("y"); s.set_defaults(fn=cmd_tap)
     # 按选择器点击：坐标从当前设备 UI 树现算，天然跨分辨率
     for name, fn in (("tapid", cmd_tapid), ("taptext", cmd_taptext), ("tapdesc", cmd_tapdesc)):

@@ -21,7 +21,7 @@
 | 目的 | 命令 |
 |---|---|
 | 看屏（控件树，决策主依据） | `python3 tools/adbkit.py --case <ID> ui <step>` |
-| 截图存证 | `... --case <ID> shot <step>` |
+| 截图存证（带步骤说明+结果） | `... --case <ID> shot <step> "一句话说明" [--result 失败]`（说明→断言列、默认结果通过；采证即自动登记 evidence.csv） |
 | **按选择器点击（首选）** | `... tapid <resource-id>` / `taptext <文案>` / `tapdesc <desc>`（`--index N` 消歧、`--partial` 子串） |
 | 定位调试（只找不点） | `... find id\|text\|desc <值>` |
 | 输入/按键/滑动 | `... text ".."` / `key <KEYCODE>` / `swipe ...` |

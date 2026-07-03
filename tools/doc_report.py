@@ -94,6 +94,35 @@ def read_summary():
     return d
 
 
+def read_log_span():
+    """从 log.csv（状态变更日志）取本轮第一条/最后一条记录的时间，算执行起止。
+    log.csv 只追加不清空，但 new_run.py 开新一轮时会整份归档+清空（见 decisions.md #10），
+    所以现存 log.csv 就是本轮的，不用再按日期/scope 过滤。"""
+    p = LEDGER / "log.csv"
+    if not p.exists():
+        return None, None
+    times = [r.get("时间", "") for r in csv.DictReader(open(p, encoding="utf-8")) if r.get("时间")]
+    return (times[0], times[-1]) if times else (None, None)
+
+
+def format_exec_span(start_t, end_t, fallback):
+    """按参考模板"2026-07-02 23:30 ～ 次日 01:10"的格式拼执行时间；没有日志就退回 fallback（生成时间）。"""
+    if not start_t or not end_t:
+        return fallback
+    try:
+        sd = datetime.datetime.strptime(start_t[:10], "%Y-%m-%d").date()
+        ed = datetime.datetime.strptime(end_t[:10], "%Y-%m-%d").date()
+        delta = (ed - sd).days
+    except ValueError:
+        delta = 0
+    end_hm = end_t[11:16]
+    if delta == 0:
+        return f"{start_t[:16]} ～ {end_hm}"
+    if delta == 1:
+        return f"{start_t[:16]} ～ 次日 {end_hm}"
+    return f"{start_t[:16]} ～ {end_t[:16]}"
+
+
 # ============================ Doc 构建器 ============================
 class DocBuilder:
     """先把整篇纯文本拼好并记录样式区间/插图点，再一把插入 → 应用样式 → 倒序插图。
@@ -136,7 +165,7 @@ class DocBuilder:
     def newline(self, n=1):
         self.text += "\n" * n
 
-    def heading(self, s, level=2, color=None):
+    def heading(self, s, level=2, color=None, size=None):
         start = self.pos
         self.text += s + "\n"
         end = self.pos
@@ -144,6 +173,20 @@ class DocBuilder:
         self.para_styles.append((start, end, {"namedStyleType": named}, "namedStyleType"))
         if color:
             self.text_styles.append((start, end, {"foregroundColor": {"color": {"rgbColor": color}}}, "foregroundColor"))
+        if size:
+            self.text_styles.append((start, end, {"fontSize": {"magnitude": size, "unit": "PT"}}, "fontSize"))
+
+    def heading_runs(self, runs, level=2, size=None):
+        """跟 heading() 一样落一个标题段落，但按 runs 逐段上色（用于标题里只部分文字要着色的场景）。"""
+        start = self.pos
+        for text, kw in runs:
+            self.run(text, **kw)
+        end = self.pos
+        self.text += "\n"
+        named = {1: "HEADING_1", 2: "HEADING_2", 3: "HEADING_3"}[level]
+        self.para_styles.append((start, end, {"namedStyleType": named}, "namedStyleType"))
+        if size:
+            self.text_styles.append((start, end, {"fontSize": {"magnitude": size, "unit": "PT"}}, "fontSize"))
 
     def title(self, s):
         start = self.pos
@@ -278,11 +321,12 @@ class LiveDoc:
             if text:
                 real_start = start + cumulative
                 real_end = real_start + u16(text)
-                style, fields = {"bold": True}, ["bold"]
                 if ri == 0:
+                    style, fields = {"bold": True}, ["bold"]  # 表头保持加粗
                     style["foregroundColor"] = {"color": {"rgbColor": WHITE}}
                     fields.append("foregroundColor")
                 else:
+                    style, fields = {"bold": False}, ["bold"]  # 数据行不加粗
                     color = cell_color_fn(ri - 1, ci, text) if cell_color_fn else None
                     if color:
                         style["foregroundColor"] = {"color": {"rgbColor": color}}
@@ -465,27 +509,37 @@ def build_report(live, drive, folder_id, want_images):
 
     # ---- 标题区 ----
     b = DocBuilder()
-    b.title("AI + ADB 安卓自动化测试 · 执行报告")
+    b.title("自动化回归测试报告")
     b.para([("Automated Regression Test Report", {"color": GREY, "italic": True})])
     b.newline()
-    b.para([("被测包：", {"bold": True, "color": DARK}), (cfg.get("package", "-"), {"color": GREY})])
+    b.para([("测试应用：", {"bold": True, "color": DARK}), (cfg.get("package", "-"), {"color": GREY})])
+    if cfg.get("app_version"):
+        b.para([("测试版本：", {"bold": True, "color": DARK}), (cfg["app_version"], {"color": GREY})])
     b.para([("默认设备：", {"bold": True, "color": DARK}), (cfg.get("serial", "-"), {"color": GREY})])
-    b.para([("生成时间：", {"bold": True, "color": DARK}), (now, {"color": GREY})])
-    b.para([("本轮范围：", {"bold": True, "color": DARK}), (summary.get("本轮范围", "全量"), {"color": BLUE, "bold": True}),
-            ("（数据来源 ledger/*.csv，本地账本为唯一真值）", {"color": GREY, "italic": True})])
+    start_t, end_t = read_log_span()
+    exec_span = format_exec_span(start_t, end_t, now)
+    b.para([("执行时间：", {"bold": True, "color": DARK}), (exec_span, {"color": GREY})])
+    scope_label = summary.get("本轮范围", "全量").split("（")[0]  # 只要"全量/部分"这个结论，括号里的条数明细不放进报告
+    b.para([("本轮范围：", {"bold": True, "color": DARK}), (scope_label, {"color": BLUE, "bold": True})])
+    if cfg.get("sheet_id"):
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{cfg['sheet_id']}/edit"
+        b.para([("对应看板：", {"bold": True, "color": DARK}), (sheet_url, {"link": sheet_url})])
     b.newline()
 
     # ---- 一、执行结论（规则拼装，不做环比/发布建议——ledger 没有上一轮通过率、也没有发布决策逻辑）----
     b.heading("一、执行结论", 1, color=DARK)
-    concl = f"本轮共执行 {total} 条用例，通过率 {rate}（通过 {pass_n} / 已完成 {done}）。"
     if issues:
-        concl += f"发现 {len(issues)} 个问题"
+        tail = f"发现 {len(issues)} 个问题"
         if high_sev_issues:
-            concl += f"，其中 {len(high_sev_issues)} 个为 P0/P1 高优先级"
-        concl += "，详见下方「失败用例详情」。"
+            tail += f"，其中 {len(high_sev_issues)} 个为 P0/P1 高优先级"
+        tail += "，详见下方「失败用例详情」。"
     else:
-        concl += "本轮未发现失败用例。"
-    b.para([(concl, {"bold": True, "color": BLUE})])
+        tail = "本轮未发现失败用例。"
+    b.para([
+        (f"本轮共执行 {total} 条用例，通过率 ", {"bold": True}),
+        (rate, {"bold": True, "color": BLUE}),
+        (f"（通过 {pass_n} / 已完成 {done}）。{tail}", {"bold": True}),
+    ])
     b.newline()
     live.flush(b)
 
@@ -499,8 +553,6 @@ def build_report(live, drive, folder_id, want_images):
         cell_color_fn=lambda ri, ci, text: [DARK, GREEN, RED, GREY, BLUE][ci],
     )
     b = DocBuilder()
-    b.para([(f"其他：覆盖缺口 {summary.get('覆盖缺口','0')}　需复核 {summary.get('需复核','0')}　"
-             f"证据条数 {summary.get('证据条数','0')}", {"color": GREY, "italic": True})])
     b.newline()
     live.flush(b)
 
@@ -525,7 +577,7 @@ def build_report(live, drive, folder_id, want_images):
         b.para([("本轮无失败用例。", {"color": GREY})])
         live.flush(b)
     b = DocBuilder()
-    b.para([("注：以上「失败原因」摘自 issues.csv 的实际结果记录；完整预期/备注见本地账本。", {"color": GREY, "italic": True})])
+    b.para([("注：截图/证据列为缺陷单编号，对应示意图见下节", {"color": GREY, "italic": True})])
     b.newline()
     live.flush(b)
 
@@ -537,7 +589,10 @@ def build_report(live, drive, folder_id, want_images):
     for r in issues:
         cid = r.get("用例ID", "")
         qrow = queue_by_cid.get(cid)
-        b.heading(f"{r.get('问题ID','')} · {cid}  {r.get('标题','')}", 3, color=BLUE)
+        b.heading_runs([
+            (f"{r.get('问题ID','')} · {cid}  ", {"color": BLUE}),
+            (r.get("标题", ""), {}),
+        ], 3, size=11)
         if qrow and qrow.get("证据链接"):
             b.para([("证据目录：", {"color": GREY}), (qrow.get("证据链接", ""), {"color": GREY})])
             insert_case_evidence(b, drive, folder_id, want_images, cid, evidence,
@@ -562,8 +617,7 @@ def build_report(live, drive, folder_id, want_images):
         b.para([("暂无待办：本轮全部用例通过。", {"color": GREY})])
     b.newline()
     # 参考模板只有一~五这五节，六（通过用例证据）、七（执行清单）、八（结构视图）都已按要求去掉。
-    b.para([("本报告由 tools/doc_report.py 自动生成，覆盖式刷新——请勿在 Doc 内手改（会被下次覆盖）。"
-             "用例增删改走「对话 → cases/*.yaml → compile_cases.py」。", {"color": GREY, "italic": True})])
+    b.para([("本报告由 tools/doc_report.py 自动生成。", {"color": GREY, "italic": True})])
     live.flush(b)
 
 

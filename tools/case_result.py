@@ -105,7 +105,7 @@ def main():
         if hit:
             hit[ei["步骤"]] = step; hit[ei["证据类型"]] = typ
             hit[ei["截图预览"]] = key_flag; hit[ei["断言"]] = assertion
-            hit[ei["结果"]] = res; hit[ei["备注"]] = "人工升级"
+            hit[ei["结果"]] = res; hit[ei["备注"]] = "判定升级"
             upd += 1  # 采集时间保留 adbkit 采证时的原值
         else:
             erows.append([a.case, step, typ, file_path, key_flag, assertion, res, now, "人工登记"])

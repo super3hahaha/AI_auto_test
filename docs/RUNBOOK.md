@@ -57,9 +57,27 @@
 - 执行 13 条用例只是不断 `sheets_sync` 写**同一张**当前表，**不是每条建一张**。
 - 同一天开第二轮会撞标题日期 → 加序号/时间后缀区分。
 
+## 本轮范围（scope）与 board.csv
+
+一次回归不一定跑全量——有时只回归 P0/P1，有时只重跑几条。用 `config/target.json` 的 `scope` 字段框定**本轮范围**：
+
+- 留空 = 全量（所有用例）。
+- 一组优先级：`"P0"` 或 `"P0,P1"`。
+- 一组用例ID：`"CUT-CORE-01,CUT-EDGE-01"`。
+- **优先级和用例ID 不能混写**；写了不存在的优先级/ID 会直接报错（不会静默变空——见 `docs/gotchas.md`）。
+
+`compile_cases.py` 按 scope 从全量 `queue.csv` 投影出 `board.csv`（本轮清单，执行顺序号在 board 内重编 1..N）。**全量真值永远是 `queue.csv`，不受 scope 影响**；`board.csv` 是随时可重建的投影，看板/报告只显示本轮，避免"只回归 P0 却看到一堆待回归用例"的迷惑。
+
+- **谁读 board**：云端看板（`sheets_sync` 的「测试队列」tab）、Doc 报告、结构/摘要统计——都按本轮口径（含"本轮范围：P0,P1（8/全量14）"声明行）。
+- **谁读 queue**：执行大脑选用例的**状态判据**（主循环第 1 步）、`case_result`/`run_flow` 写状态——都认全量真值。
+- **投影时机**：`compile_cases` 末尾、`sheets_sync`/`doc_report` 推送前各自动投影一次。`case_result`/`run_flow`/手动改账本都**不用管 board**——收工后照常 `compile → sheets_sync` 就会重投影，board 自然刷新。**board.csv 不进 git、不归档，丢了 recompile 即可。**
+- **改范围**：直接编辑 `target.json` 的 `scope`，下次 compile/sync 生效。放宽范围（如 P0→P0,P1）**不会丢状态**——那些用例的历史状态都在全量 queue.csv 里，重投影带回来；想重跑得显式重置或开新一轮。
+- **生成新用例注意**：新写的用例若不在当前 scope（尤其 scope 是 ID 列表时），不会进 board、不会被执行——生成后要提醒用户是否调 scope 把它纳入本轮。
+- **用例别互相依赖**：scope 会按优先级/ID 任意切子集，若用例 B 依赖用例 A 先跑产生的前置态，切范围时可能把 A 落下导致 B 阻塞。设计用例时尽量自带前置（自备素材/seed），保持彼此独立。
+
 ## 主循环（每条用例）
 
-1. **选用例**：从 `ledger/queue.csv` 找第一个 `当前状态=待执行` 且优先级最高（P0>P1>P2>P3）的行。
+1. **选用例**：先看 `config/target.json` 的 `scope`（本轮范围）——只在**本轮范围内**（`board.csv` 里的用例，即 scope 命中的那些）挑第一个 `当前状态=待执行` 且优先级最高（P0>P1>P2>P3）的行。**待执行状态以全量真值 `queue.csv` 为准**（board 的状态列只供云端展示，可能不是最新）；scope 为空则本轮=全量，等同直接看 queue。
 2. **挂号（开工）**：往 `ledger/log.csv` 追加一行 `动作=开始执行, 原状态=待执行, 新状态=执行中`；把 queue 该行 `当前状态` 改成 `执行中`、填 `开始时间`。
 3. **判断走脚本还是主循环**：看该行 `固化脚本` 列——非空（如 `flows/flow_cut_save.sh`）就直接跑这个脚本（无 AI 逐屏推理，快）；为空就走下面 4-5 步主循环。这一列由 `cases/*.yaml` 里的 `frozen_script` 字段编译而来，别手改 queue 里的这一格，改就去改 YAML 再 `compile_cases.py`。脚本跑挂了（选择器找不到）说明 UI 变了，回退主循环重探，然后把新脚本路径更新回 YAML（见 `flow-freeze.md`）。
    > **硬规则：跑固化脚本一律用 `python3 tools/run_flow.py <用例ID> <脚本路径> [serial]`，永远不要直接 `bash flows/xxx.sh`**——包括"顺手冒烟检查"这类看起来不算正式执行的场合。直接 `bash` 跑完全裸跑，不会往 `log.csv`/`queue.csv` 写任何东西，事后极难想起来补登记（2026-07-02 踩过：图省事直接 `bash` 跑了一次冒烟，跑完当成"检查过了"就往下走，账本和看板上完全没留痕，用户事后追问才发现）。`run_flow.py` 自动计时、自动写开始/完成时间戳到 `log.csv`、回填 `queue.csv`，判定仍需人工看 `output-check`/`logscan` 后补一行"判定确认"（见下方结果分档）。

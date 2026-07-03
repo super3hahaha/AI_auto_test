@@ -97,3 +97,23 @@
 - **背景（2026-07-02，BUG-CUT-EDGE-01 暴露的问题）**：`output-check` 原本只断言"最新文件名含某子串"，`CUT-EDGE-01` 复现时文件名/日期完全正常、只有 `_size=0`/`duration=NULL`，靠原来的断言完全测不出来——只看"存在"这一层判断太浅，抓不住"生成了但是空壳/损坏"这类静默失败。
 - **决定**：`--expect` 命中后自动追加断言 `_size>0` 且 `duration` 不是 `NULL`/`0`，不满足直接 `exit` 非0。这两个字段本来就在同一次 `content query` 里查出来了，加断言不用额外开销。确实需要断言"预期就是空文件/异常输出"的场景（目前还没遇到，理论上可能存在）用 `--allow-empty` 跳过这层。
 - **推论/边界**：这层只能证明"文件不是空壳"，证明不了"内容对不对"（比如裁剪选区错了但整体文件大小/时长看起来仍然合理）。要验证内容级正确性（时长精确匹配选区、真的能解码播放）得 `adb pull` + `ffprobe`，成本高很多——只值得用在专门验证产物细节的用例上（如 `RESULT-01`/`MERGE-RESULT-01`），不该铺开到所有用例的基础"文件生成了没有"检查里。这条口子还没做，先记在 `docs/todo.md`。
+
+## 16. Doc 报告②③节证据按"通过/失败"拆开，而不是混在一起
+
+- **背景（2026-07-03，用户对照一份外部参照 Doc 提出）**：`doc_report.py` 原来的③"关键证据"是不分通过失败、遍历所有"有证据链接"的用例统一插图+摘录，失败用例的关键截图和通过用例的验证截图混在同一节里，读的时候要在②问题清单和③证据之间来回对照才能把"这个 bug 的现场截图"和"这条 bug 描述"对上。
+- **决定**：②问题清单里每条 issue 按 `用例ID` 关联 `queue.csv` 找到对应证据目录，直接把这条失败用例的关键截图/文本证据摘录插在该 issue 的预期/实际/备注下面；③改成只筛 `执行结果 == 通过` 的用例，标题也改成"③ 通过用例关键证据（仅展示已通过用例的截图 + MediaStore/日志摘录）"，明确"只有成功用例证据"，不用再靠章节顺序或用户记忆去区分。插图/摘录逻辑本身没变，抽成公共函数 `insert_case_evidence()` 给②③共用，避免两处重复维护同一段渲染代码。
+- **推论**：以后新增"某类结果单独一节展示证据"的需求（比如"阻塞用例单独一节"），照这个模式加：在 `build_report()` 里按 `执行结果`/`当前状态` 过滤出目标用例，调 `insert_case_evidence()` 复用渲染，不用再写一遍插图/文本摘录逻辑。
+
+## 17. 本轮范围用 scope 字段 + board.csv 投影，全量真值留在 queue.csv
+
+- **背景（2026-07-03，用户提出）**：实际回归有时全量、有时只 P0/P1。看板若每次都展示全量用例，只回归 P0/P1 时会看到一堆"待执行"，让看报告的人误以为漏跑了。需要一个"本轮范围"开关，让看板/报告只显示本轮。
+- **决定**：`config/target.json` 加 `scope` 字段（空=全量 / 一组优先级如 `P0,P1` / 一组用例ID；优先级与ID互斥）。`compile_cases.py` 里 `project_board_from_queue()` 按 scope 从全量 `queue.csv` 投影出 `board.csv`（本轮清单，执行顺序号重编 1..N）。看板「测试队列」tab、Doc 报告、结构/摘要都改读 board（本轮口径），并加"本轮范围：P0,P1（8/全量14）"声明行防"以为总共就这么多用例"的反向误解。
+- **关键取舍（为什么不直接过滤 queue）**：状态真值必须有唯一落点。若执行/状态直接写收窄后的 board，缩放范围时范围外用例的状态就丢了。所以 **queue.csv 永远是全量真值**（`compile`/`case_result`/`run_flow` 都写它、执行大脑选用例的"待执行"判据也认它），board.csv 只是"要对外展示那一刻"的投影。选这个方案的红利：投影时机收敛到 `compile` 末尾 + `sheets_sync`/`doc_report` 推送前，`case_result`/`run_flow`/`new_run`/手动改账本都不用管 board（收工后 `compile→sheets_sync` 自然重投影），彻底消除"手动步骤漏同步 board"的坑。放宽范围不丢状态，因为历史状态一直在 queue 里。
+- **边界**：scope 纯按优先级/ID 切子集，不理解用例间依赖——用例设计要尽量自带前置、彼此独立（见 RUNBOOK「本轮范围」节）。结构/摘要收窄后不再是"全量覆盖全貌"而是"本轮涉及范围"；全量真值只在本地 queue.csv，云端不再有全量视图（用户已确认接受）。`board.csv` 是投影产物：不进 git、不归档、丢了 recompile 即得。
+
+## 18. 云端产物用 OAuth 建、多账号 token 按 oauth_account 切换
+
+- **背景（2026-07-03）**：云端账号要从测试号 xxtester2026 迁到公司号 zhangshixin@inshot.com，且希望两账号 token 共存、切换不用每次重新授权。
+- **为什么建文件必须 OAuth 不用 SA**：服务账号无 Drive 存储配额，建 Sheet/上传图片都 403。所以 `new_run` 建表、`doc_report` 建 Doc/传图全走 OAuth（用户本人），建完再把 Sheet 共享给 SA（Editor），`sheets_sync` 才用 SA 写数据。→ **所有云端产物归 OAuth 那个账号，不是 SA**。
+- **多账号 token**：token 按 `config/oauth_token.<account>.json` 命名，`target.json.oauth_account` 选用哪个（留空=默认 `oauth_token.json`）。`new_run`/`doc_report` 各有一份 `_oauth_token_path()` 按它拼路径；多 token 共存、切换免重授权。`.gitignore` 改 `config/oauth_token*` 通配防漏。
+- **换账号的边界**：新账号访问不到旧账号建的文件——换后要清 `target.json` 的 `doc_id`/`image_folder_id`（让在新账号 Drive 重建），`sheet_id` 想归新账号得 `new_run` 重建。企业 Workspace 账号还需同意屏幕测试用户 + 管理员放行第三方 app + 允许外部共享（inshot 已验证全通）。操作细节见 `docs/gotchas.md`。

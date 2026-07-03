@@ -8,11 +8,13 @@
   python3 tools/compile_cases.py           # 汇编全部
   python3 tools/compile_cases.py --check    # 只校验 YAML，不写 CSV
 """
-import csv, sys, glob, pathlib, yaml
+import csv, sys, glob, pathlib, json, re, yaml
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CASES = ROOT / "cases"
 QUEUE = ROOT / "ledger/queue.csv"
+BOARD = ROOT / "ledger/board.csv"
+CFG_PATHS = [ROOT / "config/target.json", ROOT / "config/target.example.json"]
 
 HEADER = ["完成","执行顺序","用例ID","模块","测试目的","一句话测试目标","测试分类","优先级",
           "当前状态","执行结果","用户/业务场景","纯模拟器执行范围","Seed Data/前置数据",
@@ -59,6 +61,72 @@ def load_cases():
     return cases
 
 
+def load_scope():
+    for p in CFG_PATHS:
+        if p.exists():
+            return (json.loads(p.read_text()).get("scope") or "").strip()
+    return ""
+
+
+def parse_scope(raw, all_ids, all_prios):
+    """解析 target.json.scope → (mode, values)。
+    mode: None=全量 / 'prio'=按优先级 / 'id'=按用例ID。
+    规则：空=全量；全是 P0-P3=优先级组；全不是=ID 组；混写报错；命不中报错。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return (None, None)
+    items = [x.strip() for x in raw.split(",") if x.strip()]
+    if not items:
+        return (None, None)
+    prio_re = re.compile(r"^P[0-3]$")
+    flags = [bool(prio_re.match(x.upper())) for x in items]
+    if all(flags):
+        vals = {x.upper() for x in items}
+        miss = sorted(v for v in vals if v not in all_prios)
+        if miss:
+            sys.exit(f"[scope] 优先级 {miss} 在当前用例里没有对应用例（现有：{sorted(all_prios)}）")
+        return ("prio", vals)
+    if not any(flags):
+        vals = set(items)  # 用例ID 大小写敏感，保留原文
+        miss = sorted(v for v in vals if v not in all_ids)
+        if miss:
+            sys.exit(f"[scope] 用例ID {miss} 不存在（检查拼写，或先 compile_cases 汇编）")
+        return ("id", vals)
+    prios = [x for x, f in zip(items, flags) if f]
+    ids = [x for x, f in zip(items, flags) if not f]
+    sys.exit(f"[scope] 不能混写优先级和用例ID：识别为优先级的 {prios}，无法归为优先级的 {ids}。"
+             "要么全填优先级(P0/P1/P2/P3)，要么全填用例ID")
+
+
+def project_board_from_queue():
+    """从 queue.csv（全量真值）按 target.scope 投影出 board.csv（本轮清单，执行顺序号重编 1..N）。
+    纯基于 queue.csv 的列，不依赖 YAML，可供 sheets_sync/doc_report 复用。
+    返回 (board_rows, scope_desc, id_set)。"""
+    rows = list(csv.reader(open(QUEUE, encoding="utf-8")))
+    header, data = rows[0], rows[1:]
+    i_id, i_prio = header.index("用例ID"), header.index("优先级")
+    all_ids = {r[i_id] for r in data}
+    all_prios = {r[i_prio].upper() for r in data if r[i_prio]}
+    raw = load_scope()
+    mode, values = parse_scope(raw, all_ids, all_prios)
+    board = [header]
+    seq = 1
+    for r in data:
+        ok = (mode is None) or (mode == "prio" and r[i_prio].upper() in values) \
+            or (mode == "id" and r[i_id] in values)
+        if ok:
+            rr = list(r)
+            rr[1] = str(seq)  # 执行顺序列，board 内从 1 重编
+            seq += 1
+            board.append(rr)
+    with open(BOARD, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(board)
+    label = raw or "全量"
+    scope_desc = f"{label}（{len(board) - 1} / 全量 {len(data)} 条）"
+    id_set = {r[i_id] for r in board[1:]}
+    return board, scope_desc, id_set
+
+
 def existing_runtime():
     """保留已有 queue.csv 里各用例的运行时状态（状态/结果/时间/证据等）。"""
     keep = {}
@@ -103,11 +171,14 @@ def build_structure(cases):
     return len(order)
 
 
-def build_summary(queue_rows):
-    """从队列运行时状态 + 证据表自动算摘要计数。保留"创建日期""Google Doc"等人工/外部字段。"""
-    h = queue_rows[0]
+def build_summary(board_rows, scope_desc):
+    """从本轮 board 的运行时状态 + 证据表算摘要计数（本轮口径）。
+    保留"创建日期""Google Doc"等人工/外部字段。"""
+    h = board_rows[0]
+    i_id = h.index("用例ID")
     i_st, i_res = h.index("当前状态"), h.index("执行结果")
-    data = queue_rows[1:]
+    data = board_rows[1:]
+    id_set = {r[i_id] for r in data}
 
     def cnt_status(v):
         return sum(1 for r in data if r[i_st] == v)
@@ -115,10 +186,12 @@ def build_summary(queue_rows):
     def cnt_result(v):
         return sum(1 for r in data if r[i_res] == v)
 
-    # 证据条数
+    # 证据条数（按本轮 board 的用例ID 过滤，与队列口径一致）
     evid_n = 0
     if EVID.exists():
-        evid_n = max(0, sum(1 for _ in open(EVID, encoding="utf-8")) - 1)
+        for r in csv.DictReader(open(EVID, encoding="utf-8")):
+            if r.get("用例ID", "") in id_set:
+                evid_n += 1
 
     # 保留已有的人工字段
     keep = {}
@@ -128,6 +201,7 @@ def build_summary(queue_rows):
                 keep[r[0]] = r[1]
 
     computed = {
+        "本轮范围": scope_desc,
         "总用例数": len(data),
         "已完成": cnt_status("已完成"),
         "待执行": cnt_status("待执行"),
@@ -140,7 +214,7 @@ def build_summary(queue_rows):
         "证据条数": evid_n,
     }
     manual = ["创建日期", "Google Doc 图文报告"]  # 保留原值，不覆盖
-    order = ["创建日期", "总用例数", "已完成", "待执行", "执行中",
+    order = ["创建日期", "本轮范围", "总用例数", "已完成", "待执行", "执行中",
              "通过", "失败", "阻塞", "覆盖缺口", "需复核", "证据条数", "Google Doc 图文报告"]
     rows = [["指标", "值"]]
     for k in order:
@@ -212,10 +286,16 @@ def main():
 
     with open(QUEUE, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(rows)
-    nmod = build_structure(cases)
-    build_summary(rows)
-    print(f"[compile] {len(cases)} 条用例 → {QUEUE}（运行时状态已保留）")
-    print(f"[compile] {nmod} 个模块 → {STRUCT}（结构视图）")
+    print(f"[compile] {len(cases)} 条用例 → {QUEUE}（全量真值，运行时状态已保留）")
+
+    # 本轮投影：按 target.scope 从 queue 过滤出 board.csv（看板/报告的本轮视图）；
+    # 结构/摘要按本轮 in-scope 子集算。全量真值 queue.csv 不受影响。
+    board_rows, scope_desc, id_set = project_board_from_queue()
+    scope_cases = [c for c in cases if c["id"] in id_set]
+    nmod = build_structure(scope_cases)
+    build_summary(board_rows, scope_desc)
+    print(f"[compile] 本轮范围 {scope_desc} → {BOARD}（board 看板视图）")
+    print(f"[compile] {nmod} 个模块 → {STRUCT}（本轮结构视图）")
     print(f"[compile] 摘要计数已刷新 → {SUMMARY}")
 
 

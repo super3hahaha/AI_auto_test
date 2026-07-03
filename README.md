@@ -11,18 +11,41 @@ AI 当测试工程师、用 ADB 驱动安卓模拟器的自动化测试框架。
 - `tools/sheets_sync.py` —— 把账本推到 Google Sheets。
 - `tools/doc_report.py` —— 把账本 + 证据截图渲染成一份 **Google Doc 图文报告**（指标概览 / 执行清单 + 状态追踪 / 结构覆盖 / 问题清单 / 内嵌截图 / 变更时间线）。用 OAuth（你本人授权），Doc 与截图都归你所有。
 - `cases/*.yaml` —— 用例定义；由 skill `adb-testcase-gen` 从一句话目标生成。`_TEMPLATE.yaml` 是通用字段模板；`CUT-CORE-01.yaml` 是唯一保留的 **MP3 Cutter 示例**（跑通给你看完整流程用的，换被测 App 时替换/删除，见下）。仓库定位是通用框架，不带完整业务用例集——本机可以写自己的 `cases/*.yaml`，`.gitignore` 里已经排除了一份体量较大的示例回归集（`regression.yaml`），避免真实业务内容混进框架库。
-- `ledger/*.csv` —— 账本（运行时真值），7 个 CSV 对应原表 7 个 Tab；**本机执行产物，不进 git**（多人协作会冲突，团队共享真值是 Sheet），fresh clone 先跑 `python3 tools/compile_cases.py` 从 `cases/*.yaml` 重新汇编。
+- `ledger/*.csv` —— 账本（运行时真值）。`queue.csv` 是**全量真值**（所有用例 + 运行时状态）；`board.csv` 是按 `config/target.json` 的 `scope` 从 queue 投影出的**本轮清单**（看板/报告只显示本轮范围，见「本轮回归范围」一节），其余 CSV 对应看板各 tab。**本机执行产物，不进 git**（多人协作会冲突，团队共享真值是 Sheet），fresh clone 先跑 `python3 tools/compile_cases.py` 从 `cases/*.yaml` 重新汇编（会一并生成 board.csv）。
 - `docs/RUNBOOK.md` —— 执行大脑的行动协议（**新会话先读它**）。
 - `docs/structure.md` / `docs/gotchas.md` / `docs/decisions.md` —— 结构、已知坑、架构决策。
 
 > ⚠️ Google Sheet 是**只读展示视图**（从 YAML 渲染）。要增删/改用例请在对话里说，由 Claude 改 `cases/*.yaml`；**别在表里手改**，会被下次同步覆盖。详见 `docs/decisions.md`。
+
+## 数据流：从生成用例到执行
+
+全量真值 `queue.csv` 经 `scope` 投影出本轮清单 `board.csv`；执行大脑对着本轮范围干活，判定后状态**回写 `queue.csv`**（真值），看板/报告只读本轮 `board`。
+
+![用例数据流：从生成用例到执行](docs/assets/dataflow.png)
+
+> 图源为 [docs/assets/dataflow.svg](docs/assets/dataflow.svg)，改图后用 `rsvg-convert -z 2 docs/assets/dataflow.svg -o docs/assets/dataflow.png` 重新导出 PNG。
+
+关键闭环是 `queue.csv ⇄ board.csv`：状态真值永远在全量 `queue.csv`，`board.csv` 只是它按 `scope` 过滤出的、随时可重建的本轮投影——所以缩放范围不丢状态，看板也不会被范围外用例干扰。
+
+## 用例的执行机制
+
+「执行一条用例」有两种机制，由该用例 `固化脚本` 列（YAML 的 `frozen_script` 字段）决定走哪条：
+
+| 机制 | 怎么跑 | 特点 | 何时用 |
+|---|---|---|---|
+| **① 固化脚本** | `run_flow.py <ID> flows/xxx.sh` | 纯选择器、无 AI 逐屏推理，快、可多设备并行；自动计时 + 登记 | 已探通并固化过脚本、UI 没变 |
+| **② 主循环逐屏** | 用 `adbkit.py` 一屏屏 `ui→tap→shot→logscan` 探路 + 采证 | 慢但健壮，能应对没跑过 / UI 变了；也是固化脚本的来源 | `固化脚本` 列为空，或脚本跑挂要回退重探 |
+
+> **硬规则**：跑固化脚本一律走 `run_flow.py`，绝不裸 `bash flows/xxx.sh`（否则 `log.csv`/`queue.csv` 不留痕）。无论哪种机制，通过/失败判定都要人工看 `output-check`/`logscan` 后补一行登记。
+
+与「执行机制」正交的是**范围口径**（一次跑多少）：跑单条 / 跑本轮全部（从 board 范围内挑待执行，一条条到没有待执行为止——"待执行"以 `queue.csv` 实时状态为准）/ 重跑某条。「本轮」由 `scope` 框定，见下方「本轮回归范围」。
 
 ## 快速开始
 
 ```bash
 # 1. 配置被测 App
 cp config/target.example.json config/target.json
-#   编辑：package / db_name / （多设备时）serial / sheet_id
+#   编辑：package / db_name / （多设备时）serial / sheet_id / （可选）scope 本轮范围
 
 # 2. 连上模拟器，确认可用（App 需 debuggable 才能导 DB/SP）
 adb devices
@@ -68,6 +91,17 @@ python3 tools/sheets_sync.py
 3. 用 skill `adb-testcase-gen`（或直接对话说测试目标）重新生成 `cases/*.yaml`。
 4. 稳定路径再按 `docs/flow-freeze.md` 固化成新的 `flows/flow_*.sh`。
 
+## 本轮回归范围（scope / board.csv）
+
+一次回归不一定跑全量。`config/target.json` 的 `scope` 字段框定本轮范围：
+
+- 留空 = 全量；
+- 一组优先级：`"P0"` 或 `"P0,P1"`；
+- 一组用例ID：`"CUT-CORE-01,CUT-EDGE-01"`；
+- 优先级与用例ID 不能混写，写错/写不存在的会直接报错（不会静默变空）。
+
+`compile_cases.py` 按 scope 从全量 `queue.csv` 投影出 `board.csv`（本轮清单，执行顺序号重编 1..N）。**全量真值永远在 `queue.csv`，不受 scope 影响**；看板「测试队列」tab、Doc 报告、结构/摘要都读 board，只显示本轮，避免"只回归 P0 却看到一堆待回归用例"的迷惑（报告顶部带「本轮范围：P0,P1（8/全量14）」声明防反向误解）。改范围只需编辑 scope 再 compile/sync；放宽范围不丢状态（历史都在 queue）。详见 `docs/RUNBOOK.md`「本轮范围」节与 `docs/decisions.md` #17。
+
 ## Google Sheets 同步（可选，云端看板）
 
 一次性：
@@ -100,6 +134,22 @@ python3 tools/doc_report.py --new        # 另建一份新 Doc
 
 覆盖式刷新（同 sheets_sync）：既存 Doc 先清空再重画，**别在 Doc 里手改**。生成后会把链接回写进 `summary.csv`，
 再跑 `sheets_sync.py` 即可让看板摘要也带上 Doc 链接。
+
+## 云端账号与多账号切换（oauth_account）
+
+`new_run` 建表、`doc_report` 建 Doc / 传证据图，都用 **OAuth（你本人授权）**——因为服务账号(SA)无 Drive 配额、不能建文件（SA 只负责 sheets_sync 往已建好的表里写数据）。OAuth token 按账号存成 `config/oauth_token.<account>.json`，`target.json` 的 `oauth_account` 字段选用哪个：
+
+- 留空 = `config/oauth_token.json`（默认单账号）
+- 填 `<acct>` = `config/oauth_token.<acct>.json`（如 `inshot` → `oauth_token.inshot.json`）
+
+多个账号的 token **可以共存**，切换只改 `oauth_account`、**不用重新授权**（前提该账号 token 已授权存在）。
+
+**换成一个新账号**（含企业 Workspace 账号）：
+1. GCP OAuth 同意屏幕把新账号加为**测试用户**；
+2. 改 `oauth_account`（或删对应 token 文件）→ 下次跑 `new_run`/`doc_report` 弹浏览器用新账号授权；
+3. **旧账号建的产物新账号访问不到**——把 `target.json` 的 `doc_id`/`image_folder_id` 清空让脚本在新账号 Drive 重建；`sheet_id` 那张旧表 SA 仍能写（归属仍是旧账号），想让表也归新账号得 `new_run` 重建。
+
+> 企业 Workspace 账号还要过两关：管理员允许第三方 OAuth 应用、允许向外部 SA 邮箱共享。凭证一律不进 git（`.gitignore` 用 `config/oauth_token*` 通配）。
 
 ## 证据类型说明
 

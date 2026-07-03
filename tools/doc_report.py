@@ -33,31 +33,43 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 LEDGER = ROOT / "ledger"
 CFG_PATH = ROOT / "config/target.json"
 OAUTH_CLIENT = ROOT / "config/oauth_client.json"
-OAUTH_TOKEN = ROOT / "config/oauth_token.json"
+
+
+def _oauth_token_path():
+    """按 target.json 的 oauth_account 选 token 文件——多账号 token 共存、切换免重授权。
+    留空=config/oauth_token.json（默认）；填 <acct>=config/oauth_token.<acct>.json。"""
+    acct = ""
+    if CFG_PATH.exists():
+        try:
+            acct = (json.loads(CFG_PATH.read_text()).get("oauth_account") or "").strip()
+        except Exception:
+            acct = ""
+    return ROOT / (f"config/oauth_token.{acct}.json" if acct else "config/oauth_token.json")
+
+
+OAUTH_TOKEN = _oauth_token_path()
 IMAGE_FOLDER_NAME = "AI_auto_test 证据图"
+
+sys.path.insert(0, str(ROOT / "tools"))
+from compile_cases import project_board_from_queue  # 复用 scope→board 投影
 
 SCOPES = [
     "https://www.googleapis.com/auth/documents",
     "https://www.googleapis.com/auth/drive.file",  # 仅本 app 建/传的文件，够用且授权面最小
 ]
 
-# ---- 颜色 ----
-GREEN = {"red": 0.13, "green": 0.53, "blue": 0.20}
-RED = {"red": 0.80, "green": 0.13, "blue": 0.13}
-ORANGE = {"red": 0.90, "green": 0.55, "blue": 0.00}
-GREY = {"red": 0.42, "green": 0.42, "blue": 0.42}
-BLUE = {"red": 0.10, "green": 0.35, "blue": 0.80}
-TEAL = {"red": 0.04, "green": 0.45, "blue": 0.37}  # 同 Sheet 表头墨绿 #0B735F
+# ---- 颜色（对齐参考模板"录屏App自动化回归测试报告.docx"的配色）----
+def hexc(h):
+    return {"red": int(h[0:2], 16) / 255, "green": int(h[2:4], 16) / 255, "blue": int(h[4:6], 16) / 255}
 
-# 执行结果 → (符号, 颜色)；用于执行清单前缀
-RESULT_MARK = {
-    "通过": ("✅", GREEN),
-    "失败": ("❌", RED),
-    "阻塞": ("⛔", ORANGE),
-    "覆盖缺口": ("⚠️", ORANGE),
-    "需复核": ("🔁", ORANGE),
-}
-STATUS_MARK = {"执行中": ("⏳", BLUE), "待执行": ("☐", GREY), "已完成": ("✅", GREEN)}
+
+DARK = hexc("1F2937")   # 标题/表头深色，同时是表头底色
+GREEN = hexc("15803D")
+RED = hexc("B91C1C")
+GREY = hexc("6B7280")
+BLUE = hexc("2563EB")
+TEAL = BLUE  # 参考模板只有一个强调色（蓝），不再单独用墨绿
+WHITE = {"red": 1, "green": 1, "blue": 1}
 
 
 def u16(s):
@@ -124,12 +136,14 @@ class DocBuilder:
     def newline(self, n=1):
         self.text += "\n" * n
 
-    def heading(self, s, level=2):
+    def heading(self, s, level=2, color=None):
         start = self.pos
         self.text += s + "\n"
         end = self.pos
         named = {1: "HEADING_1", 2: "HEADING_2", 3: "HEADING_3"}[level]
         self.para_styles.append((start, end, {"namedStyleType": named}, "namedStyleType"))
+        if color:
+            self.text_styles.append((start, end, {"foregroundColor": {"color": {"rgbColor": color}}}, "foregroundColor"))
 
     def title(self, s):
         start = self.pos
@@ -158,46 +172,132 @@ class DocBuilder:
         self.images.append((off, uri, width_pt))
         self.text += "\n"  # 图片将插在这个换行之前，独占一行
 
-    # ---- 落地到某个 Doc ----
-    def execute(self, docs, doc_id):
-        doc = docs.documents().get(documentId=doc_id).execute()
+
+# ============================ 增量写入 Doc（支持穿插表格）============================
+class LiveDoc:
+    """跟 DocBuilder 配合：DocBuilder 只管拼一段纯文本+样式，LiveDoc 负责把一段段内容
+    依次真正写进 Google Doc，并在段落之间插入表格（表格的单元格 index 只有插入后才知道，
+    没法像纯文本那样离线拼好一把插入，所以整份报告改成"分段写入"而不是一次性 execute）。
+    """
+
+    def __init__(self, docs, doc_id):
+        self.docs = docs
+        self.doc_id = doc_id
+        self.cursor = 1
+        self.ok = 0
+        self.fail = 0
+
+    def _batch(self, requests):
+        for i in range(0, len(requests), 400):
+            self.docs.documents().batchUpdate(
+                documentId=self.doc_id, body={"requests": requests[i:i + 400]}).execute()
+
+    def clear(self):
+        doc = self.docs.documents().get(documentId=self.doc_id).execute()
         end = doc["body"]["content"][-1]["endIndex"]
         if end > 2:
-            docs.documents().batchUpdate(documentId=doc_id, body={"requests": [
-                {"deleteContentRange": {"range": {"startIndex": 1, "endIndex": end - 1}}}]}).execute()
+            self._batch([{"deleteContentRange": {"range": {"startIndex": 1, "endIndex": end - 1}}}])
+        self.cursor = 1
 
-        docs.documents().batchUpdate(documentId=doc_id, body={"requests": [
-            {"insertText": {"location": {"index": 1}, "text": self.text}}]}).execute()
+    def flush(self, b):
+        """把一个 DocBuilder 缓冲区插入到当前 cursor 位置，随后 cursor 前移到本段末尾。"""
+        if not b.text:
+            return
+        base = self.cursor
+        self._batch([{"insertText": {"location": {"index": base}, "text": b.text}}])
 
         style_reqs = []
-        for s, e, ps, fields in self.para_styles:
+        for s, e, ps, fields in b.para_styles:
             style_reqs.append({"updateParagraphStyle": {
-                "range": {"startIndex": 1 + s, "endIndex": 1 + e},
+                "range": {"startIndex": base + s, "endIndex": base + e},
                 "paragraphStyle": ps, "fields": fields}})
-        for s, e, preset in self.bullets:
+        for s, e, preset in b.bullets:
             style_reqs.append({"createParagraphBullets": {
-                "range": {"startIndex": 1 + s, "endIndex": 1 + e}, "bulletPreset": preset}})
-        for s, e, ts, fields in self.text_styles:
+                "range": {"startIndex": base + s, "endIndex": base + e}, "bulletPreset": preset}})
+        for s, e, ts, fields in b.text_styles:
             style_reqs.append({"updateTextStyle": {
-                "range": {"startIndex": 1 + s, "endIndex": 1 + e},
+                "range": {"startIndex": base + s, "endIndex": base + e},
                 "textStyle": ts, "fields": fields}})
-        for i in range(0, len(style_reqs), 400):
-            docs.documents().batchUpdate(documentId=doc_id,
-                                         body={"requests": style_reqs[i:i + 400]}).execute()
+        if style_reqs:
+            self._batch(style_reqs)
 
         # 倒序插图：在小索引插入只影响其后的内容，倒序保证未处理的图片偏移不失效
-        ok, fail = 0, 0
-        for off, uri, w in sorted(self.images, key=lambda x: -x[0]):
+        for off, uri, w in sorted(b.images, key=lambda x: -x[0]):
             try:
-                docs.documents().batchUpdate(documentId=doc_id, body={"requests": [
-                    {"insertInlineImage": {
-                        "location": {"index": 1 + off}, "uri": uri,
-                        "objectSize": {"width": {"magnitude": w, "unit": "PT"}}}}]}).execute()
-                ok += 1
+                self._batch([{"insertInlineImage": {
+                    "location": {"index": base + off}, "uri": uri,
+                    "objectSize": {"width": {"magnitude": w, "unit": "PT"}}}}])
+                self.ok += 1
             except Exception as ex:
-                fail += 1
+                self.fail += 1
                 print(f"[warn] 插图失败（跳过）：{uri} -> {ex}")
-        return ok, fail
+
+        self.cursor = base + b.pos
+
+    def table(self, headers, rows, header_bg=DARK, cell_color_fn=None):
+        """在 cursor 处插入一张表格（首行表头），headers/rows 均为字符串二维结构。
+        cell_color_fn(row_idx, col_idx, text) -> 颜色 dict|None，给数据行单元格文字上色，不传就用默认深色。
+        """
+        all_rows = [list(headers)] + [list(r) for r in rows]
+        n_rows, n_cols = len(all_rows), len(headers)
+        self._batch([{"insertTable": {"rows": n_rows, "columns": n_cols, "location": {"index": self.cursor}}}])
+
+        doc = self.docs.documents().get(documentId=self.doc_id).execute()
+        table_el = [el for el in doc["body"]["content"] if "table" in el][-1]
+        table = table_el["table"]
+
+        cells = []  # (原始起始 index, 行, 列, 文本)
+        for ri, row in enumerate(table["tableRows"]):
+            for ci, cell in enumerate(row["tableCells"]):
+                text = str(all_rows[ri][ci]) if ci < len(all_rows[ri]) else ""
+                cells.append((cell["content"][0]["startIndex"], ri, ci, text))
+
+        # 表头底色：按行列的逻辑坐标定位，不依赖字符 index
+        if header_bg:
+            bg_reqs = [{"updateTableCellStyle": {
+                "tableCellStyle": {"backgroundColor": {"color": {"rgbColor": header_bg}}},
+                "fields": "backgroundColor",
+                "tableRange": {
+                    "tableCellLocation": {"tableStartLocation": {"index": table_el["startIndex"]},
+                                           "rowIndex": 0, "columnIndex": ci},
+                    "rowSpan": 1, "columnSpan": 1}}} for ci in range(n_cols)]
+            self._batch(bg_reqs)
+
+        # 填文字：按原始 startIndex 降序排列，合并进同一个 batchUpdate（同一批请求按数组顺序依次生效，
+        # 大的先插不影响排在后面、还没处理的更小位置——原理同旧版倒序插图；一张表只发一次请求，避免
+        # 逐格分开调用把 Docs API 60次/分钟的写配额挤爆（见 docs/decisions.md 表格插入方式的记录）
+        text_reqs = [{"insertText": {"location": {"index": start}, "text": text}}
+                     for start, ri, ci, text in sorted(cells, key=lambda x: -x[0]) if text]
+        if text_reqs:
+            self._batch(text_reqs)
+
+        # 文字样式：按原始 startIndex 升序累加前面已插入文本的长度，换算出插入完成后的真实区间
+        text_style_reqs = []
+        cumulative = 0
+        for start, ri, ci, text in sorted(cells, key=lambda x: x[0]):
+            if text:
+                real_start = start + cumulative
+                real_end = real_start + u16(text)
+                style, fields = {"bold": True}, ["bold"]
+                if ri == 0:
+                    style["foregroundColor"] = {"color": {"rgbColor": WHITE}}
+                    fields.append("foregroundColor")
+                else:
+                    color = cell_color_fn(ri - 1, ci, text) if cell_color_fn else None
+                    if color:
+                        style["foregroundColor"] = {"color": {"rgbColor": color}}
+                        fields.append("foregroundColor")
+                text_style_reqs.append({"updateTextStyle": {
+                    "range": {"startIndex": real_start, "endIndex": real_end},
+                    "textStyle": style, "fields": ",".join(fields)}})
+                cumulative += u16(text)
+        if text_style_reqs:
+            self._batch(text_style_reqs)
+
+        # 表格结束后固定跟一个空段落；重新查一次文档拿 endIndex 最省心，不用自己心算位移
+        doc2 = self.docs.documents().get(documentId=self.doc_id).execute()
+        table_el2 = [el for el in doc2["body"]["content"] if "table" in el][-1]
+        self.cursor = table_el2["endIndex"]
 
 
 # ============================ 认证 / 服务 ============================
@@ -309,135 +409,162 @@ def case_screenshots_fallback(link):
     return pics[:6]
 
 
-def build_report(b, drive, folder_id, want_images):
+def insert_case_evidence(b, drive, folder_id, want_images, cid, evidence, current_link, queue_shot, max_images=None):
+    """插入一条用例的关键截图 + 文本证据摘录（②失败用例、③通过用例共用这一段渲染逻辑）。
+
+    `max_images`：截图张数上限（③节"核心用例放1张、非核心不放"要求用），None 表示不限制。
+    """
+    pics, key_texts = case_key_evidence(cid, evidence, current_link, queue_shot)
+    if not pics and not key_texts:
+        pics = case_screenshots_fallback(current_link)  # 该用例还没按新规标注，退回旧逻辑
+    if max_images is not None:
+        pics = pics[:max_images]
+    if want_images:
+        for p in pics:
+            name = f"{cid}__{pathlib.Path(p).parent.parent.name}__{pathlib.Path(p).name}"
+            try:
+                uri = upload_png(drive, folder_id, p, name, build_report._cache)
+                b.image(uri, width_pt=170)
+                b.para([(pathlib.Path(p).name, {"color": GREY, "italic": True})])
+            except Exception as ex:
+                print(f"[warn] 上传截图失败（跳过）：{p} -> {ex}")
+    for t in key_texts:
+        b.para([(f"【{t.get('证据类型','')}·关键】", {"bold": True, "color": TEAL}),
+                (f" {t.get('断言','')}", {})])
+        if t.get("文件/链接"):
+            b.para([("　证据文件：", {"color": GREY}), (t["文件/链接"], {"color": GREY, "italic": True})])
+
+
+def build_report(live, drive, folder_id, want_images):
+    """按参考模板"录屏App自动化回归测试报告.docx"的章节结构（一~八，含表格）分段写入 live。
+
+    跟表格穿插的老式"一把拼好整份文本再 execute"的 DocBuilder 模式不兼容（表格单元格 index
+    要插入后才知道），所以这里改成一段一段地 `b = DocBuilder(); ...; live.flush(b)`，
+    文本段落之间穿插 `live.table(...)`，见 docs/decisions.md 里表格写入方式的记录。
+    """
     summary = read_summary()
-    queue = read_csv("queue")
-    structure = read_csv("structure")
+    queue = read_csv("board")  # 报告基于本轮 board（scope 过滤后），非全量 queue
     issues = read_csv("issues")
     evidence = read_csv("evidence")
+    _board_ids = {r.get("用例ID") for r in queue}  # queue 即本轮 board
+    issues = [r for r in issues if r.get("用例ID") in _board_ids]  # 问题清单只留本轮用例
     cfg = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    queue_by_cid = {r.get("用例ID"): r for r in queue}
 
-    # ---- 标题区 ----
-    b.title("AI + ADB 安卓自动化测试 · 执行报告")
-    b.para([(f"被测包：{cfg.get('package','-')}    默认设备：{cfg.get('serial','-')}", {"color": GREY})])
-    b.para([(f"生成时间：{now}    数据来源：ledger/*.csv（本地账本为唯一真值）", {"color": GREY, "italic": True})])
-    b.newline()
-
-    # ---- 1. 指标概览 ----
-    b.heading("① 指标概览", 2)
     total = summary.get("总用例数", "0")
     done = summary.get("已完成", "0")
     pass_n = summary.get("通过", "0")
+    fail_n = summary.get("失败", "0")
+    blocked_n = summary.get("阻塞", "0")
     try:
         rate = f"{int(pass_n) / max(int(done), 1) * 100:.0f}%" if int(done) else "—"
     except ValueError:
         rate = "—"
-    b.para([("已完成通过率：", {"bold": True}), (rate, {"bold": True, "color": GREEN}),
-            (f"（通过 {pass_n} / 已完成 {done}）", {"color": GREY})])
-    metric_line = [
-        ("总用例", summary.get("总用例数", "0"), None),
-        ("已完成", done, None),
-        ("待执行", summary.get("待执行", "0"), GREY),
-        ("执行中", summary.get("执行中", "0"), BLUE),
-        ("通过", pass_n, GREEN),
-        ("失败", summary.get("失败", "0"), RED),
-        ("阻塞", summary.get("阻塞", "0"), ORANGE),
-        ("覆盖缺口", summary.get("覆盖缺口", "0"), ORANGE),
-        ("需复核", summary.get("需复核", "0"), ORANGE),
-        ("证据条数", summary.get("证据条数", "0"), None),
-    ]
-    for name, val, color in metric_line:
-        b.bullet([(f"{name}：", {"bold": True}),
-                  (str(val), {"bold": True, "color": color} if color else {"bold": True})])
+    high_sev_issues = [r for r in issues if r.get("严重级别", "").startswith(("P0", "P1"))]
+
+    # ---- 标题区 ----
+    b = DocBuilder()
+    b.title("AI + ADB 安卓自动化测试 · 执行报告")
+    b.para([("Automated Regression Test Report", {"color": GREY, "italic": True})])
+    b.newline()
+    b.para([("被测包：", {"bold": True, "color": DARK}), (cfg.get("package", "-"), {"color": GREY})])
+    b.para([("默认设备：", {"bold": True, "color": DARK}), (cfg.get("serial", "-"), {"color": GREY})])
+    b.para([("生成时间：", {"bold": True, "color": DARK}), (now, {"color": GREY})])
+    b.para([("本轮范围：", {"bold": True, "color": DARK}), (summary.get("本轮范围", "全量"), {"color": BLUE, "bold": True}),
+            ("（数据来源 ledger/*.csv，本地账本为唯一真值）", {"color": GREY, "italic": True})])
     b.newline()
 
-    # ---- 2. 问题清单 ----
-    b.heading("② 问题清单", 2)
-    if not issues:
-        b.para([("暂无问题记录。", {"color": GREY})])
-    for r in issues:
-        sev = r.get("严重级别", "")
-        sev_color = RED if sev in ("阻塞", "严重", "致命") else ORANGE
-        b.bullet([
-            (f"[{r.get('问题ID','')}] ", {"bold": True, "color": sev_color}),
-            (f"{sev} · ", {"color": sev_color}),
-            (r.get("标题", ""), {"bold": True}),
-            (f"　用例：{r.get('用例ID','')}", {"color": TEAL}),
-            (f"　状态：{r.get('状态','')}", {"color": GREY}),
-        ])
-        for label, key in [("预期", "预期结果"), ("实际", "实际结果"), ("备注", "负责人备注")]:
-            if r.get(key):
-                b.para([(f"　{label}：{r[key]}", {"color": GREY})])
+    # ---- 一、执行结论（规则拼装，不做环比/发布建议——ledger 没有上一轮通过率、也没有发布决策逻辑）----
+    b.heading("一、执行结论", 1, color=DARK)
+    concl = f"本轮共执行 {total} 条用例，通过率 {rate}（通过 {pass_n} / 已完成 {done}）。"
+    if issues:
+        concl += f"发现 {len(issues)} 个问题"
+        if high_sev_issues:
+            concl += f"，其中 {len(high_sev_issues)} 个为 P0/P1 高优先级"
+        concl += "，详见下方「失败用例详情」。"
+    else:
+        concl += "本轮未发现失败用例。"
+    b.para([(concl, {"bold": True, "color": BLUE})])
     b.newline()
+    live.flush(b)
 
-    # ---- 3. 证据图（图文核心）----
-    b.heading("③ 关键证据（截图 + MediaStore/日志摘录）", 2)
-    executed = [r for r in queue if r.get("证据链接")]
+    # ---- 二、结果统计（表格）----
+    b = DocBuilder()
+    b.heading("二、结果统计", 1, color=DARK)
+    live.flush(b)
+    live.table(
+        headers=["用例总数", "通过", "失败", "阻塞", "通过率"],
+        rows=[[total, pass_n, fail_n, blocked_n, rate]],
+        cell_color_fn=lambda ri, ci, text: [DARK, GREEN, RED, GREY, BLUE][ci],
+    )
+    b = DocBuilder()
+    b.para([(f"其他：覆盖缺口 {summary.get('覆盖缺口','0')}　需复核 {summary.get('需复核','0')}　"
+             f"证据条数 {summary.get('证据条数','0')}", {"color": GREY, "italic": True})])
+    b.newline()
+    live.flush(b)
+
+    # ---- 三、失败用例详情（表格）----
+    b = DocBuilder()
+    b.heading("三、失败用例详情", 1, color=DARK)
+    live.flush(b)
+    if issues:
+        rows = []
+        for r in issues:
+            cid = r.get("用例ID", "")
+            qrow = queue_by_cid.get(cid)
+            name = (qrow.get("一句话测试目标") or qrow.get("测试目的", "")) if qrow else ""
+            rows.append([cid, name, qrow.get("模块", "") if qrow else "", r.get("实际结果", ""), r.get("问题ID", "")])
+        live.table(
+            headers=["用例编号", "用例名称", "所属模块", "失败原因", "问题ID"],
+            rows=rows,
+            cell_color_fn=lambda ri, ci, text: BLUE if ci == 4 else None,
+        )
+    else:
+        b = DocBuilder()
+        b.para([("本轮无失败用例。", {"color": GREY})])
+        live.flush(b)
+    b = DocBuilder()
+    b.para([("注：以上「失败原因」摘自 issues.csv 的实际结果记录；完整预期/备注见本地账本。", {"color": GREY, "italic": True})])
+    b.newline()
+    live.flush(b)
+
+    # ---- 四、失败用例示意图（每条用例一张关键截图）----
+    b = DocBuilder()
+    b.heading("四、失败用例示意图", 1, color=DARK)
     if not want_images:
-        b.para([("（本次以 --no-images 生成，未嵌入截图；证据目录见下方链接）", {"color": GREY, "italic": True})])
-    if not executed:
-        b.para([("暂无带证据的已执行用例。", {"color": GREY})])
-    for r in executed:
+        b.para([("（本次以 --no-images 生成，未嵌入截图；证据目录见「失败用例详情」的问题ID/本地账本）", {"color": GREY, "italic": True})])
+    for r in issues:
         cid = r.get("用例ID", "")
-        b.heading(f"{cid} · {r.get('模块','')}", 3)
-        b.para([("证据目录：", {"color": GREY}), (r.get("证据链接", ""), {"color": GREY})])
-        pics, key_texts = case_key_evidence(cid, evidence, r.get("证据链接", ""), r.get("关键截图", ""))
-        if not pics and not key_texts:
-            pics = case_screenshots_fallback(r.get("证据链接", ""))  # 该用例还没按新规标注，退回旧逻辑
-        if want_images:
-            for p in pics:
-                name = f"{cid}__{pathlib.Path(p).parent.parent.name}__{pathlib.Path(p).name}"
-                try:
-                    uri = upload_png(drive, folder_id, p, name, build_report._cache)
-                    b.image(uri, width_pt=170)
-                    b.para([(pathlib.Path(p).name, {"color": GREY, "italic": True})])
-                except Exception as ex:
-                    print(f"[warn] 上传截图失败（跳过）：{p} -> {ex}")
-        # 文本类关键证据（MediaStore/logs/db/sp）——不能插图，摘录断言文字
-        for t in key_texts:
-            b.para([(f"【{t.get('证据类型','')}·关键】", {"bold": True, "color": TEAL}),
-                    (f" {t.get('断言','')}", {})])
-            if t.get("文件/链接"):
-                b.para([("　证据文件：", {"color": GREY}), (t["文件/链接"], {"color": GREY, "italic": True})])
+        qrow = queue_by_cid.get(cid)
+        b.heading(f"{r.get('问题ID','')} · {cid}  {r.get('标题','')}", 3, color=BLUE)
+        if qrow and qrow.get("证据链接"):
+            b.para([("证据目录：", {"color": GREY}), (qrow.get("证据链接", ""), {"color": GREY})])
+            insert_case_evidence(b, drive, folder_id, want_images, cid, evidence,
+                                  qrow.get("证据链接", ""), qrow.get("关键截图", ""), max_images=1)
         b.newline()
+    if not issues:
+        b.para([("本轮无失败用例，无需示意图。", {"color": GREY})])
+    live.flush(b)
 
-    # ---- 4. 执行清单 + 状态追踪 ----
-    b.heading("④ 执行清单与状态追踪", 2)
-    for r in queue:
-        res, st = r.get("执行结果", ""), r.get("当前状态", "")
-        mark, color = RESULT_MARK.get(res) or STATUS_MARK.get(st) or ("☐", GREY)
-        head = f"{mark} [{r.get('用例ID','')}] "
-        tail = f"{r.get('优先级','')} · {r.get('模块','')} · {r.get('测试目的','') or r.get('一句话测试目标','')}"
-        runs = [(head, {"bold": True, "color": color}), (tail, {})]
-        status_bits = []
-        if st:
-            status_bits.append(st)
-        if res:
-            status_bits.append(res)
-        if r.get("结束时间"):
-            status_bits.append(f"完成于 {r['结束时间']}")
-        elif r.get("开始时间"):
-            status_bits.append(f"开始于 {r['开始时间']}")
-        if status_bits:
-            runs.append(("　→ " + " / ".join(status_bits), {"color": color}))
-        b.bullet(runs)
+    # ---- 五、结论与建议（规则生成：按优先级列待办，不编具体技术方案）----
+    b = DocBuilder()
+    b.heading("五、结论与建议", 1, color=DARK)
+    if issues:
+        sev_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+        ranked = sorted(issues, key=lambda r: sev_order.get((r.get("严重级别", "") or "")[:2], 9))
+        for i, r in enumerate(ranked, 1):
+            b.para([(f"{i}. ", {"bold": True}),
+                    ("待修复：", {"bold": True, "color": DARK}),
+                    (f"{r.get('标题','')}", {}),
+                    (f"（用例 {r.get('用例ID','')}，{r.get('严重级别','')}）", {"color": GREY})])
+    else:
+        b.para([("暂无待办：本轮全部用例通过。", {"color": GREY})])
     b.newline()
-
-    # ---- 5. 结构视图 / 覆盖 ----
-    b.heading("⑤ 结构视图（模块覆盖）", 2)
-    for r in structure:
-        b.bullet([
-            (f"{r.get('模块','')}", {"bold": True}),
-            (f"（{r.get('用例数量','')} 用例 · {r.get('优先级','')}）：", {"color": GREY}),
-            (r.get("覆盖用例", ""), {}),
-        ])
-        if r.get("测试目的"):
-            b.para([("　测试点：" + r["测试目的"], {"color": GREY, "italic": True})])
-    b.newline()
-
+    # 参考模板只有一~五这五节，六（通过用例证据）、七（执行清单）、八（结构视图）都已按要求去掉。
     b.para([("本报告由 tools/doc_report.py 自动生成，覆盖式刷新——请勿在 Doc 内手改（会被下次覆盖）。"
              "用例增删改走「对话 → cases/*.yaml → compile_cases.py」。", {"color": GREY, "italic": True})])
+    live.flush(b)
 
 
 build_report._cache = {}
@@ -481,12 +608,25 @@ def main():
 
     folder_id = None
     if want_images:
-        folder_id = cfg.get("image_folder_id") or ensure_folder(drive)
+        folder_id = cfg.get("image_folder_id")
+        if folder_id:
+            try:
+                drive.files().get(fileId=folder_id, fields="id").execute()
+            except Exception:
+                print(f"[warn] image_folder_id={folder_id} 打不开（可能已在 Drive 里被删/挪走），改为重新建/找同名文件夹。")
+                folder_id = None
+        if not folder_id:
+            folder_id = ensure_folder(drive)
 
-    b = DocBuilder()
+    # 渲染前重新投影：报告读的是本轮 board（scope 过滤后），先刷新它
+    _, scope_desc, _ = project_board_from_queue()
+    print(f"[doc] 本轮范围 {scope_desc} → board.csv 已刷新")
+
+    live = LiveDoc(docs, doc_id)
+    live.clear()
     build_report._cache = {}
-    build_report(b, drive, folder_id, want_images)
-    ok, fail = b.execute(docs, doc_id)
+    build_report(live, drive, folder_id, want_images)
+    ok, fail = live.ok, live.fail
 
     url = f"https://docs.google.com/document/d/{doc_id}/edit"
     print(f"[doc] 渲染完成：插图 {ok} 成功 / {fail} 失败")

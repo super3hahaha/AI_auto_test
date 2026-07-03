@@ -1,7 +1,7 @@
 config/target.json
 config/service_account.json
 config/oauth_client.json
-config/oauth_token.json
+config/oauth_token*
 evidence/*/
 !evidence/.gitkeep
 .dumpcache/

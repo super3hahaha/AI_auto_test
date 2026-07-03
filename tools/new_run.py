@@ -28,8 +28,22 @@ import json, shutil, sys, argparse, datetime, pathlib, subprocess, csv
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CFG = ROOT / "config/target.json"
 SA_JSON = ROOT / "config/service_account.json"
-OAUTH_TOKEN = ROOT / "config/oauth_token.json"
 OAUTH_CLIENT = ROOT / "config/oauth_client.json"
+
+
+def _oauth_token_path():
+    """按 target.json 的 oauth_account 选 token 文件——多账号 token 共存、切换免重授权。
+    留空=config/oauth_token.json（默认）；填 <acct>=config/oauth_token.<acct>.json。"""
+    acct = ""
+    if CFG.exists():
+        try:
+            acct = (json.loads(CFG.read_text()).get("oauth_account") or "").strip()
+        except Exception:
+            acct = ""
+    return ROOT / (f"config/oauth_token.{acct}.json" if acct else "config/oauth_token.json")
+
+
+OAUTH_TOKEN = _oauth_token_path()
 LEDGER = ROOT / "ledger"
 RUNS = LEDGER / "runs.csv"
 ARCHIVE = LEDGER / "archive"

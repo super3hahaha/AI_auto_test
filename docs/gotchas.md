@@ -70,3 +70,22 @@ MP3Cutter 的 mp3 编码器遇到该采样率时**不报错、不拦截，直接
 ## 需要外部依赖 → 直接排除（写进 excluded.csv）
 
 Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为三星等）/ 旧 UI 专项 / 需真实 Google 账号的备份恢复。这些不在纯模拟器范围内。
+
+## target.json 的 scope 字段：写错会被拦，但要看懂报错（2026-07-03）
+
+`scope` 控制本轮回归范围（投影出 `board.csv`，见 `decisions.md` #17）。三个易踩点：
+
+- **优先级和用例ID 不能混写**：`"P0,CUT-EDGE-01"` 会报 `[scope] 不能混写优先级和用例ID`。判别规则是"全是 `P0~P3` 就当优先级组，全不是就当ID组"——想填优先级却把某个敲成字母 `O`（`P0,PO`）会被当成"混了ID"，报错会列出"无法归为优先级的"元素，照着改。
+- **写了不存在的优先级/ID 会直接 `sys.exit` 报错，不会静默变空**：`scope="P2"` 但没有 P2 用例、或 `scope="CUT-XXX"` 拼错ID，都会报"在当前用例里没有对应用例/不存在"。这是**故意**的——否则 board 静默为空，执行大脑会把"本轮 0 条"误当成"全部跑完了"。
+- **改 scope 不重置状态**：放宽范围（P0→P0,P1）时，P1 用例若之前跑过，board 里直接显示其历史状态（已完成就不会再被选中执行）。想在本轮重跑得开新一轮（`new_run.py`）或显式重置，不是改 scope 就会重跑。
+
+`board.csv` 是 `queue.csv` 的投影产物：不进 git、不归档，`compile_cases.py` / `sheets_sync.py` / `doc_report.py` 任一跑一次就重建，丢了不用慌。
+
+## 换 OAuth 账号 / 多账号 token 共存（2026-07-03）
+
+`new_run`/`doc_report` 的 OAuth token 按 `target.json` 的 `oauth_account` 选文件：`config/oauth_token.<acct>.json`（留空=`oauth_token.json`）。多账号 token 可共存、切换只改 `oauth_account` 不重授权。几个坑：
+
+- **旧账号建的产物，新账号没权限**：换账号后复用旧 `doc_id`/`image_folder_id`/`sheet_id` 会 404/无权限。Doc 会自动新建（doc_report 打不开旧 doc 就建新的），但 **`image_folder_id` 非空时不会自动 fallback → 必须手动清空**，否则传图一直 404。想让 Sheet 也归新账号得 `new_run` 重建（SA 写数据不受影响，但表归属看谁建的）。
+- **gitignore 必须用通配** `config/oauth_token*`：只写 `oauth_token.json` 的话 `oauth_token.<acct>.json` 会漏进 git（凭证泄露）。
+- **企业 Workspace 账号（如 inshot）额外三关**：① 同意屏幕加测试用户；② 管理员允许第三方/未验证 app；③ 允许向外部 SA 邮箱共享文件。本项目已实测 `zhangshixin@inshot.com` 三关全通（建表+共享外部SA+建Doc+传图）。
+- token 文件不含明文邮箱、肉眼分不出哪个账号授权——按文件名（`oauth_token.<acct>.json`）管理，别靠猜。

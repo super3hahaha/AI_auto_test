@@ -16,7 +16,7 @@
 
 用法：
   python3 tools/sheets_sync.py                 # 推全部 tab 并美化
-  python3 tools/sheets_sync.py queue log       # 只推指定 tab
+  python3 tools/sheets_sync.py board log       # 只推指定 tab
   python3 tools/sheets_sync.py --no-format     # 只推数据不套格式
 """
 import csv, json, sys, pathlib
@@ -26,16 +26,23 @@ LEDGER = ROOT / "ledger"
 CFG = json.loads((ROOT / "config/target.json").read_text()) if (ROOT / "config/target.json").exists() else {}
 SA = ROOT / "config/service_account.json"
 
+sys.path.insert(0, str(ROOT / "tools"))
+from compile_cases import project_board_from_queue  # 复用 scope→board 投影
+
 # CSV 文件名 → Sheet 里的 tab 名
 TAB_NAME = {
     "summary": "摘要",
     "structure": "结构视图",
-    "queue": "测试队列",
+    "board": "测试队列",
     "evidence": "证据链",
     "issues": "问题清单",
     "excluded": "排除用例",
     "log": "状态变更日志",
 }
+
+# 带「用例ID」列的流水表：推云端前按本轮 board 过滤，让看板只含本轮用例内容
+# （历史用例的记录留在本地全量账本 + 所属那一轮的旧 Sheet 里）
+SCOPED_TABS = {"issues", "evidence", "log"}
 
 # ---- 调色板（参照原表墨绿主色，状态色借鉴 Google Material）----
 TEAL    = "#0B735F"  # 品牌墨绿：表头 / 标题
@@ -57,7 +64,7 @@ def _rgb(hex_):
 
 # 每个 tab 的美化配置。cond 项：(列号从0起, 匹配方式 EQ/CONTAINS, 文本, 配色, 是否加粗)
 STYLE = {
-    "queue": {
+    "board": {
         "freeze_cols": 3, "checkbox_col": 0,
         "wide": {4: 190, 5: 360, 6: 150, 12: 260, 13: 200, 19: 260},
         "cond": [
@@ -232,6 +239,10 @@ def main():
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
 
+    # 推送前重新投影：确保云端「测试队列」拿到最新的本轮 board（含实时状态）
+    _, scope_desc, board_ids = project_board_from_queue()
+    print(f"[sync] 本轮范围 {scope_desc} → board.csv 已刷新")
+
     pushed = {}  # stem -> (sheet_id, ncols, nrows)
     for stem, tab in TAB_NAME.items():
         if only and stem not in only:
@@ -240,6 +251,9 @@ def main():
         if not csv_path.exists():
             continue
         rows = list(csv.reader(open(csv_path, encoding="utf-8")))
+        if stem in SCOPED_TABS and rows and "用例ID" in rows[0]:
+            ci = rows[0].index("用例ID")
+            rows = [rows[0]] + [r for r in rows[1:] if len(r) > ci and r[ci] in board_ids]
         try:
             ws = sh.worksheet(tab)
         except gspread.WorksheetNotFound:

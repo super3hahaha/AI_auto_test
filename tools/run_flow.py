@@ -82,7 +82,8 @@ def main():
 
     end_dt = datetime.datetime.now()
     end_ts = end_dt.strftime("%Y-%m-%d %H:%M:%S")
-    evidence = f"evidence/{cfg.get('app_name','')}/{cfg.get('app_version','')}/{end_dt.strftime('%Y%m%d')}/{a.case}/{serial}"
+    app_slug = cfg.get('app_slug') or cfg.get('app_name', '')
+    evidence = f"evidence/{app_slug}/{cfg.get('app_version','')}/{end_dt.strftime('%Y%m%d')}/{a.case}/{serial}"
 
     if result.returncode == 0:
         note = f"固化脚本正常退出，耗时约{elapsed:.0f}秒"

@@ -37,7 +37,7 @@ DB = CFG.get("db_name", "")
 SERIAL = CFG.get("serial", "")
 EVID_ROOT = ROOT / CFG.get("evidence_root", "evidence")
 EVID_LEDGER = ROOT / "ledger/evidence.csv"  # 采证即登记的账本（每次采集自动追加一行）
-APP = CFG.get("app_name") or PKG.split(".")[-1]
+APP = CFG.get("app_slug") or CFG.get("app_name") or PKG.split(".")[-1]  # 证据目录用的简称，跟展示用 app_name 分开（见 gotchas.md）
 _VER = None
 
 
@@ -92,7 +92,9 @@ def need_case(args):
 
 def _append_evidence(case, step, etype, abs_path, assertion="", result=""):
     """采证即登记：把这次采集追加进 ledger/evidence.csv，默认标「过程留痕，仅本地」。
-    幂等——同一 (用例ID, 文件路径) 已登记就跳过（重跑不产生重复行）。
+    不做同路径去重——同一 (用例ID, 文件路径) 同一天被多次重跑命中同一文件名时，直接在后面
+    多加一行，不覆盖/跳过之前已登记的行（旧证据保持原样，新证据接在后面，见 decisions.md #23；
+    历史多轮的筛选交给 doc_report.py 的 current_link 前缀过滤，不在写入这层做）。
     关键性不在这里判断：由人在判定环节用 case_result --evi 按文件路径升级为「关键，供报告用」。"""
     header = ["用例ID", "步骤", "证据类型", "文件/链接", "截图预览", "断言", "结果", "采集时间", "备注"]
     try:
@@ -102,15 +104,13 @@ def _append_evidence(case, step, etype, abs_path, assertion="", result=""):
     rows = list(csv.reader(open(EVID_LEDGER, encoding="utf-8"))) if EVID_LEDGER.exists() else []
     if not rows:
         rows = [header]
-    i_id, i_fp = header.index("用例ID"), header.index("文件/链接")
-    for r in rows[1:]:
-        if len(r) > i_fp and r[i_id] == case and r[i_fp] == rel:
-            return  # 已登记，幂等跳过
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    rows.append([case, step, etype, rel, "过程留痕，仅本地", assertion, result, now, "自动登记"])
+    row = [case, step, etype, rel, "过程留痕，仅本地", assertion, result, now, "自动登记"]
+    rows.append([_clean(x) for x in row])
     EVID_LEDGER.parent.mkdir(parents=True, exist_ok=True)
     with open(EVID_LEDGER, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows)
+        w = csv.writer(f)
+        w.writerows(rows)
 
 
 # ---------- 子命令 ----------
@@ -136,16 +136,53 @@ def cmd_ui(args):
     """uiautomator dump → 拉 XML 到证据目录。这是大脑"看屏"的主要依据。
     默认顺手把这次 dump 也存进 .dumpcache/<step>（screen_id 默认取 step 名，--cache 可换个名字）——
     主循环探路阶段的每次 dump 因此自动预热缓存，以后这条路径固化成脚本时可直接 --from-cache 复用，
-    不用固化那天再冷启动一次。"""
+    不用固化那天再冷启动一次。
+    --field <resource-id后缀>（可重复）：按 ET 解析直接取该控件的 text 属性，打印成
+    `FIELD:<name>=<value>` 一行——供固化脚本拼断言用。2026-07-03 踩过坑：固化脚本原来是
+    整份 XML 走 bash 管道 grep/sed/iconv 抠字段，播放中重绘偶发导致产出的字节在某些环节
+    (推测是 shell 文本处理链路)劣化成非法 UTF-8，传到下一个 python 进程的 argv 变成 lone
+    surrogate，写 evidence.csv 时 UnicodeEncodeError 直接崩脚本。给 --field 用 ET.parse
+    在 Python 里直接把值取干净，绕开整条 shell 字节处理链路，从根上不让这类损坏有机会发生。"""
     case = need_case(args)
     step = args.name
-    shell("uiautomator dump /sdcard/uidump.xml")
     out = evid_dir(case, "ui") / f"{step}.xml"
-    adb("pull", "/sdcard/uidump.xml", str(out))
+    fields = getattr(args, "fields", None)
+    values = {}
+    # --field 时最多重 dump 3 次：偶发 UI 重绘中间态会让某个控件的 text 带 lone surrogate
+    # （见 gotchas.md「选中音频进编辑器会自动播放…」），与其直接吃 _clean 兜底出来的 "??"
+    # 占位断言，不如先重新 dump 一次，大概率下一帧画面已经稳定、能拿到真实值。
+    attempts = 3 if fields else 1
+    for attempt in range(attempts):
+        shell("uiautomator dump /sdcard/uidump.xml")
+        adb("pull", "/sdcard/uidump.xml", str(out))
+        if not fields:
+            break
+        try:
+            nodes = list(_nodes_from(out)) if out.exists() else []
+        except ET.ParseError as e:
+            nodes = []
+            print(f"[ui] XML 解析失败，--field 全部留空：{e}", file=sys.stderr)
+        values = {}
+        for want in fields:
+            val = ""
+            for n in nodes:
+                rid = n.get("resource-id", "")
+                if rid == want or rid.endswith("/" + want):
+                    val = n.get("text", "")
+                    break
+            values[want] = val
+        if not any(_is_dirty(v) for v in values.values()):
+            break
+        if attempt < attempts - 1:
+            print(f"[ui] 第{attempt + 1}次 dump 抓到疑似渲染中间态（含非法字节），重新 dump 重试", file=sys.stderr)
     if out.exists():
         shutil.copyfile(out, _cache_path(args.cache_screen or step))
-    # 同时打印到 stdout，方便大脑直接读控件树
-    print(out.read_text(errors="replace") if out.exists() else "[ui] dump 失败")
+    if fields:
+        for want in fields:
+            print(f"FIELD:{want}={_clean(values.get(want, ''))}")
+    else:
+        # 同时打印到 stdout，方便大脑直接读控件树
+        print(out.read_text(errors="replace") if out.exists() else "[ui] dump 失败")
     print(f"\n[ui] 已保存 {out}", file=sys.stderr)
 
 
@@ -155,7 +192,15 @@ def cmd_shot(args):
     shell("screencap -p /sdcard/_shot.png")
     adb("pull", "/sdcard/_shot.png", str(out))
     print(f"[shot] {out}")
-    _append_evidence(case, args.name, "screenshots", out, assertion=getattr(args, "note", "") or "",
+    # 「dump 有没有喂给这条断言」是语义判断，只有写 note 的人自己知道，不按文件是否存在猜
+    # （同名 ui/<step>.xml 存在也可能只是导航用的 dump，跟这条断言无关）——由调用方用
+    # --used-dump 显式声明，合并登记一行（不拆两行）：证据类型用 + 连接，文件/链接列仍只放
+    # 截图路径，XML 按约定路径（同用例目录 ui/ 子目录+同步骤名）能推出来，不重复登记。
+    ui_dir = out.parent.parent / "ui"
+    if getattr(args, "used_dump", False) and not ui_dir.exists():
+        print(f"[shot] 警告：--used-dump 但 {ui_dir} 下没有任何 UI dump 文件，确认真的引用了 dump 数据吗？", file=sys.stderr)
+    etype = "screenshots+UI XML" if getattr(args, "used_dump", False) else "screenshots"
+    _append_evidence(case, args.name, etype, out, assertion=getattr(args, "note", "") or "",
                      result=getattr(args, "shot_result", "通过"))  # note→断言列；result→结果列（默认「通过」=这步走到了）
 
 
@@ -170,6 +215,29 @@ _BOUNDS = re.compile(r"\[(\d+),(\d+)\]\[(\d+),(\d+)\]")
 
 def _nodes_from(path):
     return ET.parse(path).getroot().iter("node")
+
+
+def _is_dirty(s):
+    """判断字符串是否带 lone surrogate（编不成 utf-8）——用来决定要不要重新 dump 重试。"""
+    if not isinstance(s, str):
+        return False
+    try:
+        s.encode("utf-8")
+        return False
+    except UnicodeEncodeError:
+        return True
+
+
+def _clean(s):
+    """兜底清掉字符串里的 lone surrogate（无效字节经 surrogateescape 解码后的产物），
+    防止写 evidence.csv/打印 FIELD 时 UnicodeEncodeError 崩掉整条固化脚本。2026-07-03
+    实测过：MP3Cutter 选中音频进编辑器偶发 UI 重绘瞬间，uiautomator dump 抓到的某个
+    文本控件会带无效字节（推测是动画切换帧时半个多字节字符被截断），--field/--used-dump
+    这条链路本身没有编码问题，但源头数据本来就脏——只能在往外吐的地方兜底替换，不能假设
+    "先让屏幕静止再 dump" 能百分百避免（已经这么做过，仍然复现）。"""
+    if not isinstance(s, str):
+        return s
+    return s.encode("utf-8", "replace").decode("utf-8")
 
 
 def _safe(s):
@@ -420,14 +488,26 @@ def _field(row, name):
     return m.group(1).strip() if m else None
 
 
+# 另存为弹窗「格式」下拉的显示名 → mime_type 里应出现的关键字（不完整，遇到新格式按 mime_type 实测结果补）。
+FORMAT_MIME_HINTS = {
+    "MP3": "mpeg", "M4A": "mp4", "M4R": "mp4", "WAV": "wav",
+    "AAC": "aac", "FLAC": "flac", "OGG": "ogg", "WMA": "wma",
+}
+
+
 def cmd_output_check(args):
     """查 MediaStore 里最新的音频文件，独立验证"输出确实生成"（非 debug 包读不了 DB 时的黑盒断言）。
     --expect <子串>：断言最新文件名含该串，不含则 exit 非0。
     带 _data（设备端真实文件路径），方便证据里直接给出可在设备上核对的绝对路径，不只是 MediaStore 元数据。
     --expect 命中后默认还会做一层完整性检查（_size>0 且 duration 非空/非0）——只看文件名存在
     抓不住"文件生成了但是空壳/损坏"这类静默失败（BUG-CUT-EDGE-01 就是这样：文件名、日期都正常，
-    _size=0/duration=NULL）。确实需要断言"应该是空文件"的场景用 --allow-empty 跳过这层检查。"""
-    proj = "_display_name:_size:duration:date_added:_data"
+    _size=0/duration=NULL）。确实需要断言"应该是空文件"的场景用 --allow-empty 跳过这层检查。
+    --expect-duration-ms <N>：进一步跟另一个独立来源量到的时长（比如编辑器选区、结果页显示）做
+    交叉核对，|实际-预期|<=--tolerance-ms（默认1000ms，容忍编码取整误差）才算一致，结论直接写进
+    这行证据的断言里——不然"完整性通过"这种话只证明"文件不是空壳"，证明不了"时长对不对"。
+    --expect-format <格式名>：跟另存为弹窗里读到的格式（如 format_text="MP3"）交叉核对 mime_type，
+    防止"保存框显示MP3，落盘却是别的格式"这类静默错位测不出来。"""
+    proj = "_display_name:_size:duration:date_added:_data:mime_type"
     uri = "content://media/external/audio/media"
     r = shell(f'content query --uri {uri} --projection {proj} --sort "date_added DESC"')
     rows = [l.strip() for l in (r.stdout or "").splitlines() if l.strip().startswith("Row:")]
@@ -436,26 +516,51 @@ def cmd_output_check(args):
     top = rows[: args.n]
     for l in top:
         print(" ", l[:160])
+
+    extra, fail_msg = "", None
+    if args.expect:
+        newest = rows[0]
+        if args.expect not in newest:
+            fail_msg = f"[output-check] ✗ 最新音频不含 {args.expect!r}：{newest[:140]}"
+        else:
+            print(f"[output-check] ✓ 最新音频含 {args.expect!r}")
+            if not args.allow_empty:
+                size_s, dur_s = _field(newest, "_size"), _field(newest, "duration")
+                size = int(size_s) if size_s and size_s.lstrip("-").isdigit() else 0
+                dur_ok = dur_s not in (None, "NULL", "0")
+                problems = [f"_size={size_s}"] if size <= 0 else []
+                if not dur_ok:
+                    problems.append(f"duration={dur_s}")
+                if problems:
+                    fail_msg = f"[output-check] ✗ 文件存在但疑似空壳/损坏（{', '.join(problems)}）：{newest[:140]}"
+                else:
+                    print(f"[output-check] ✓ 完整性检查通过（_size={size_s}, duration={dur_s}）")
+                    if args.expect_duration_ms is not None:
+                        actual_ms = int(dur_s)
+                        diff = abs(actual_ms - args.expect_duration_ms)
+                        ok = diff <= args.tolerance_ms
+                        verdict = "一致" if ok else "不一致"
+                        extra = f"；与预期时长{args.expect_duration_ms}ms对比{verdict}（实际{actual_ms}ms，差{diff}ms，容忍{args.tolerance_ms}ms）"
+                        print(f"[output-check] {'✓' if ok else '✗'} 时长对比{verdict}：实际{actual_ms}ms vs 预期{args.expect_duration_ms}ms（差{diff}ms）")
+                        if not ok:
+                            fail_msg = fail_msg or f"[output-check] ✗ 时长与预期不一致：实际{actual_ms}ms vs 预期{args.expect_duration_ms}ms（差{diff}ms，容忍{args.tolerance_ms}ms）"
+                    if args.expect_format:
+                        mime = (_field(newest, "mime_type") or "").lower()
+                        hint = FORMAT_MIME_HINTS.get(args.expect_format.upper(), args.expect_format.lower())
+                        ok = hint in mime
+                        verdict = "一致" if ok else "不一致"
+                        extra += f"；与预期格式{args.expect_format!r}对比{verdict}（实际mime_type={mime or '空'}）"
+                        print(f"[output-check] {'✓' if ok else '✗'} 格式对比{verdict}：预期{args.expect_format!r} vs 实际mime_type={mime or '空'}")
+                        if not ok:
+                            fail_msg = fail_msg or f"[output-check] ✗ 格式与预期不一致：预期{args.expect_format!r} vs 实际mime_type={mime or '空'}"
+
     if args.case:
         oc_out = evid_dir(args.case, "logs") / "output-check.txt"
         oc_out.write_text("\n".join(rows[: args.n]))
         _append_evidence(args.case, "output-check", "MediaStore", oc_out,
-                         assertion=(f"最新产物: {rows[0][:110]}" if rows else ""))
-    if args.expect:
-        newest = rows[0]
-        if args.expect not in newest:
-            sys.exit(f"[output-check] ✗ 最新音频不含 {args.expect!r}：{newest[:140]}")
-        print(f"[output-check] ✓ 最新音频含 {args.expect!r}")
-        if not args.allow_empty:
-            size_s, dur_s = _field(newest, "_size"), _field(newest, "duration")
-            size = int(size_s) if size_s and size_s.lstrip("-").isdigit() else 0
-            dur_ok = dur_s not in (None, "NULL", "0")
-            problems = [f"_size={size_s}"] if size <= 0 else []
-            if not dur_ok:
-                problems.append(f"duration={dur_s}")
-            if problems:
-                sys.exit(f"[output-check] ✗ 文件存在但疑似空壳/损坏（{', '.join(problems)}）：{newest[:140]}")
-            print(f"[output-check] ✓ 完整性检查通过（_size={size_s}, duration={dur_s}）")
+                         assertion=(f"最新产物: {rows[0][:160]}{extra}" if rows else ""))
+    if fail_msg:
+        sys.exit(fail_msg)
 
 
 def cmd_privls(args):
@@ -497,10 +602,16 @@ def build_parser():
     s = sub.add_parser("ui"); s.add_argument("name")
     s.add_argument("--cache", dest="cache_screen", default=None,
                    help="缓存槽名，默认用 <name>（不传就自动按 step 名存进 .dumpcache，供固化脚本 --from-cache 复用）")
+    s.add_argument("--field", dest="fields", action="append", default=[],
+                   help="按 resource-id 后缀取 text 属性，打印 FIELD:<name>=<value>（可重复，给了就不再打印整份XML）")
     s.set_defaults(fn=cmd_ui)
     s = sub.add_parser("shot"); s.add_argument("name")
     s.add_argument("note", nargs="?", default="", help="这步的一句话说明，写进证据断言列（不用精细，如「进入选择音频列表」）")
     s.add_argument("--result", dest="shot_result", default="通过", help="这步结果，默认「通过」（截到图=走到了）；失败分支截图传「失败/需复核」")
+    s.add_argument("--used-dump", dest="used_dump", action="store_true",
+                   help="这条 note 断言引用了 ui dump 里的数据（比如控件文本里的精确数值），不是纯看截图写的——"
+                        "证据类型登记为 screenshots+UI XML。由调用方（执行大脑/固化脚本作者）显式声明，"
+                        "不按文件是否存在猜，因为「dump 有没有喂给判断」只有写断言的人自己知道")
     s.set_defaults(fn=cmd_shot)
     s = sub.add_parser("tap"); s.add_argument("x"); s.add_argument("y"); s.set_defaults(fn=cmd_tap)
     # 按选择器点击：坐标从当前设备 UI 树现算，天然跨分辨率
@@ -557,6 +668,13 @@ def build_parser():
     s.add_argument("--n", type=int, default=3, help="列出最近 N 个(默认3)")
     s.add_argument("--allow-empty", action="store_true",
                     help="跳过 _size>0/duration 非空的完整性检查（仅用于明确预期空/异常输出的场景）")
+    s.add_argument("--expect-duration-ms", type=int, default=None, dest="expect_duration_ms",
+                    help="预期时长(ms)，通常来自另一独立来源（如编辑器选区、结果页显示）算出来的值，"
+                         "跟 MediaStore 实测 duration 交叉核对，结论写进这行证据的断言")
+    s.add_argument("--tolerance-ms", type=int, default=1000, dest="tolerance_ms",
+                    help="上面那项的容忍误差(ms)，默认1000（容忍编码取整误差）")
+    s.add_argument("--expect-format", dest="expect_format", default=None,
+                    help="预期格式(如 MP3/WAV/AAC，通常来自另存为弹窗 format_text)，跟 mime_type 交叉核对")
     s.set_defaults(fn=cmd_output_check)
     s = sub.add_parser("alarm"); s.add_argument("label"); s.set_defaults(fn=cmd_alarm)
     return p

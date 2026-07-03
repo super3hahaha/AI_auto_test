@@ -20,6 +20,7 @@ AK="python3 tools/adbkit.py --serial $S"
 CASE="CUT-CORE-01"   # 纯用例ID；证据路径里的设备段由 adbkit 按 --serial 自动加，别把 serial 掺进 --case
 SRC="assets/陈一发儿 - 童话镇.mp3"
 DEV_DST="/sdcard/Music/陈一发儿 - 童话镇.mp3"
+SRC_NAME="$(basename "$SRC")"
 log(){ echo "[$S] $*"; }
 
 adb -s "$S" push "$SRC" "$DEV_DST" >/dev/null
@@ -44,7 +45,11 @@ $AK tapid permission_allow_button --timeout 6 >/dev/null 2>&1 || true
 $AK waitfor text 选择音频 --timeout 8 --cache picker >/dev/null
 $AK --case "$CASE" shot 02-picker "进入「选择音频」列表" >/dev/null; log "选择音频"
 
-$AK taptext 童话镇 --partial --timeout 8 >/dev/null
+# 精确匹配纯文件名，不加 --partial——2026-07-03 实测过"童话镇" --partial 命中 3~4 个候选
+# （历史裁剪产物 AudioCutter_/AudioCutter_AudioCutter_/... 前缀的都含"童话镇"子串），列表并不是
+# "新推的排最前"，盲点第 0 个曾经点到过一轮历史产物再剪一遍。exact 匹配只有纯文件名这一个
+# 节点的 text 完全相等，天然排除所有带前缀的历史产物，不依赖列表排序假设。
+$AK taptext "$SRC_NAME" --timeout 8 >/dev/null
 $AK waitfor id take_save --timeout 8 --cache editor >/dev/null
 
 # 清数据后首次进剪辑器会弹 5 步新手引导遮罩，挡住保存按钮；连点遮罩把它关掉（最多5次，
@@ -52,16 +57,57 @@ $AK waitfor id take_save --timeout 8 --cache editor >/dev/null
 for i in 1 2 3 4 5; do
   $AK tapid guide_mask_view --timeout 2 >/dev/null 2>&1 || break
 done
-$AK --case "$CASE" shot 03-editor "进入剪辑器，新手引导已关、保留默认选区" >/dev/null; log "剪辑器（保留默认选区，引导已关）"
+
+# 选中音频进编辑器会自动开始播放——dump 撞上播放中控件重绘的瞬间可能拿到不稳定/
+# 半更新的文本，先点暂停停下来再 dump（best-effort，找不到 play_btn 就跳过，不阻断）。
+$AK tapid play_btn --timeout 3 >/dev/null 2>&1 || true
+
+# 断言不能只说"进了剪辑器"——裁没裁对，得看选区的精确起止/总时长，这是后面结果页/
+# MediaStore 三方交叉核对的基准值。数值来自 ui dump 里 start_time_text/end_time_text/
+# progress_time_text 三个控件的可访问文本（真实读出来的，不是识图猜的），--used-dump
+# 声明这条断言引用了 dump 数据（见 decisions.md #22）。
+# 取值走 adbkit `ui --field`（Python 端 ET.parse 直接抠 text 属性打印 FIELD:name=value），
+# 不再用 bash grep/sed 处理整份 XML 文本——2026-07-03 实测踩过：播放中重绘偶发导致这条 shell
+# 字节处理链路产出非法 UTF-8，传到下个 python 进程的 argv 变成 lone surrogate，写 evidence.csv
+# 时 UnicodeEncodeError 直接崩脚本，见 gotchas.md。
+field_of() { grep -o "^FIELD:${1}=.*" <<< "$2" | cut -d= -f2-; }
+mmss_to_ms() { awk -F: -v t="$1" 'BEGIN{split(t,a,":"); printf "%d", (a[1]*60+a[2])*1000+0.5}'; }
+FIELDS=$($AK --case "$CASE" ui 03-editor --field start_time_text --field end_time_text --field progress_time_text)
+START=$(field_of start_time_text "$FIELDS")
+END=$(field_of end_time_text "$FIELDS")
+TOTAL=$(field_of progress_time_text "$FIELDS")
+EXPECT_MS=$(( $(mmss_to_ms "$END") - $(mmss_to_ms "$START") ))
+$AK --case "$CASE" shot 03-editor "进入剪辑器，新手引导已关、保留默认选区（起 $START / 止 $END / $TOTAL）" --used-dump >/dev/null
+log "剪辑器：选区 $START-$END（$TOTAL，预期时长 ${EXPECT_MS}ms）"
 
 $AK tapid take_save --timeout 8 >/dev/null
 $AK waitfor id bitrate_trigger --timeout 8 --cache saveas >/dev/null
-$AK --case "$CASE" shot 04-saveas "弹出「另存为」对话框（默认格式/比特率）" >/dev/null; log "另存为：保留默认格式/比特率"
+
+# 同一条纪律用在保存框：默认格式/比特率会直接决定产物，不能只截图配一句空话——读
+# format_text/tag_text/bitrate_text/tag_text1 的真实文本存证（tag_text="(原始)" 说明
+# 是沿用源文件参数，不是App写死的默认值），$FORMAT 留到 output-check 阶段跟 MediaStore
+# 的 mime_type 交叉核对（flow-freeze.md 写脚本的纪律 #7）。
+SAVEAS_FIELDS=$($AK --case "$CASE" ui 04-saveas --field format_text --field tag_text --field bitrate_text --field tag_text1)
+FORMAT=$(field_of format_text "$SAVEAS_FIELDS")
+FORMAT_TAG=$(field_of tag_text "$SAVEAS_FIELDS")
+BITRATE=$(field_of bitrate_text "$SAVEAS_FIELDS")
+BITRATE_TAG=$(field_of tag_text1 "$SAVEAS_FIELDS")
+$AK --case "$CASE" shot 04-saveas "弹出「另存为」对话框：格式=$FORMAT$FORMAT_TAG / 比特率=$BITRATE$BITRATE_TAG" --used-dump >/dev/null
+log "另存为：格式=$FORMAT$FORMAT_TAG，比特率=$BITRATE$BITRATE_TAG"
 
 $AK tapid btn_convert --timeout 8 >/dev/null
 if $AK waitfor text 音频已保存 --timeout 15 >/dev/null 2>&1; then
-  $AK --case "$CASE" shot 05-result "显示「音频已保存」，裁剪产物已生成" >/dev/null
-  log "结果: 音频已保存 ✓"
+  # 结果页同样不能只说"已生成"——读结果页 info 控件的"大小｜时长"文本存进断言；
+  # 再跑一次 output-check 用编辑器选区算出的预期时长做交叉核对，MediaStore 那行的
+  # 断言会带精确 _size/duration + 是否跟预期一致的结论，而不是"完整性通过"这种空话。
+  INFO=$(field_of info "$($AK --case "$CASE" ui 05-result --field info)")
+  $AK --case "$CASE" shot 05-result "显示「音频已保存」，裁剪产物已生成；结果页显示：$INFO" --used-dump >/dev/null
+  log "结果: 音频已保存 ✓（结果页：$INFO）"
+  if OC=$($AK --case "$CASE" output-check --expect 童话镇 --expect-duration-ms "$EXPECT_MS" --expect-format "$FORMAT" 2>&1); then
+    log "MediaStore 校验通过：$(grep -E '完整性检查通过|时长对比|格式对比' <<< "$OC" | tr '\n' ' ')"
+  else
+    log "MediaStore 校验未通过：$(tail -1 <<< "$OC")"
+  fi
 else
   $AK --case "$CASE" shot 05-fail "未见「音频已保存」，保存疑似失败" --result 失败 >/dev/null
   log "结果: 未见'音频已保存'，已截图待查"

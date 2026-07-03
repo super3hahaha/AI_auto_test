@@ -512,7 +512,7 @@ def build_report(live, drive, folder_id, want_images):
     b.title("自动化回归测试报告")
     b.para([("Automated Regression Test Report", {"color": GREY, "italic": True})])
     b.newline()
-    b.para([("测试应用：", {"bold": True, "color": DARK}), (cfg.get("package", "-"), {"color": GREY})])
+    b.para([("测试应用：", {"bold": True, "color": DARK}), (cfg.get("app_name") or cfg.get("package", "-"), {"color": GREY})])
     if cfg.get("app_version"):
         b.para([("测试版本：", {"bold": True, "color": DARK}), (cfg["app_version"], {"color": GREY})])
     b.para([("默认设备：", {"bold": True, "color": DARK}), (cfg.get("serial", "-"), {"color": GREY})])

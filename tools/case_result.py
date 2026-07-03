@@ -83,6 +83,8 @@ def main():
 
     # --evi：按 (用例ID, 文件路径) upsert——adbkit 采证时已自动登记（默认「过程留痕」），
     # 这里按文件路径找到那行、升级成关键标记/精确断言；没有对应行才新增。避免与自动登记重复。
+    # 命中已有行时只改「关键标记/断言/结果」，「步骤/证据类型」保留自动登记的原值不覆盖
+    # （这两项是采证时的客观事实，不该由判定这步手动重填，见下面 hit 分支注释）。
     header = ["用例ID", "步骤", "证据类型", "文件/链接", "截图预览", "断言", "结果", "采集时间", "备注"]
     erows = list(csv.reader(open(EVID, encoding="utf-8"))) if EVID.exists() else []
     if not erows:
@@ -100,10 +102,16 @@ def main():
             file_path = "证据文件缺失"
         if not key_flag:
             print(f"[case_result] 警告：证据行 {step!r} 未标注「关键/过程留痕」")
-        hit = next((r for r in erows[1:]
+        # 倒序找最后一个匹配行——adbkit 不再按路径去重（decisions.md #23），同一路径
+        # 同一天重跑会积累好几行，正序 next() 会命中最早那行（可能是今天第一次跑、
+        # 断言还很粗糙的旧行），必须找最新那行升级，不然升级到了错误/过时的那一行。
+        hit = next((r for r in reversed(erows[1:])
                     if len(r) > ei["文件/链接"] and r[ei["用例ID"]] == a.case and r[ei["文件/链接"]] == file_path), None)
         if hit:
-            hit[ei["步骤"]] = step; hit[ei["证据类型"]] = typ
+            # 「步骤」「证据类型」是采证时就确定的客观事实（adbkit 自动登记时已经写对），
+            # 判定升级只改「关键与否/断言/结果」这几项主观判断，不碰前两项——不然调用方
+            # 传的值一旦手滑写错（2026-07-03 真出过一次：忘了 +UI XML 后缀），会静默覆盖
+            # 掉本来正确的自动登记内容。--evi 里的 step/typ 两段仅用于「新增」分支。
             hit[ei["截图预览"]] = key_flag; hit[ei["断言"]] = assertion
             hit[ei["结果"]] = res; hit[ei["备注"]] = "判定升级"
             upd += 1  # 采集时间保留 adbkit 采证时的原值

@@ -7,6 +7,7 @@ AI 当测试工程师、用 ADB 驱动安卓模拟器的自动化测试框架。
 
 - `tools/adbkit.py` —— 手和眼：ADB 封装。感知 `ui/find/waitfor`；操作 `tapid/taptext/tapdesc`（选择器点击，坐标现算跨分辨率，`--from` 复用 dump、`--timeout` 等待重试）+ `tap/text/key/swipe`；证据 `shot/logscan`(按PID过滤)/`output-check`(查MediaStore)/`alarm/db/sp`；`--serial` 多设备。
 - `tools/compile_cases.py` —— 把 `cases/*.yaml` 汇编进 `queue.csv`（幂等，保留运行时状态）。
+- `tools/init_target.py <包名>` —— 换被测 App 时，只给包名自动探测 `serial`/`app_version`/`main_activity`/`build`(debuggable 判定)/`db_name` 并生成/更新 `config/target.json`（默认只打印不落盘，`--write` 才写回；`app_name`/`app_version` 要人工核对再确认，见 `docs/gotchas.md`）。
 - `flows/flow_cut_save.sh` —— 示例：把一条用例编译成纯选择器的可执行流程，按 serial 参数化，可多设备并行。
 - `tools/sheets_sync.py` —— 把账本推到 Google Sheets。
 - `tools/doc_report.py` —— 把账本 + 证据截图渲染成一份 **Google Doc 图文报告**（指标概览 / 执行清单 + 状态追踪 / 结构覆盖 / 问题清单 / 内嵌截图 / 变更时间线）。用 OAuth（你本人授权），Doc 与截图都归你所有。
@@ -166,3 +167,5 @@ python3 tools/doc_report.py --new        # 另建一份新 Doc
 | `alarm` | `alarm` | 检查提醒/闹钟排程状态，验证系统级 reminder 是否真正设置/取消 | 视具体实现而定 |
 
 判定优先级：非 debug 包（大多数 release 包）只能用 `screenshots`/`MediaStore`/`logs`，`db`/`sp`/`privls` 这三类需要 App 是 debuggable 才能用 `run-as` 读到。详见 `docs/RUNBOOK.md`「判定要读多源」和「`证据类型=MediaStore` 具体包含哪些情况」两节。
+
+**`UI XML`（不是独立证据类型，是合并标注）**：`ui <step>` 会把这次 uiautomator 控件树 dump 存进 `evidence/.../ui/<step>.xml`——控件文本/resource-id/bounds 都在里面，是断言里精确数值（比如具体时长）的原始依据。写断言时如果真的引用了这份 dump 数据（不是纯看截图写的），`shot` 加 `--used-dump`，`_append_evidence` 就把这行的"证据类型"写成 `screenshots+UI XML`（**不拆成两行**，"文件/链接"列仍只放截图路径——XML 按约定路径能推出来，不重复登记）。**这是显式声明，不是自动检测**——「dump 有没有喂给这条判断」只有写断言的人自己知道，同名 XML 文件存在不代表就用上了（可能只是导航用的 dump），所以不按文件存在与否去猜。只单独 `ui` 没有配套 `--used-dump` 的 `shot` 的那次 dump 不会进账本（纯定位用，见 `docs/decisions.md` #20）。

@@ -46,7 +46,7 @@
 
 `python3 tools/new_run.py` —— 在用户 Drive 新建**带日期**的看板表（标题 `<board_title> - <date>`），共享给服务账号、重指向 `config.sheet_id`、记入 `ledger/runs.csv`、填充 7 tab；**同时调 `doc_report.py --new --date` 建一份带日期的新 Doc 图文报告**，`config.doc_id` 指向它，`doc_id`/`doc_url` 也记进 `ledger/runs.csv`。**每轮回归一张独立 Sheet + 一份独立 Doc，历史互不覆盖**（旧的都留云端归档）。之后本轮所有 `sheets_sync` 都写这张 Sheet；Doc 不跟着每条用例自动刷新，要更新就手动跑 `python3 tools/doc_report.py`（覆盖式刷新当前轮这份，别加 `--new` 否则又建一份）。用 OAuth 建（服务账号无 Drive 配额，建不了）。`--no-doc` 可跳过建 Doc。
 
-**同时会把本地账本归档+重置**（新表只体现这一轮的活动，历史反正已经留在上一轮的云端表里）：`log.csv`/`evidence.csv` 整份搬进 `ledger/archive/<上一轮日期>/`、本地清空只留表头；`issues.csv` 只搬走「状态=已关闭」的，未关闭的留着继续跟踪；`queue.csv` 运行时字段（状态/结果/证据链接/时间等）重置回「待执行」，用例定义不变。不想动本地账本就加 `--no-archive`。
+**同时会把本地账本归档+重置**（新表只体现这一轮的活动，历史反正已经留在上一轮的云端表里）：`log.csv`/`evidence.csv`/`issues.csv` 整份搬进 `ledger/archive/<上一轮日期>/`、本地清空只留表头（issues 不分开没关闭，见 `decisions.md` #10 2026-07-03 修正——历史问题要看去对应那一轮的旧 Sheet/Doc 找）；`queue.csv` 运行时字段（状态/结果/证据链接/时间等）重置回「待执行」，用例定义不变。不想动本地账本就加 `--no-archive`。
 
 > **时序要求**：`new_run.py` 必须在**当天第一件事、还没执行任何用例之前**跑。它是把"当前 `log.csv`/`evidence.csv` 里还没被上次归档过的所有行"当成"上一轮的历史"整体搬走——这两个文件只按时间追加，不知道哪一行属于哪一轮。如果当天已经执行了几条用例之后才补跑 `new_run.py`，这些已完成的记录会被一起误伤归档、`queue.csv` 也会被重置掉，需要手工从归档目录里把误伤的行捞回来（2026-07-02 踩过一次，见 `ledger/archive/2026-07-01/` 和当时的处理）。
 

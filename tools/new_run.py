@@ -11,8 +11,8 @@ config.doc_id 指向新的这份；之后想更新 Doc 就手动重跑 `doc_repo
 
 **开新一轮同时会把本地账本归档+重置**（上一轮的完整历史已经留在上一轮的云端 Sheet 里，
 本地账本只保留"这一轮"的活动，避免新表继承旧数据）：
-  - log.csv / evidence.csv：整份复制进 ledger/archive/<上一轮日期>/，本地清空只留表头。
-  - issues.csv：只把「状态=已关闭」的问题挪进归档，未关闭的（待修/处理中等）留在本地继续跟踪。
+  - log.csv / evidence.csv / issues.csv：整份复制进 ledger/archive/<上一轮日期>/，本地清空只留表头
+    （issues.csv 不分开没关闭——不管状态如何，只要不是这一轮跑出来的就不该留在新一轮账本里）。
   - queue.csv：运行时字段（当前状态/执行结果/证据链接/关键截图/问题ID/开始时间/结束时间/历史覆盖情况）
     重置为初始值，用例定义本身不变。
 
@@ -73,8 +73,10 @@ def archive_and_reset(prev_date):
     dest = ARCHIVE / prev_date
     dest.mkdir(parents=True, exist_ok=True)
 
-    # log.csv / evidence.csv：整份归档，本地清空只留表头
-    for name in ("log.csv", "evidence.csv"):
+    # log.csv / evidence.csv / issues.csv：整份归档，本地清空只留表头
+    # （issues.csv 曾经只挪走「已关闭」的、未关闭的留本地跟踪——2026-07-03 用户明确纠正：
+    # 不管开没开闭，只要不是这一轮跑出来的就不该出现在新一轮账本里，跟 log/evidence 保持一致）
+    for name in ("log.csv", "evidence.csv", "issues.csv"):
         src = LEDGER / name
         if not src.exists():
             continue
@@ -83,23 +85,7 @@ def archive_and_reset(prev_date):
             shutil.copyfile(src, dest / name)
         with open(src, "w", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(rows[0] if rows else [])
-    print(f"[new_run] log.csv / evidence.csv 已归档到 {dest}，本地已清空")
-
-    # issues.csv：只挪走「状态=已关闭」的，未关闭的留在本地继续跟踪
-    issues = LEDGER / "issues.csv"
-    if issues.exists():
-        rows = list(csv.reader(open(issues, encoding="utf-8")))
-        if len(rows) > 1:
-            header = rows[0]
-            i_status = header.index("状态") if "状态" in header else None
-            closed = [r for r in rows[1:] if i_status is not None and r[i_status] == "已关闭"]
-            kept = [r for r in rows[1:] if r not in closed]
-            if closed:
-                with open(dest / "issues.csv", "w", newline="", encoding="utf-8") as f:
-                    w = csv.writer(f); w.writerow(header); w.writerows(closed)
-            with open(issues, "w", newline="", encoding="utf-8") as f:
-                w = csv.writer(f); w.writerow(header); w.writerows(kept)
-            print(f"[new_run] issues.csv：{len(closed)} 条已关闭归档到 {dest}，{len(kept)} 条未关闭留本地")
+    print(f"[new_run] log.csv / evidence.csv / issues.csv 已归档到 {dest}，本地已清空")
 
     # queue.csv：运行时字段重置回初始值，用例定义列不动
     if QUEUE.exists():

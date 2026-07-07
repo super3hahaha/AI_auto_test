@@ -75,6 +75,44 @@ bash flows/flow_cut_save.sh <serial>
 4. 路径探稳定、要反复回归的核心流程，按 [docs/flow-freeze.md](docs/flow-freeze.md) 固化成 `flows/flow_*.sh`。
 5. 让 Claude Code 按 [docs/RUNBOOK.md](docs/RUNBOOK.md) 的协议接管执行——新会话冷启动时它会自己先读这份文档。
 
+## 多人协作：Git 提交流程
+
+仓库 `main` 分支已加保护（禁止直接 push、必须 PR + 至少 1 人 approve 才能合并）。分工是：**协作者负责开分支+提PR，仓库所有者负责 review+approve+merge**。
+
+### 协作者（Write 权限）的步骤
+
+```bash
+# 首次：clone 仓库
+git clone https://github.com/super3hahaha/AI_auto_test.git
+cd AI_auto_test
+
+# 每次开始新工作前：同步 main，从它开新分支（不要在 main 上直接改）
+git checkout main
+git pull
+git checkout -b feature/描述这次改动
+
+# 改代码...
+
+# 提交（按文件名 add，别用 -A，容易带上本机专属文件比如 config/target.json）
+git add <改动的文件>
+git commit -m "说清楚改了什么、为什么"
+
+# push 这条分支（不是 main，main 会被拒绝）
+git push -u origin feature/描述这次改动
+
+# 开 Pull Request（base: main ← compare: 这条分支）
+gh pr create --base main --fill
+# 或去 GitHub 网页开
+```
+
+开完 PR 之后等所有者 review，改完对方要求的地方再 push 到同一分支即可（PR 会自动更新）。
+
+### 所有者的步骤
+
+1. 协作者开 PR 后，用 `gh pr diff <编号>` 或网页 Files changed 看改动，评估风险
+2. 没问题：`gh pr review <编号> --approve`，然后 `gh pr merge <编号> --merge`
+3. 有问题：`gh pr review <编号> --request-changes -b "说明原因"`，等对方改完再看一遍
+
 ## 接下来该读什么（按需，不用一次看完）
 
 - [docs/RUNBOOK.md](docs/RUNBOOK.md) —— 执行大脑的行动协议，Claude Code 冷启动必读

@@ -77,9 +77,26 @@ def main():
             r[ix["历史覆盖情况"]] = a.coverage if a.coverage is not None else detect_coverage()
     csv.writer(open(Q, "w", newline="", encoding="utf-8")).writerows(q)
 
-    with open(LOG, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([now, a.case, "完成执行", old or "执行中",
-                                f"已完成/{a.result}", a.evidence, a.note])
+    # 判定纠正（old 已经是「已完成/xxx」，说明这次不是执行后首次判定，而是没有新执行、
+    # 单纯改判上一次的结论）——就地覆盖上一条"完成执行"日志，不再追加新行。否则 log.csv
+    # 里会同时留着"失败"和"通过"两条，容易被误读成跑了两次、或者不知道该信哪条。
+    # 2026-07-03 用户看云端「状态变更日志」发现这个重复才指出来的。
+    log_rows = list(csv.reader(open(LOG, encoding="utf-8"))) if LOG.exists() else []
+    new_row = [now, a.case, "完成执行", old or "执行中", f"已完成/{a.result}", a.evidence, a.note]
+    if old.startswith("已完成/") and len(log_rows) > 1:
+        lh = log_rows[0]
+        li_case = lh.index("用例ID"); li_action = lh.index("动作")
+        last_idx = next((i for i in range(len(log_rows) - 1, 0, -1)
+                          if log_rows[i][li_case] == a.case and log_rows[i][li_action] == "完成执行"), None)
+        if last_idx is not None:
+            log_rows[last_idx] = new_row
+            csv.writer(open(LOG, "w", newline="", encoding="utf-8")).writerows(log_rows)
+        else:
+            log_rows.append(new_row)
+            csv.writer(open(LOG, "w", newline="", encoding="utf-8")).writerows(log_rows)
+    else:
+        with open(LOG, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(new_row)
 
     # --evi：按 (用例ID, 文件路径) upsert——adbkit 采证时已自动登记（默认「过程留痕」），
     # 这里按文件路径找到那行、升级成关键标记/精确断言；没有对应行才新增。避免与自动登记重复。

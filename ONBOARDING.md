@@ -84,8 +84,8 @@ bash flows/flow_cut_save.sh <serial>
 - [docs/flow-freeze.md](docs/flow-freeze.md) —— 什么时候该把探索路径固化成脚本
 - [docs/todo.md](docs/todo.md) —— 已知待办/未完成的事
 
-## 云端看板（可选）
+## 云端看板
 
-想要 Google Sheets 云看板 / Google Doc 图文报告，看 [README.md](README.md) 里的对应章节——纯本地跑测试不需要这些。
+想要 Google Sheets 云看板 / Google Doc 图文报告，看 [README.md](README.md) 里的对应章节
 
 配置 GCP 项目/启用 API/OAuth 凭证这部分手续比较繁琐，详细图文教程见：[Claude Code Google WorkSpace 教程](https://docs.google.com/document/d/1dEA1P5JXNZSk4RLpGWf2n7BBIh_ZZfGSaJB62zz4yqc/edit?tab=t.0)。

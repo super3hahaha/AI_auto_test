@@ -448,8 +448,8 @@ def case_screenshots_fallback(link):
     if not base.exists():
         return []
     pics = sorted(glob.glob(str(base / "screenshots" / "*.png")))
-    if not pics:  # 退到按设备分的子目录
-        pics = sorted(glob.glob(str(base / "*" / "screenshots" / "*.png")))
+    if not pics:  # 退到更深的子目录（按 <serial>/<attempt> 分层，run_id 制下可能深两层）
+        pics = sorted(glob.glob(str(base / "**" / "screenshots" / "*.png"), recursive=True))
     return pics[:6]
 
 

@@ -78,7 +78,7 @@ def main():
     print("  · docs/RUNBOOK.md —— 执行协议（选择器点击/失败处理/结果分档）")
     print("  · cases/regression.yaml 头注 —— 各模块已探明的真实选择器与流程")
     print("  · flows/flow_cut_save.sh / flow_multi.sh —— 已固化的可跑流程脚本")
-    print("  · 证据落 evidence/<date>/<case>/{screenshots,ui,logs}（gitignore，本地）")
+    print("  · 证据落 evidence/<app>/<ver>/<run_id>/<case>/<serial>/<attempt>/{screenshots,ui,logs}（gitignore，本地）")
 
     print("\n" + ("✅ 就绪，可开跑" if ok else "⚠️ 有缺项，先按上面补齐再跑"))
     sys.exit(0 if ok else 1)

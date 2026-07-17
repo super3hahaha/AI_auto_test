@@ -44,7 +44,7 @@
 
 ## 开一轮新回归（每次回归开始，跑一次）
 
-`python3 tools/new_run.py` —— 在用户 Drive 新建**带日期**的看板表（标题 `<board_title> - <date>`），共享给服务账号、重指向 `config.sheet_id`、记入 `ledger/runs.csv`、填充 7 tab；**同时调 `doc_report.py --new --date` 建一份带日期的新 Doc 图文报告**，`config.doc_id` 指向它，`doc_id`/`doc_url` 也记进 `ledger/runs.csv`。**每轮回归一张独立 Sheet + 一份独立 Doc，历史互不覆盖**（旧的都留云端归档）。之后本轮所有 `sheets_sync` 都写这张 Sheet；Doc 不跟着每条用例自动刷新，要更新就手动跑 `python3 tools/doc_report.py`（覆盖式刷新当前轮这份，别加 `--new` 否则又建一份）。用 OAuth 建（服务账号无 Drive 配额，建不了）。`--no-doc` 可跳过建 Doc。
+`python3 tools/new_run.py` —— 在用户 Drive 新建**带日期**的看板表（标题 `<app_name> <board_title> - <date> <创建时刻HH:MM>`，2026-07-17 起加了 App 名 + 精确到分的创建时间），共享给服务账号、重指向 `config.sheet_id`、记入 `ledger/runs.csv`、填充 7 tab；**同时调 `doc_report.py --new --date` 建一份带日期的新 Doc 图文报告**，`config.doc_id` 指向它，`doc_id`/`doc_url` 也记进 `ledger/runs.csv`。**每轮回归一张独立 Sheet + 一份独立 Doc，历史互不覆盖**（旧的都留云端归档）。之后本轮所有 `sheets_sync` 都写这张 Sheet；Doc 不跟着每条用例自动刷新，要更新就手动跑 `python3 tools/doc_report.py`（覆盖式刷新当前轮这份，别加 `--new` 否则又建一份）。用 OAuth 建（服务账号无 Drive 配额，建不了）。`--no-doc` 可跳过建 Doc。
 
 **同时会把本地账本归档+重置**（新表只体现这一轮的活动，历史反正已经留在上一轮的云端表里）：`log.csv`/`evidence.csv`/`issues.csv` 整份搬进 `ledger/archive/<上一轮日期>/`、本地清空只留表头（issues 不分开没关闭，见 `decisions.md` #10 2026-07-03 修正——历史问题要看去对应那一轮的旧 Sheet/Doc 找）；`queue.csv` 运行时字段（状态/结果/证据链接/时间等）重置回「待执行」，用例定义不变。不想动本地账本就加 `--no-archive`。
 
@@ -78,7 +78,10 @@
 ## 主循环（每条用例）
 
 1. **选用例**：先看 `config/target.json` 的 `scope`（本轮范围）——只在**本轮范围内**（`board.csv` 里的用例，即 scope 命中的那些）挑第一个 `当前状态=待执行` 且优先级最高（P0>P1>P2>P3）的行。**待执行状态以全量真值 `queue.csv` 为准**（board 的状态列只供云端展示，可能不是最新）；scope 为空则本轮=全量，等同直接看 queue。
-2. **挂号（开工）**：往 `ledger/log.csv` 追加一行 `动作=开始执行, 原状态=待执行, 新状态=执行中`；把 queue 该行 `当前状态` 改成 `执行中`、填 `开始时间`。
+2. **挂号（开工）**：往 `ledger/log.csv` 追加一行 `动作=开始执行, 原状态=待执行, 新状态=执行中`；把 queue 该行 `当前状态` 改成 `执行中`、填 `开始时间`。**同时为本次执行设一个 attempt 标识并 export，供本条用例后续所有 adbkit 采证命令复用**：
+   > **挂号时定下本次执行的 attempt 值**（一次执行取一次当前时刻 `HHMMSS`，如 `140122`）。adbkit 采证会把它拼进证据路径 `.../<case>/<serial>/<attempt>/...`，让**同一台设备上同一 case 的每次重跑各留一份画面、不覆盖**（`<serial>` 只区分不同设备，区分不了同机重跑，靠 attempt——数据模型见 `docs/desktop-app-prd.md`「★ 证据数据模型」）。
+   > **怎么传（主循环逐屏模式）**：Claude Code 每条 Bash 调用是独立 shell、`export` 不跨调用留存，所以**本条用例本次执行的每条 adbkit 采证命令都要就地带上同一个 `ADBKIT_ATTEMPT=<值>` 前缀**，例如 `ADBKIT_ATTEMPT=140122 python3 tools/adbkit.py --case CUT-CORE-01 shot 03-editor "…"`。整条用例这一趟全用**同一个**值；**重跑同一条 = 重新挂号 = 换一个新值**（别在一趟中途改，否则同一次的截图会散进多个 attempt 目录）。
+   > **固化脚本模式（`run_flow.py`）无需操心**：它在同一个 bash 进程里注入一次 env，脚本内所有 adbkit 自动继承同一个 attempt。未带 `ADBKIT_ATTEMPT` 时 adbkit 退回不加 attempt 段（legacy 结构，同机重跑会覆盖）。
 3. **判断走脚本还是主循环**：看该行 `固化脚本` 列——非空（如 `flows/flow_cut_save.sh`）就直接跑这个脚本（无 AI 逐屏推理，快）；为空就走下面 4-5 步主循环。这一列由 `cases/*.yaml` 里的 `frozen_script` 字段编译而来，别手改 queue 里的这一格，改就去改 YAML 再 `compile_cases.py`。脚本跑挂了（选择器找不到）说明 UI 变了，回退主循环重探，然后把新脚本路径更新回 YAML（见 `flow-freeze.md`）。
    > **硬规则：跑固化脚本一律用 `python3 tools/run_flow.py <用例ID> <脚本路径> [serial]`，永远不要直接 `bash flows/xxx.sh`**——包括"顺手冒烟检查"这类看起来不算正式执行的场合。直接 `bash` 跑完全裸跑，不会往 `log.csv`/`queue.csv` 写任何东西，事后极难想起来补登记（2026-07-02 踩过：图省事直接 `bash` 跑了一次冒烟，跑完当成"检查过了"就往下走，账本和看板上完全没留痕，用户事后追问才发现）。`run_flow.py` 自动计时、自动写开始/完成时间戳到 `log.csv`、回填 `queue.csv`，判定仍需人工看 `output-check`/`logscan` 后补一行"判定确认"（见下方结果分档）。**`run_flow` 跑完会列出本轮该用例已自动登记的证据清单（脚本跑时 adbkit 采的每张截图/output-check/logscan 都在），据此判定并把关键的 `case_result --evi` 升级为「关键，供报告用」。**
 4. **造前置态**（如需）：写 `seeds/<用例>.sql` → `adbkit seed`。构造精确初始状态，别靠手点一路走过去。
@@ -125,6 +128,7 @@
 - **DB diff**：动作前后 `db` 导出对比，看有没有脏数据 / 字段被错误覆盖。
 - **SP diff**：开关位、bitmask、通知模型。
 - **系统态**：`logscan`（有无 FATAL/ANR/SQLiteException）、`alarm`（提醒是否真排程/取消）。
+- **播放态**（视频/音频播放器类 App）：`playback`（`dumpsys media_session`/`audio` 验推进+出声）、`framediff`（视频区帧差验画面在渲染）。这类**过程类 App** 不产出文件，`output-check` 用不上，判定完全靠"过程在推进+画面在渲染+声音在出"三轴交叉——**完整证据链、命令规格、故障对照见 `docs/evidence-video-playback.md`**。
 - **源码断言**（能拿到源码时）：读实现确认 UI 行为是否符合代码语义，并把 bug 根因下沉到具体方法/行号。拿不到源码就跳过这层，只做前四层。
 
 ## `证据类型=MediaStore` 具体包含哪些情况（2026-07-02 定义）

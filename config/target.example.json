@@ -4,6 +4,7 @@
   "db_name": "app.db",
   "evidence_root": "evidence",
   "date": "",
+  "run_id": "",
   "scope": "",
   "oauth_account": "",
   "sheet_id": "",
@@ -21,7 +22,7 @@
     "package": "被测 App 包名，adbkit 全靠它 run-as / launch / clear",
     "serial": "多设备时填 adb devices 里的序列号；单设备留空",
     "db_name": "App 私有目录 databases/ 下的主 sqlite 文件名；不做 DB 断言可留空",
-    "app_name": "展示用的 App 全名（如从 apk 里 aapt 读到的），目前代码里没有地方引用它做展示，纯记录用",
+    "app_name": "展示用的 App 全名（如从 apk 里 aapt 读到的）；new_run.py 建看板标题会带上它（`<app_name> <board_title> - <date> <HH:MM>`），留空则标题不含 App 名",
     "app_slug": "证据目录简称（evidence/<app_slug>/<version>/...），跟 app_name 分开是因为全名常带空格/&，直接当目录名不好看；留空则退回用 app_name，再空退回包名最后一段",
     "app_version": "被测版本号，决定证据目录第二层；换版本记得连 build 一起改",
     "main_activity": "launch 子命令用来 am start 显式启动页；留空会退回 monkey 启动",
@@ -29,12 +30,13 @@
     "_tools": "以上 app_name/app_slug/app_version/main_activity/build/db_name 换包时可用 tools/init_target.py <包名> 自动探测（默认只打印，--write 才落盘；app_name/app_version 建议人工核对后再写，见 docs/gotchas.md）",
     "evidence_root": "证据根目录，相对项目根",
     "date": "留空=用今天(YYYYMMDD)；复现历史某轮时可固定",
+    "run_id": "本轮执行批次 ID（格式 YYYYMMDD-HHMM），由 new_run.py 开一轮时自动生成并回填，无需手填。证据目录按它归档（evidence/<app>/<ver>/<run_id>/...），同日多轮不撞、桌面壳可按批次查证据。留空时 adbkit 退回用纯日期段（兼容旧机器）。见 docs/desktop-app-prd.md「★ 证据数据模型」",
     "scope": "本轮回归范围（决定 board.csv 与看板/报告显示哪些用例）。留空=全量；填一组优先级如 'P0' 或 'P0,P1'；或填一组用例ID如 'CUT-CORE-01,CUT-EDGE-01'。优先级与ID不能混写。全量真值 queue.csv 不受影响，执行/状态照旧",
     "oauth_account": "OAuth 账号标签，用于多账号 token 共存、切换免重授权。留空=用 config/oauth_token.json；填 <acct>=用 config/oauth_token.<acct>.json（如 'inshot' → oauth_token.inshot.json）。new_run 建表 + doc_report 建Doc/传图都读这个 token，切账号只改这里、不用重新授权（前提该账号的 token 文件已授权存在）",
     "sheet_id": "Google Sheet 的 ID（URL 中 /d/ 和 /edit 之间那段）；sheets_sync 用",
     "doc_id": "Google Doc 图文报告的 ID；doc_report 首次运行会自动新建并回填，无需手填",
     "image_folder_id": "证据截图上传到的 Drive 文件夹 ID；doc_report 自动创建并回填",
-    "board_title": "看板表标题前缀，留空默认「AI+ADB 自动化测试执行看板」；new_run.py 建表用",
+    "board_title": "看板表标题前缀，留空默认「自动化测试执行看板」；new_run.py 建表用，实际标题=`<app_name> <board_title> - <date> <创建时刻HH:MM>`（2026-07-17 起标题加了 App 名+精确到分的创建时间，避免只有日期时信息太少分不清）",
     "report_title": "Doc 图文报告标题前缀，留空默认「AI+ADB 自动化测试 · 执行报告」；doc_report.py 建 Doc 用"
   }
 }

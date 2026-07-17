@@ -14,7 +14,7 @@ logscan/结果判定 仍然要人工做（脚本本身只知道"跑完了没崩"
 serial 不传则读 config/target.json 的 serial。
 脚本本身 exit code != 0 时会记成"固化脚本异常退出"，exit code 会带进备注。
 """
-import csv, json, subprocess, sys, argparse, datetime, pathlib, time
+import csv, json, os, subprocess, sys, argparse, datetime, pathlib, time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 LOG = ROOT / "ledger/log.csv"
@@ -76,14 +76,23 @@ def main():
     _append_log(start_ts, a.case, "开始执行", old_status, "执行中", "",
                 f"跑固化脚本 {a.script}（run_flow.py 自动计时）")
 
+    # attempt：本次执行的开始时刻（HHMMSS），export 给脚本里所有 adbkit 采证命令复用，
+    # 让同一台设备上同一 case 的每次重跑各落一个 attempt 目录、画面不覆盖。一次执行内稳定
+    # （整批脚本共享这一个值，不是每条 shot 各取当前时刻）。见 docs/desktop-app-prd.md「★ 证据数据模型」。
+    attempt = start_dt.strftime("%H%M%S")
+    env = {**os.environ, "ADBKIT_ATTEMPT": attempt}
+
     t0 = time.monotonic()
-    result = subprocess.run(["bash", str(script_path), serial])
+    result = subprocess.run(["bash", str(script_path), serial], env=env)
     elapsed = time.monotonic() - t0
 
     end_dt = datetime.datetime.now()
     end_ts = end_dt.strftime("%Y-%m-%d %H:%M:%S")
     app_slug = cfg.get('app_slug') or cfg.get('app_name', '')
-    evidence = f"evidence/{app_slug}/{cfg.get('app_version','')}/{end_dt.strftime('%Y%m%d')}/{a.case}/{serial}"
+    # 证据链接(current_link) 用 run_id 段（无则退回今天日期，兼容旧机器）；停在 serial 层、不含 attempt，
+    # 这样它作为前缀能覆盖本 run 该用例的所有 attempt（doc_report 按此前缀筛"本轮"证据）。
+    run_seg = cfg.get('run_id') or end_dt.strftime('%Y%m%d')
+    evidence = f"evidence/{app_slug}/{cfg.get('app_version','')}/{run_seg}/{a.case}/{serial}"
 
     if result.returncode == 0:
         note = f"固化脚本正常退出，耗时约{elapsed:.0f}秒"

@@ -6,11 +6,13 @@
 # force-stop 重进。只 force-stop 的话已授权状态还在，隐私同意/文件访问/通知/音频权限
 # 弹窗只会在首次授权时出现，冒烟就测不到这条路径；pm clear 会连运行时权限一起撤销，
 # 保证每次冒烟都重新走一遍完整的首次启动+授权流程。
-# 新增首次启动的隐私同意/文件访问/通知/音频权限弹窗兜底（best-effort，命中就点，没有就跳过）；
+# 首次启动的隐私同意/文件访问弹窗单独兜底（App 专属控件，不在通用库里）；通知/音频系统权限、
+# 以及各环节可能撞上的插屏广告，统一交给通用清障 sweep（规则库 config/ad_rules.json 驱动，
+# 见 decisions.md #25）——启动后、点音频裁剪后、点转换后各兜一发，best-effort、命中才点、不阻断；
 # 清数据后首次进剪辑器还会弹 5 步新手引导（guide_mask_view 全屏遮罩，挡住 take_save 点击），
 # 要连续点掉 5 次遮罩才会消失，不能直接点保存。另存为不调比特率，直接用默认值保存——冒烟
 # 只验证链路通不通，不特地断言具体比特率数值。
-# 2026-07-02 新增：每次跑先重推固定素材 assets/陈一发儿 - 童话镇.mp3（真实歌曲，320kbps/258s）
+# 2026-07-02 新增：每次跑先重推固定素材 assets/mp3-sample-track.mp3（真实歌曲，320kbps/258s）
 # 到设备并触发媒体扫描，date_added 最新会排到「选择音频」列表最前面，改用文件名精确匹配点选
 # ——不再靠 .mp3 --index 0 猜第一项（MediaStore 混杂大量历史裁剪产物，谁排第一不确定，
 # 见 gotchas.md），素材固定了，选中的源文件也固定，裁剪结果可预期、可重复对比。
@@ -18,10 +20,13 @@ set -e
 S="$1"
 AK="python3 tools/adbkit.py --serial $S"
 CASE="CUT-CORE-01"   # 纯用例ID；证据路径里的设备段由 adbkit 按 --serial 自动加，别把 serial 掺进 --case
-SRC="assets/陈一发儿 - 童话镇.mp3"
-DEV_DST="/sdcard/Music/陈一发儿 - 童话镇.mp3"
+SRC="assets/mp3-sample-track.mp3"
+DEV_DST="/sdcard/Music/mp3-sample-track.mp3"
 SRC_NAME="$(basename "$SRC")"
 log(){ echo "[$S] $*"; }
+# 通用广告/弹窗清障：调 adbkit sweep（规则库 config/ad_rules.json 驱动），命中就点、没有就跳过，
+# 始终 exit0 不阻断流程；点掉了就在流程日志里记一行。参数按调用点的广告出现节奏各自传。
+sweep(){ local out; out=$($AK sweep "$@" 2>/dev/null || true); grep -q '点掉' <<< "$out" && log "清障 $(grep '点掉' <<< "$out" | tr '\n' ' ')" || true; }
 
 adb -s "$S" push "$SRC" "$DEV_DST" >/dev/null
 # 文件名带空格，adb shell 会把整串命令再交给设备端 shell 解析一次，必须用单引号包住 URI，
@@ -34,22 +39,35 @@ $AK launch >/dev/null; sleep 4
 
 # 启动即弹的隐私同意弹窗（App级，只在首次/清数据后出现），命中就点，没有就跳过
 $AK tapdesc 同意 --timeout 6 >/dev/null 2>&1 || true
+# 冷启动可能撞上插屏广告/权限弹窗，通用清障兜一发（scope 门控：不在广告页时啥也不点，很快退）
+sweep --rounds 4 --interval 0.6 --patience 2
 $AK --case "$CASE" shot 01-home "App 首页正常显示（隐私同意弹窗已关）" >/dev/null; log "首页"
 
 $AK taptext 音频裁剪 --timeout 8 >/dev/null
 # 点「音频裁剪」后依次弹：文件访问(App内btn) → 通知权限(系统) → 音频权限(系统)，
-# 清数据后每次都会重新出现；命中就点，没有就跳过，顺序/是否出现可能随系统版本变化
+# 清数据后每次都会重新出现；顺序/是否出现可能随系统版本变化。
+# 文件访问是 App 内自定义按钮(id=btn)，不在通用库里，单独点；命中就点，没有就跳过。
 $AK tapid btn --timeout 6 >/dev/null 2>&1 || true
-$AK tapid permission_allow_button --timeout 6 >/dev/null 2>&1 || true
-$AK tapid permission_allow_button --timeout 6 >/dev/null 2>&1 || true
+# 通知/音频这两个系统权限弹窗改交给 sweep（perm-allow 规则覆盖 allow/allow_all/foreground 变体，
+# 顺序无关、有几个点几个），比原来固定点两次 permission_allow_button 更稳，还顺带兜这一步的广告。
+sweep --rounds 5 --interval 0.6 --patience 2
 $AK waitfor text 选择音频 --timeout 8 --cache picker >/dev/null
 $AK --case "$CASE" shot 02-picker "进入「选择音频」列表" >/dev/null; log "选择音频"
 
-# 精确匹配纯文件名，不加 --partial——2026-07-03 实测过"童话镇" --partial 命中 3~4 个候选
-# （历史裁剪产物 AudioCutter_/AudioCutter_AudioCutter_/... 前缀的都含"童话镇"子串），列表并不是
-# "新推的排最前"，盲点第 0 个曾经点到过一轮历史产物再剪一遍。exact 匹配只有纯文件名这一个
-# 节点的 text 完全相等，天然排除所有带前缀的历史产物，不依赖列表排序假设。
-$AK taptext "$SRC_NAME" --timeout 8 >/dev/null
+# 2026-07-17 改为搜索定位：点搜索图标 → 输入文件名 → 点结果，比在长列表里翻找/裸猜第一项更稳。
+# btn_search 是搜索入口的真实 id（不是 ll_search）；素材必须在进这个页面之前就推送+扫描完成，
+# 页面是打开时的快照，之后才推的文件搜不到，得退出重进才刷新（实测踩过）。
+$AK tapid btn_search --timeout 6 >/dev/null
+$AK waitfor id search_edit_text --timeout 6 >/dev/null
+# 系统默认输入法必须是不带联想的英文键盘——实测拼音等联想输入法会把 input text 送入的字符串整段
+# 替换成联想词（"mp3-sample-track.mp3" 变成"门票－3sample－track。门票3"这种），导致搜索失败；
+# 这不是 adbkit text 命令的 bug，是设备当前 IME 拦截改写了原始按键，见 gotchas.md。
+$AK text "$SRC_NAME" >/dev/null
+# 精确匹配纯文件名，不加 --partial——历史裁剪产物 AudioCutter_.../AudioCutter_AudioCutter_... 前缀的
+# 文件名也会被搜索结果收录，但它们的 text 跟纯文件名不完全相等，exact 匹配天然排除。搜索结果页这个
+# 文本会命中 2 个节点：第 0 个是搜索框自身回显的输入文本，第 1 个才是真正的列表项，必须 --index 1
+# （用 --index 0 会点到搜索框本身，卡在原地，实测踩过）。
+$AK taptext "$SRC_NAME" --index 1 --timeout 8 >/dev/null
 $AK waitfor id take_save --timeout 8 --cache editor >/dev/null
 
 # 清数据后首次进剪辑器会弹 5 步新手引导遮罩，挡住保存按钮；连点遮罩把它关掉（最多5次，
@@ -96,6 +114,10 @@ $AK --case "$CASE" shot 04-saveas "弹出「另存为」对话框：格式=$FORM
 log "另存为：格式=$FORMAT$FORMAT_TAG，比特率=$BITRATE$BITRATE_TAG"
 
 $AK tapid btn_convert --timeout 8 >/dev/null
+# 点转换后 MP3 Cutter 常弹插屏广告，会盖住结果页让下面的 waitfor「音频已保存」超时误判失败。
+# 转换本身也要几秒，这里多轮清障（interval 1s 留给广告倒计时/跳过按钮延迟出现，最长约 10s）：
+# 有广告就等它出跳过按钮点掉，没广告则连续 patience 轮无命中很快退，不会白等满 10s。
+sweep --rounds 10 --interval 1 --patience 3
 if $AK waitfor text 音频已保存 --timeout 15 >/dev/null 2>&1; then
   # 结果页同样不能只说"已生成"——读结果页 info 控件的"大小｜时长"文本存进断言；
   # 再跑一次 output-check 用编辑器选区算出的预期时长做交叉核对，MediaStore 那行的
@@ -103,7 +125,7 @@ if $AK waitfor text 音频已保存 --timeout 15 >/dev/null 2>&1; then
   INFO=$(field_of info "$($AK --case "$CASE" ui 05-result --field info)")
   $AK --case "$CASE" shot 05-result "显示「音频已保存」，裁剪产物已生成；结果页显示：$INFO" --used-dump >/dev/null
   log "结果: 音频已保存 ✓（结果页：$INFO）"
-  if OC=$($AK --case "$CASE" output-check --expect 童话镇 --expect-duration-ms "$EXPECT_MS" --expect-format "$FORMAT" 2>&1); then
+  if OC=$($AK --case "$CASE" output-check --expect mp3-sample-track --expect-duration-ms "$EXPECT_MS" --expect-format "$FORMAT" 2>&1); then
     log "MediaStore 校验通过：$(grep -E '完整性检查通过|时长对比|格式对比' <<< "$OC" | tr '\n' ' ')"
   else
     log "MediaStore 校验未通过：$(tail -1 <<< "$OC")"

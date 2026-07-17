@@ -11,8 +11,12 @@ config.doc_id 指向新的这份；之后想更新 Doc 就手动重跑 `doc_repo
 
 **开新一轮同时会把本地账本归档+重置**（上一轮的完整历史已经留在上一轮的云端 Sheet 里，
 本地账本只保留"这一轮"的活动，避免新表继承旧数据）：
-  - log.csv / evidence.csv / issues.csv：整份复制进 ledger/archive/<上一轮日期>/，本地清空只留表头
+  - log.csv / evidence.csv / issues.csv：整份复制进 ledger/archive/<上一轮 run_id>/，本地清空只留表头
     （issues.csv 不分开没关闭——不管状态如何，只要不是这一轮跑出来的就不该留在新一轮账本里）。
+
+本脚本会为这一轮生成一个执行批次 ID **run_id**（格式 YYYYMMDD-HHMM），写进 config.run_id、记进
+runs.csv（首列），证据目录也按它归档（evidence/<app>/<ver>/<run_id>/...，见 docs/desktop-app-prd.md
+「★ 证据数据模型」）——同日多轮不再撞目录、桌面壳可按批次查证据。
   - queue.csv：运行时字段（当前状态/执行结果/证据链接/关键截图/问题ID/开始时间/结束时间/历史覆盖情况）
     重置为初始值，用例定义本身不变。
 
@@ -23,7 +27,7 @@ config.doc_id 指向新的这份；之后想更新 Doc 就手动重跑 `doc_repo
   python3 tools/new_run.py --no-populate   # 只建表不填充
   python3 tools/new_run.py --no-archive    # 跳过本地归档+重置（只建新表，本地账本不动）
 """
-import json, shutil, sys, argparse, datetime, pathlib, subprocess, csv
+import json, re, shutil, sys, argparse, datetime, pathlib, subprocess, csv
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CFG = ROOT / "config/target.json"
@@ -57,20 +61,47 @@ FOLDER_MIME = "application/vnd.google-apps.folder"
 QUEUE_RUNTIME_RESET = ["完成", "当前状态", "执行结果", "证据链接", "关键截图",
                        "问题ID", "开始时间", "结束时间", "历史覆盖情况"]
 
+RUNS_HEADER = ["run_id", "日期", "标题", "sheet_id", "URL", "doc_id", "doc_url"]
 
-def _last_run_date():
-    """上一轮的日期，取 runs.csv 最后一行；没有历史就返回 None（首次跑，不归档）。"""
+
+def _last_run_id():
+    """上一轮的归档键（run_id），取 runs.csv 最后一行首列。
+    新 schema 首列就是 run_id；旧 schema（无 run_id 列）首列是日期，退回用它当归档键
+    （legacy，同日多轮无法细分——历史数据的已知取舍）。没有历史返回 None（首次跑，不归档）。"""
     if not RUNS.exists():
         return None
     rows = list(csv.reader(open(RUNS, encoding="utf-8")))
-    return rows[-1][0] if len(rows) > 1 else None
+    return rows[-1][0] if len(rows) > 1 and rows[-1] else None
 
 
-def archive_and_reset(prev_date):
-    if not prev_date:
+def _ensure_runs_schema():
+    """把 runs.csv 迁到带 run_id 首列的新 schema；旧行 backfill run_id：日期 + 标题尾部的
+    HH:MM 拼成 YYYYMMDD-HHMM，拼不出用 -0000（legacy 近似，同日多轮可能撞）。已是新 schema 则不动。"""
+    if not RUNS.exists():
+        return
+    rows = list(csv.reader(open(RUNS, encoding="utf-8")))
+    if not rows or rows[0][:1] == ["run_id"]:
+        return
+    migrated = [RUNS_HEADER]
+    for r in rows[1:]:
+        if not r:
+            continue
+        date_c = r[0] if len(r) > 0 else ""
+        title_c = r[1] if len(r) > 1 else ""
+        m = re.search(r"(\d{1,2}):(\d{2})\s*$", title_c)
+        hhmm = f"{int(m.group(1)):02d}{m.group(2)}" if m else "0000"
+        rid = f"{date_c.replace('-', '')}-{hhmm}"
+        migrated.append([rid] + r)
+    with open(RUNS, "w", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerows(migrated)
+    print(f"[new_run] runs.csv 已迁到带 run_id 首列的新 schema（旧行按日期+标题时间 backfill）")
+
+
+def archive_and_reset(prev_run_id):
+    if not prev_run_id:
         print("[new_run] 没有上一轮记录，跳过归档，本地账本保持原样。")
         return
-    dest = ARCHIVE / prev_date
+    dest = ARCHIVE / prev_run_id
     dest.mkdir(parents=True, exist_ok=True)
 
     # log.csv / evidence.csv / issues.csv：整份归档，本地清空只留表头
@@ -153,11 +184,16 @@ def main():
         date = f"{d[:4]}-{d[4:6]}-{d[6:8]}" if len(d) == 8 and d.isdigit() else d
     else:
         date = datetime.date.today().strftime("%Y-%m-%d")
-    prefix = cfg.get("board_title", "AI+ADB 自动化测试执行看板")
-    title = f"{prefix} - {date}"
+    prefix = cfg.get("board_title", "自动化测试执行看板")
+    app_name = cfg.get("app_name", "").strip()
+    now_hm = datetime.datetime.now().strftime("%H:%M")
+    title = f"{app_name + ' ' if app_name else ''}{prefix} - {date} {now_hm}"
+
+    # 这一轮的执行批次 ID（证据目录 + runs.csv + config 都按它对齐）
+    run_id = f"{date.replace('-', '')}-{now_hm.replace(':', '')}"
 
     if not args.no_archive:
-        archive_and_reset(_last_run_date())
+        archive_and_reset(_last_run_id())
 
     from googleapiclient.discovery import build
     creds = get_creds()
@@ -177,10 +213,11 @@ def main():
             sendNotificationEmail=False, fields="id").execute()
         print(f"[new_run] 已共享给服务账号 {sa_email}（Editor）")
 
-    # 重指向 config.sheet_id
+    # 重指向 config.sheet_id + 记本轮 run_id（写在 doc_report 调用前，之后 re-read 能带上）
     cfg["sheet_id"] = sid
+    cfg["run_id"] = run_id
     CFG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
-    print("[new_run] config.sheet_id 已指向新看板")
+    print(f"[new_run] config.sheet_id 已指向新看板；config.run_id = {run_id}")
 
     # 开新一轮同时建一份带日期的新 Doc 报告（旧 Doc 不删，留云端归档；同 Sheet 的逻辑）
     doc_id, doc_url = "", ""
@@ -195,14 +232,15 @@ def main():
         else:
             print("[warn] doc_report 建新 Doc 失败，runs.csv 该轮 doc 列留空，之后可手动补跑。")
 
-    # 记入 runs 索引
+    # 记入 runs 索引（先把旧 schema 迁到带 run_id 首列，再追加本轮）
+    _ensure_runs_schema()
     new_file = not RUNS.exists()
     with open(RUNS, "a", newline="", encoding="utf-8") as fp:
         w = csv.writer(fp)
         if new_file:
-            w.writerow(["日期", "标题", "sheet_id", "URL", "doc_id", "doc_url"])
-        w.writerow([date, title, sid, url, doc_id, doc_url])
-    print(f"[new_run] 已记入 {RUNS}")
+            w.writerow(RUNS_HEADER)
+        w.writerow([run_id, date, title, sid, url, doc_id, doc_url])
+    print(f"[new_run] 已记入 {RUNS}（run_id={run_id}）")
 
     # 填充
     if not args.no_populate:

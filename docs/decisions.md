@@ -151,3 +151,30 @@
 - **决定（用户明确要求）**：`_append_evidence` 去掉按路径去重那段，不管路径是否已登记过，一律在文件末尾追加新行；**不覆盖、不跳过、不删除之前的证据行**。历史多轮混在一起的问题不在写入这层解决，交给读取端（`doc_report.py` 的 `case_key_evidence()` 已经有 `current_link` 前缀过滤，见 #12 补丁）。
 - **连带修复**：`case_result.py --evi` 的 upsert 逻辑原本用 `next()` 正序找第一个 `(用例ID,文件路径)` 匹配行来升级——去掉去重后，同路径可能积累多行，正序会命中**最早**那行（很可能是当天第一次跑、断言还很粗糙的旧行），升级到错误的行上。改成 `reversed()` 倒序找，命中的是**最新**那行，才是这次真正要升级的证据。
 - **代价/边界**：`evidence.csv` 行数会随重跑次数线性增长（尤其固化脚本一天跑很多次的场景），比 #19 设想的"重跑不产生重复行"更占空间——用户明确接受这个代价，换来的是"旧证据不丢、新证据可见"。`doc_report.py` 靠 `current_link` 前缀过滤是按"本轮证据目录"而不是按"最新时间戳"选行，如果同一天内某一轮的证据已经被 `case_result --evi` 标过"关键"、之后又重跑一次产生了新的同路径行（新行默认"过程留痕"），`case_key_evidence()` 仍会选中那条旧的"关键"行——文件内容是最新的（覆盖式），但断言文本可能是上一轮判定时写的，存在细微不一致；这个场景比较边缘（同一天内跑完判定又重跑），暂不处理，出现了再按需修。
+
+## 24. 看板标题加 App 名 + 精确到分的创建时间
+
+- **背景（2026-07-17）**：用户反馈当前看板标题"AI+ADB 自动化测试执行看板 - 2026-07-03"信息太少——只有通用框架名+日期，看不出测的是哪个 App，同一天多轮回归（见 `ledger/runs.csv` 里 2026-07-03 那天建过 4 张表）也分不清先后。
+- **决定**：`tools/new_run.py` 建表标题从 `<board_title> - <date>` 改成 `<app_name> <board_title> - <date> <创建时刻HH:MM>`（`app_name` 取自 `config/target.json`，`board_title` 默认值同步从"AI+ADB 自动化测试执行看板"简化成"自动化测试执行看板"，App 名已经在前面单独出现，不用重复"AI+ADB"这个框架自称）。当前活跃看板（sheet_id `1oSp4s4A9OYi6MaxgduX4OH2gl85Te1iMcOJEtGPmMF8`）已手动改名为"MP3 Cutter & Ringtone Maker 自动化测试执行看板 - 2026-07-03 18:50"（用 OAuth `inshot` 账号走 Drive `files.update` 改 `name` 字段，不是 Sheets API 操作），`ledger/runs.csv` 对应行同步更新。
+- **代价/边界**：时间只精确到分钟，同一分钟内建两张表仍会重名（概率极低，不处理）；`date`（用于归档目录名/`doc_report --date`/`runs.csv` 日期列）保持纯日期不变，只有标题这一处拼了时间。
+
+## 25. 通用广告/弹窗清障用「规则库 + sweep」，而不是每条用例里硬写关闭步骤
+
+- **背景（2026-07-17）**：测试过程中会间歇撞上各家广告 SDK 的全屏插屏/激励视频、系统权限弹窗、沉浸式提示等，打断用例流程。同事已有一份成熟的规则清单（`ad-admob-close`/`ad-applovin-close`/`ad-unity-close`/`ad-fan-close`/`ad-vungle-close`/`perm-allow`/`perm-allow-all-files`/`system-immersive-cling`），语义统一为「作用页 + 命中选择器 → tap_matched」。
+- **决定**：把这份清单固化成 `config/ad_rules.json`（跨 App 通用、随仓库版本管理，不进 `.gitignore` 那批本机产物），adbkit 加 `sweep` 命令读它执行。规则模型三要素：`scope`（作用页，子串匹配当前前台窗口组件串，`任意页面`/`*` 不限页）、`match`（选择器列表，按序试、第一个命中即点，`by ∈ id/text/desc` + `partial`）、`action`（目前只 `tap_matched`，留字段给以后扩展如 back/tap_outside）。
+- **为什么不复用已有的 `dismiss`**：`dismiss` 是「点弹窗外部空白关掉单个已知标志弹窗」，一次一个、要调用方指定选择器和外部坐标；广告清障要的是「一批规则、认页、点控件本身（不是点外部）、可轮询等跳过按钮出现」，语义不同，另起 `sweep` 更清楚，两者并存。
+- **关键设计**：① **scope 门控**——广告关闭类只在对应 SDK 全屏页（如 `AdActivity`/`AppLovinFullscreen`）才动 Skip/Close，避免在 App 正常界面误伤同名文案的按钮；权限/系统类才用 `任意页面`。② **text/desc 用 partial**——广告按钮常是 `Skip Ad`/`跳过广告 5s` 带后缀，精确匹配会漏，靠 scope 已经兜住误伤风险，所以放开子串；权限/系统类用精确 id。③ **每轮只点一个 + 重 dump**——点完界面就变，一轮一个再重扫最稳。④ **尽力而为、幂等**——没广告是正常状态，`sweep` 始终 exit0，不当失败；连续 `--patience` 轮无命中即收工，界面干净时快速退出，不干等满 `--rounds`。⑤ **认页靠 `_current_focus()`**——取 `dumpsys window` 的 `mCurrentFocus` 整行做子串匹配，不解析精确组件（各 Android 版本组件写法不一，子串更稳）；配套加了 `focus` 命令方便加新规则时看 scope 该填什么。
+- **代价/边界**：`sweep` 是黑盒点击、不产证据（跟被测功能无关的清障动作，不该污染 evidence.csv）；调用时机由执行大脑掌握（进广告位后、步骤之间兜底），不自动串进每条用例。规则命中依赖 dump 到的控件文案，纯 SurfaceView/WebView 渲染、控件树里拿不到文字的广告，本方案点不到（属已知盲区，遇到再按 desc/坐标兜）。
+- **固化脚本织入（2026-07-17）**：`flows/flow_cut_save.sh` 已按上述纪律织入——定义 `sweep()` helper（命中才 log、始终不阻断，`grep && || true` 对 `set -e` 安全），在广告高发点各兜一发：启动后、点「音频裁剪」后、点「转换」后。其中点转换后那发最关键（MP3 Cutter 常在此弹插屏，会盖住结果页让 `waitfor 音频已保存` 超时误判失败），给了 `--rounds 10 --interval 1` 覆盖广告倒计时窗口。同时把原来固定点两次 `permission_allow_button` 换成一发 `sweep`（perm-allow 规则覆盖 allow/allow_all/foreground 变体、顺序无关、有几个点几个，比固定点两次稳）；App 专属弹窗（隐私同意 desc=同意、文件访问 id=btn、新手引导遮罩）不在通用库里，仍单独点。刻意不在 `sweep` 前保留会超时空等的显式 `tapid --timeout`，避免"先 sweep 点掉、再 tapid 空等 6s"的冗余延迟。
+
+## 26. 视频播放器类 App 的证据类型：新增 `playback` + `framediff`（2026-07-17 讨论定，命令待实现）
+
+- **背景**：现有证据类型全为**产物类 App**（音频编辑→文件落地）设计，主力 `output-check` 查 MediaStore 验产物。视频播放器是**过程类**，不产出文件（流媒体尤甚），`output-check` 用不上；且单张截图无法区分正常播放 / 首帧冻结 / 黑屏 / 卡 buffering / 花屏。需要能证明"过程在推进"的证据。完整规格落在 `docs/evidence-video-playback.md`，此处只记非显然的**设计取舍**。
+- **三轴模型**：正常播放 = 出声（`dumpsys audio` player=`started`）+ 推进（`dumpsys media_session` `state=PLAYING`+`position` 递增）+ 画面（`framediff` 帧差 + AI 目视）。三轴**正交**，谁也替不了谁——音频 `started` 证不了画面，media_session 对渲染的像素一无所知（黑屏有声/首帧冻结有声/花屏它全亮绿灯）。
+- **为什么合成一个 `playback` 类型而不是拆 `media_session`/`audio` 两类**：视频里播放会话态和音频态几乎总是一起采、一起判，是一个逻辑证据单元（类比 `output-check` 把"存在+size+duration+mime"打包成一次检查，不拆成四类）。且它俩与 `alarm` 同族（都是 dumpsys 状态快照），按既有惯例**按语义域命名**（`playback`），不按机制命名（不叫 `dumpsys`）。
+- **为什么 flag 按数据源（`--session`/`--audio`）而不是按用例类型（`--video`/`--audio`）**：早期设计用 `--video`（采两份）/`--audio`（采一份），但 `--video` 名字误导——它一帧画面都不采（画面在 `framediff`），且"命令 `--video` 却断言 audio started"读起来矛盾。改成一个 flag 对一个 dumpsys 源、可组合（`--session --audio` 一次拿齐），和"采几份 dump"的直觉对齐。纯音频用例只 `--audio`，不拖入没人判的 media_session dump。
+- **为什么 `framediff` 归 `screenshots` 类型但命令另写**：产物是截图（故类型标签复用 `screenshots`），但 `shot` 只存单张、不算差，证不了"在变"——必须截多张+算像素差+下阈值断言。同 `output-check` 之于 MediaStore：数据源沿用，断言逻辑另写。
+- **为什么 `framediff` 3 帧不是 2 帧、必须裁剪**：2 帧碰上慢镜头/静止场景误判冻结，3 帧取首末帧时间基线最长；不裁剪则状态栏时钟/进度条/字幕/弹幕/转圈菊花在视频冻住时也会动 → 假"在播"，故裁到视频 View bounds 的中心 60%。
+- **画面轴是两条正交判断**：`framediff`（定量/阈值）抓冻结/黑屏，但花屏/撕裂/偏色是**高帧差**、会被放过 → 必须叠 **AI 目视**（定性）兜画质，两者共用同一批截图。
+- **已知边界（决定可用性，动手前必验）**：① `screencap` 对 SurfaceView/硬件 overlay/DRM 视频可能全黑，`framediff` 直接失效——用前先验视频区截不截得到，全黑则退回 `SurfaceFlinger --latency`/`gfxinfo` 或人工目视。② 自研/H5/WebView 播放器可能不发 MediaSession，`--session` 取不到——"推进"轴改走 UI 进度条两次采样递增（归 `screenshots`），别丢掉推进轴。③ 无声视频不适用出声轴，判定退化成 推进∧画面。
+- **状态**：`playback`/`framediff` 两个命令**尚未落进 `adbkit.py`**，本条与 `evidence-video-playback.md` 是规格；实现待办见 `todo.md`。`framediff` 依赖 Pillow+numpy，实现前确认宿主机装得了。

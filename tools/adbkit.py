@@ -2,7 +2,8 @@
 """adbkit —— AI 自动化测试的"手和眼"：一层 ADB 封装。
 
 执行大脑（Claude Code）通过调用本脚本的子命令来感知屏幕、操作设备、采集证据。
-所有产物统一落到 evidence/<date>/<case>/ 下，供证据链引用。
+所有产物统一落到 evidence/<app>/<ver>/<run_id>/<case>/<serial>/<attempt>/ 下，供证据链引用
+（run_id/attempt 见 docs/desktop-app-prd.md「★ 证据数据模型」；旧机器无 run_id 时退回纯日期段）。
 
 配置：读 config/target.json（没有则读 config/target.example.json）。
 用法示例：
@@ -45,6 +46,13 @@ def today():
     return CFG.get("date") or datetime.date.today().strftime("%Y%m%d")
 
 
+def run_seg():
+    """证据目录的"执行批次"段：优先 config.run_id（格式 YYYYMMDD-HHMM，由 new_run 生成），
+    为空则退回 today()（legacy 的纯日期，向后兼容——没跑过新版 new_run 的机器行为不变）。
+    见 docs/desktop-app-prd.md「★ 证据数据模型」。"""
+    return CFG.get("run_id") or today()
+
+
 def app_version():
     """版本号：优先 config.app_version；否则查设备一次并缓存。"""
     global _VER
@@ -71,14 +79,20 @@ def shell(remote, capture=True):
 
 
 def evid_dir(case, sub):
-    # 证据按 应用/版本/日期/用例 归档（版本为主轴，日期是同版本下的轮次）；
-    # SERIAL 非空时再按设备分一层子目录 .../case/<serial>/sub——多设备矩阵跑各存各的不撞，
-    # 单设备(config.serial 空且没传 --serial)时省掉设备段。
-    # 用例ID 只放 case，serial 段由这里按 --serial 自动加，绝不掺进 --case
-    # （否则 evidence.csv 的用例ID 列会被 serial 污染，跟 queue/board 对不上）。
-    d = EVID_ROOT / _safe(APP) / _safe(app_version()) / today() / case
+    # 证据按 应用/版本/执行批次(run_id)/用例 归档（版本为主轴，run_id 是同版本下的一次执行批次，
+    # 由 new_run 生成，格式 YYYYMMDD-HHMM；未跑过新版 new_run 时 run_seg() 退回纯日期，兼容旧行为）；
+    # SERIAL 非空时再按设备分一层 .../case/<serial>——多设备矩阵跑各存各的不撞，单设备省掉设备段；
+    # 环境变量 ADBKIT_ATTEMPT 非空时再加一层 .../<serial>/<attempt>——同一台设备上同一 case 重跑
+    # 各留一份画面不覆盖（attempt=执行开始 HHMMSS，由 run_flow / 主循环挂号处 export，一次执行内稳定；
+    # 未设则不加这层，避免每条 shot 各取当前时刻把同一次执行的截图散进多个目录）。见 desktop-app-prd.md。
+    # 用例ID 只放 case，serial/attempt 段由这里自动加，绝不掺进 --case
+    # （否则 evidence.csv 的用例ID 列会被污染，跟 queue/board 对不上）。
+    d = EVID_ROOT / _safe(APP) / _safe(app_version()) / _safe(run_seg()) / case
     if SERIAL:
         d = d / _safe(SERIAL)
+    attempt = os.environ.get("ADBKIT_ATTEMPT", "").strip()
+    if attempt:
+        d = d / _safe(attempt)
     d = d / sub
     d.mkdir(parents=True, exist_ok=True)
     return d
@@ -369,6 +383,94 @@ def cmd_dismiss(args):
         print(f"[dismiss] 无 {args.by}={args.value}，跳过")
 
 
+# ---------- 通用广告/弹窗清障（规则库驱动） ----------
+
+AD_RULES_PATH = ROOT / "config/ad_rules.json"
+_ANY_SCOPE = {"任意页面", "*", "any", ""}
+_ATTR = {"id": "resource-id", "text": "text", "desc": "content-desc"}
+
+
+def _current_focus():
+    """当前前台窗口组件串，供 sweep 判定规则作用页(scope)。取 dumpsys window 的 mCurrentFocus 整行，
+    退化再看 mFocusedApp / activity 的 ResumedActivity。返回原始行文本，scope 用子串命中即可——
+    不同 Android 版本 mCurrentFocus 里组件写法有的是 pkg/Activity、有的是全类名，子串匹配都稳。"""
+    out = shell("dumpsys window").stdout or ""
+    m = re.search(r"mCurrentFocus=Window\{[^}]*\}", out)
+    if m:
+        return m.group(0)
+    m = re.search(r"mFocusedApp=\S.*", out)
+    if m:
+        return m.group(0).strip()
+    out2 = shell("dumpsys activity activities").stdout or ""
+    m = re.search(r"(?:topResumedActivity|ResumedActivity|mResumedActivity)=\S.*", out2)
+    return m.group(0).strip() if m else ""
+
+
+def load_ad_rules(path=None):
+    p = pathlib.Path(path) if path else AD_RULES_PATH
+    if not p.exists():
+        sys.exit(f"[sweep] 找不到规则库 {p}（默认 config/ad_rules.json）。")
+    try:
+        return json.loads(p.read_text(encoding="utf-8")).get("rules", [])
+    except json.JSONDecodeError as e:
+        sys.exit(f"[sweep] 规则库 JSON 解析失败：{e}")
+
+
+def cmd_focus(args):
+    """打印当前前台窗口组件串——写 sweep 新规则时用来确认某广告页的 scope 该填什么子串。"""
+    print(_current_focus())
+
+
+def cmd_sweep(args):
+    """通用广告/弹窗清障器：按规则库(config/ad_rules.json)扫当前界面，命中就点掉。
+    幂等、尽力而为——没广告是正常状态，不当失败(始终 exit0)。每轮只点一个(点完界面会变，
+    下一轮重新 dump)；连续 --patience 轮无命中即认为界面已清干净，提前收工。
+    广告关闭类规则靠 scope 卡在对应 SDK 全屏页才动手，不会误伤 App 正常界面；
+    权限/系统弹窗类作用页为任意页面。调用时机由执行大脑掌握（如进广告位后、每步之间兜底）。"""
+    rules = load_ad_rules(args.rules)
+    only = set(x for x in args.only.split(",") if x) if args.only else None
+    fired, quiet = [], 0
+    for rnd in range(1, args.rounds + 1):
+        focus = _current_focus()
+        try:
+            nodes = list(_dump_tree())
+        except SystemExit:
+            time.sleep(args.interval)  # dump 失败多为界面在动画/瞬时，歇一下再来
+            continue
+        hit = None
+        for rule in rules:
+            if only and rule.get("id") not in only:
+                continue
+            if not rule.get("enabled", True):
+                continue
+            scope = rule.get("scope", "")
+            if not (scope in _ANY_SCOPE or (scope and scope in focus)):
+                continue
+            for sel in rule.get("match", []):
+                by = sel.get("by", "id")
+                hits = _match_nodes(nodes, _ATTR[by], sel["value"], sel.get("partial", False))
+                if hits:
+                    (cx, cy), v, _b = hits[0]
+                    hit = (rule.get("id"), by, v, cx, cy)
+                    if not args.dry_run:
+                        shell(f"input tap {cx} {cy}")
+                    break
+            if hit:
+                break
+        if hit:
+            rid, by, v, cx, cy = hit
+            print(f"{'[命中]' if args.dry_run else '[点掉]'} 第{rnd}轮 {rid}: {by}={v} @ ({cx},{cy})")
+            fired.append(hit)
+            quiet = 0
+        else:
+            quiet += 1
+            if quiet >= args.patience:
+                break
+        if rnd < args.rounds:
+            time.sleep(args.interval)
+    print(f"[sweep] 处理 {len(fired)} 个广告/弹窗。" if fired else "[sweep] 界面干净，无可清理项。")
+
+
 def cmd_tapid(args):
     _tap_selector("id", args)
 
@@ -648,6 +750,15 @@ def build_parser():
     s.add_argument("--x", type=int, default=540)
     s.add_argument("--y", type=int, default=240)
     s.set_defaults(fn=cmd_dismiss)
+    sub.add_parser("focus").set_defaults(fn=cmd_focus)
+    s = sub.add_parser("sweep")
+    s.add_argument("--rules", default=None, help="规则库路径，默认 config/ad_rules.json")
+    s.add_argument("--only", default=None, help="只跑这些规则 id（逗号分隔），调试单条用")
+    s.add_argument("--rounds", type=int, default=8, help="最多扫几轮（每轮最多点一个，默认8）")
+    s.add_argument("--interval", type=float, default=1.0, help="轮间隔秒（默认1.0，留给广告倒计时/跳过按钮出现）")
+    s.add_argument("--patience", type=int, default=2, help="连续几轮无命中即收工（默认2，界面已干净时快速退出）")
+    s.add_argument("--dry-run", action="store_true", help="只报命中不真点，用于核对规则")
+    s.set_defaults(fn=cmd_sweep)
     s = sub.add_parser("text"); s.add_argument("value"); s.set_defaults(fn=cmd_text)
     s = sub.add_parser("key"); s.add_argument("code"); s.set_defaults(fn=cmd_key)
     s = sub.add_parser("swipe")

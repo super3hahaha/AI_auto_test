@@ -43,7 +43,7 @@ python3 tools/compile_cases.py
 bash seeds/gen_assets.sh
 ```
 
-如果你要跑内置的 MP3 Cutter 示例用例 `CUT-CORE-01`，还需要手动补一个真实音频文件（内容不重要，文件名要含"童话镇"）放进 `assets/`，具体要求看 [assets/README.md](assets/README.md)。如果你是接入自己的 App，跳过这个。
+如果你要跑内置的 MP3 Cutter 示例用例 `CUT-CORE-01`，还需要手动补一个真实音频文件（内容不重要，文件名要含"mp3-sample-track"）放进 `assets/`，具体要求看 [assets/README.md](assets/README.md)。如果你是接入自己的 App，跳过这个。
 
 ## 4. 自检
 

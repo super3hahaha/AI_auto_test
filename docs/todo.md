@@ -47,3 +47,16 @@
 这条用例的"结果页返回首页"这类导航动作，如果要做，可以顺手做成公共函数复用（另一个更小的、无风险的想法，不在此待办范围内，随手做即可，不用专门立项）。
 
 **触发条件**：等用户明确要求设计/实现这条用例再动手。
+
+## 4. 实现 `playback` + `framediff` 两个证据采集命令（2026-07-17 定规格，待实现）
+
+**背景**：讨论"怎么测视频播放器、怎么证明视频在正常播放"得出的证据链，规格已写全（`docs/evidence-video-playback.md` + `decisions.md` #26），但 `adbkit.py` 里这两个命令还没落地。当前被测 App 是音频编辑类（MP3 Cutter），暂用不上；等接手视频播放器类 App 时再实现。
+
+**待办**：
+- `adbkit.py` 加 `playback` 子命令：`--session` 跑 `dumpsys media_session`（内建"采样—等 N 秒—再采样"，比 `position` 递增）、`--audio` 跑 `dumpsys audio`（判 player 状态 `started`），可组合；按包名过滤；`_append_evidence` 类型写 `playback`，产物落 `evidence/.../logs/`。
+- `adbkit.py` 加 `framediff` 子命令：从 ui dump 拿视频 View bounds → 中心 60% 裁剪 → `screencap` 隔 ~1s 拍 3 帧 → 单帧有效性（mean_luma<16 黑屏 / std<8 平色）+ 首末帧 changed_ratio（差>12 才算变，>2% 判在动）。依赖 **Pillow+numpy**（实现前确认宿主机装得了）；类型写 `screenshots`。阈值（16/8/2%/12）在真机素材上标定。
+- 实现后可固化成 `flows/flow_video_play.sh`（按证据链 0→4 时序编排 `shot`/`playback`/`framediff`/`logscan`）。
+
+**动手前必验的两个前置**（决定命令可用性，见 `evidence-video-playback.md` 边界节）：① `screencap` 对被测播放器的视频区截不截得到（SurfaceView/DRM 会全黑，framediff 报废）；② 被测播放器发不发 MediaSession（不发则 `--session` 取不到，推进轴改走 UI 进度条）。
+
+**触发条件**：等被测对象换成视频播放器类 App、或用户明确要求实现再动手。

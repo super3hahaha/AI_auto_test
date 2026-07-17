@@ -35,6 +35,7 @@ AI_auto_test/
     ├── RUNBOOK.md       # 执行大脑协议（先读这个）
     ├── structure.md     # 本文件
     ├── flow-freeze.md   # AI 探路→固化成 flow_*.sh 脚本（回归提速）
+    ├── evidence-video-playback.md  # 视频播放器类 App 的证据链（三轴模型 + playback/framediff 规格）
     ├── decisions.md     # 非显然的架构选择与原因
     └── gotchas.md       # 已知坑
 ```

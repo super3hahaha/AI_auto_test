@@ -5,7 +5,8 @@ AI 当测试工程师、用 ADB 驱动安卓模拟器的自动化测试框架。
 
 ## 组成
 
-- `tools/adbkit.py` —— 手和眼：ADB 封装。感知 `ui/find/waitfor`；操作 `tapid/taptext/tapdesc`（选择器点击，坐标现算跨分辨率，`--from` 复用 dump、`--timeout` 等待重试）+ `tap/text/key/swipe`；证据 `shot/logscan`(按PID过滤)/`output-check`(查MediaStore)/`alarm/db/sp`；`--serial` 多设备。
+- `tools/adbkit.py` —— 手和眼：ADB 封装。感知 `ui/find/waitfor/focus`；操作 `tapid/taptext/tapdesc`（选择器点击，坐标现算跨分辨率，`--from` 复用 dump、`--timeout` 等待重试）+ `tap/text/key/swipe`；清障 `dismiss`(单弹窗) / `sweep`(通用广告&权限&系统弹窗清障，规则库驱动，见下)；证据 `shot/logscan`(按PID过滤)/`output-check`(查MediaStore)/`alarm/db/sp`；`--serial` 多设备。
+- `config/ad_rules.json` —— 通用广告/弹窗**清障规则库**（跨 App 通用、随仓库版本管理）。每条规则 = `作用页(scope) + 命中选择器(match) → tap_matched`。`adbkit.py sweep` 读它：认当前前台页 → dump 一次 → 命中就点，幂等且尽力而为（没广告不算失败，始终 exit0；连续 `--patience` 轮无命中即收工）。广告关闭类靠 scope 卡在对应 SDK 全屏页才动手（不误伤正常界面），权限/系统弹窗类作用页为任意页面。加新规则先 `adbkit.py focus` 看目标页的组件串定 scope。调用时机由执行大脑掌握（进广告位后 / 步骤之间兜底）。
 - `tools/compile_cases.py` —— 把 `cases/*.yaml` 汇编进 `queue.csv`（幂等，保留运行时状态）。
 - `tools/init_target.py <包名>` —— 换被测 App 时，只给包名自动探测 `serial`/`app_version`/`main_activity`/`build`(debuggable 判定)/`db_name` 并生成/更新 `config/target.json`（默认只打印不落盘，`--write` 才写回；`app_name`/`app_version` 要人工核对再确认，见 `docs/gotchas.md`）。
 - `flows/flow_cut_save.sh` —— 示例：把一条用例编译成纯选择器的可执行流程，按 serial 参数化，可多设备并行。
@@ -161,11 +162,13 @@ python3 tools/doc_report.py --new        # 另建一份新 Doc
 | `screenshots` | `shot` | 界面截图，验证 UI 呈现是否符合预期（页面文案、控件状态、结果提示等） | 否 |
 | `MediaStore` | `output-check` | 查询 **Android 系统级媒体索引库**（`content://media/external/audio/media`，不是 App 自己的数据），验证音频/视频等产物是否真的生成、`_size`/`duration` 是否合理（`--expect` 命中后默认带完整性检查）、路径（`_data`）是否符合预期。系统公共 provider，`adb shell` 直接能查，不需要 `run-as` | 否——非 debug 包也能用，是本项目验证"产物确实生成且正确"的主要黑盒手段 |
 | `logs` | `logscan` | 按 App 进程 PID 过滤的 logcat 崩溃扫描，验证有无 FATAL / ANR / AndroidRuntime / SQLiteException / NativeCrash | 否 |
+| `playback` | `playback`（待实现）| dump 播放运行时态验证"正在播放"而非卡首帧/暂停/静音——**过程类 App**(视频/音频播放器)的核心手段，补 `output-check`(只验落地产物)覆盖不到的"过程在推进"。flag 按数据源命名可组合：`--session`(`dumpsys media_session`，断言 `state=PLAYING`+`position` 两采样递增=推进)、`--audio`(`dumpsys audio`，断言 player 状态=`started`=出声)。与 `alarm` 同族(dumpsys 状态快照)。详见 `docs/evidence-video-playback.md` | 否——`dumpsys` 走 `adb shell` 即可，非 debug 包也能取 |
+| `screenshots`（复用，命令 `framediff`）| `framediff`（待实现）| **视频区帧差**:裁剪画面区后隔 N 秒连拍 2–3 张 `screencap`，算像素差+单帧有效性——帧差>阈值=在渲染、≈0=首帧冻结、纯黑=黑屏。专治"截一张看不出动没动"。产物是截图故归 `screenshots`，但采集命令另写(`shot` 只存单张不算差)。**注意** `screencap` 对 SurfaceView/DRM 视频可能全黑 → 用前先验。详见 `docs/evidence-video-playback.md` | 否——`screencap` 无需 debuggable |
 | `db` | `db` | 导出 App 私有 SQLite 数据库做前后 diff，验证数据是否正确写入、有没有被污染/覆盖 | 是（需 `run-as`） |
 | `sp` | `sp` | 导出 App 私有 SharedPreferences，验证开关位/配置字段是否符合预期 | 是（需 `run-as`） |
 | `privls` | `privls` | 列出 App 私有存储目录（内部 `files/` 或外部专属目录），常配合操作前后 diff，用于验证"下载/输出落在私有目录而非 MediaStore"这类场景 | 是（需 `run-as`） |
 | `alarm` | `alarm` | 检查提醒/闹钟排程状态，验证系统级 reminder 是否真正设置/取消 | 视具体实现而定 |
 
-判定优先级：非 debug 包（大多数 release 包）只能用 `screenshots`/`MediaStore`/`logs`，`db`/`sp`/`privls` 这三类需要 App 是 debuggable 才能用 `run-as` 读到。详见 `docs/RUNBOOK.md`「判定要读多源」和「`证据类型=MediaStore` 具体包含哪些情况」两节。
+判定优先级：非 debug 包（大多数 release 包）只能用 `screenshots`/`MediaStore`/`logs`/`playback`/`framediff`，`db`/`sp`/`privls` 这三类需要 App 是 debuggable 才能用 `run-as` 读到。详见 `docs/RUNBOOK.md`「判定要读多源」和「`证据类型=MediaStore` 具体包含哪些情况」两节；视频播放器类 App 的完整证据链见 `docs/evidence-video-playback.md`。
 
 **`UI XML`（不是独立证据类型，是合并标注）**：`ui <step>` 会把这次 uiautomator 控件树 dump 存进 `evidence/.../ui/<step>.xml`——控件文本/resource-id/bounds 都在里面，是断言里精确数值（比如具体时长）的原始依据。写断言时如果真的引用了这份 dump 数据（不是纯看截图写的），`shot` 加 `--used-dump`，`_append_evidence` 就把这行的"证据类型"写成 `screenshots+UI XML`（**不拆成两行**，"文件/链接"列仍只放截图路径——XML 按约定路径能推出来，不重复登记）。**这是显式声明，不是自动检测**——「dump 有没有喂给这条判断」只有写断言的人自己知道，同名 XML 文件存在不代表就用上了（可能只是导航用的 dump），所以不按文件存在与否去猜。只单独 `ui` 没有配套 `--used-dump` 的 `shot` 的那次 dump 不会进账本（纯定位用，见 `docs/decisions.md` #20）。

@@ -29,9 +29,10 @@ runs.csv（首列），证据目录也按它归档（evidence/<app>/<ver>/<run_i
 """
 import json, re, shutil, sys, argparse, datetime, pathlib, subprocess, csv
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-CFG = ROOT / "config/target.json"
-SA_JSON = ROOT / "config/service_account.json"
+from _appctx import REPO, LEDGER as APP_LEDGER, TARGET_CFG  # 多 App 路径解析
+ROOT = REPO
+CFG = TARGET_CFG                                     # 被测 App 配置：apps/<slug>/target.json（per-app）
+SA_JSON = ROOT / "config/service_account.json"       # 账号级凭证：共享
 OAUTH_CLIENT = ROOT / "config/oauth_client.json"
 
 
@@ -48,7 +49,7 @@ def _oauth_token_path():
 
 
 OAUTH_TOKEN = _oauth_token_path()
-LEDGER = ROOT / "ledger"
+LEDGER = APP_LEDGER                 # apps/<slug>/ledger（per-app）
 RUNS = LEDGER / "runs.csv"
 ARCHIVE = LEDGER / "archive"
 QUEUE = LEDGER / "queue.csv"

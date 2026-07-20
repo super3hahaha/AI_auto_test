@@ -20,18 +20,25 @@ app_name 随便覆盖，app_slug 要延续就手动保留旧值。
 默认只探测 + 打印，不落盘（先看结果对不对，尤其 db_name 可能有多个候选要人工挑一个）。
 确认无误后加 --write 才真正写回 config/target.json。
 
+dump 后端（dump_backend，见 adbkit.py）：不探测。`--atx-init` 做 uiautomator2 连接+健康检查
+（首次自动装 atx 常驻组件），`--dump-backend {shell,u2}` 在写回时显式设置——默认不动，保持 shell，
+确认 atx 稳定后再切 u2（u2 dump 快约 4×，代价是设备端常驻组件保活，见 gotchas.md）。
+
 用法：
     python3 tools/init_target.py <package>                  # 只探测打印
     python3 tools/init_target.py <package> --serial <SN>    # 多设备时指定
     python3 tools/init_target.py <package> --write          # 探测完确认写回
     python3 tools/init_target.py <package> --db-name xxx.db --write  # 手动指定 db_name 再写回
+    python3 tools/init_target.py <package> --atx-init       # 装/验 atx（切 u2 后端前的设备初始化）
+    python3 tools/init_target.py <package> --atx-init --dump-backend u2 --write  # 验通过后切 u2 并写回
 """
-import argparse, json, pathlib, re, subprocess, sys
+import argparse, json, pathlib, re, subprocess, sys, time
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-CFG_PATH = ROOT / "config/target.json"
-EXAMPLE_PATH = ROOT / "config/target.example.json"
-DUMPCACHE = ROOT / ".dumpcache"
+from _appctx import REPO, TARGET_CFG, DUMPCACHE as _DC  # 多 App 路径解析
+ROOT = REPO
+CFG_PATH = TARGET_CFG                              # apps/<slug>/target.json（per-app，活跃 App）
+EXAMPLE_PATH = ROOT / "config/target.example.json"  # 模板：共享
+DUMPCACHE = _DC
 
 
 def find_aapt():
@@ -48,6 +55,42 @@ def find_aapt():
 def adb(serial, *args, capture=True):
     cmd = ["adb"] + (["-s", serial] if serial else []) + list(args)
     return subprocess.run(cmd, capture_output=capture, text=True)
+
+
+def _u2_version():
+    try:
+        from importlib.metadata import version
+        return version("uiautomator2")
+    except Exception:
+        return "?"
+
+
+def atx_healthcheck(serial, timeout=25.0):
+    """设备初始化的一步：连 uiautomator2（首次 connect 会自动 push atx-agent + 装 apk），
+    再做一次 dump_hierarchy 验活。返回结构化结果 {ok, version, connect_ms, dump_ms, err}，
+    供本脚本 CLI 与 desktop 选设备流程复用——切 u2 dump 后端前先确认 atx 真的连得上、dump 得动。
+    注意：这是「装 + 首连健康检查」；atx 常驻组件后续会被系统省电策略杀，运行期的重连保活
+    由 adbkit 的 _u2_device()（连接惰性缓存）+ u2 库 connect 内建 healthcheck 负责。"""
+    try:
+        # 静音 uiautomator2→urllib3 的 NotOpenSSLWarning（import 时打，与功能无关，别污染输出）
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            import uiautomator2 as u2
+    except ImportError:
+        return {"ok": False, "err": "未安装 uiautomator2（pip install uiautomator2）"}
+    try:
+        t0 = time.monotonic()
+        d = u2.connect(serial)                       # 首次自动安装 atx 常驻组件
+        connect_ms = (time.monotonic() - t0) * 1000
+        t1 = time.monotonic()
+        xml = d.dump_hierarchy()
+        dump_ms = (time.monotonic() - t1) * 1000
+        if not xml or "<hierarchy" not in xml:
+            return {"ok": False, "err": "dump_hierarchy 返回空/无 <hierarchy>", "connect_ms": connect_ms}
+        return {"ok": True, "version": _u2_version(), "connect_ms": connect_ms, "dump_ms": dump_ms}
+    except Exception as e:
+        return {"ok": False, "err": str(e)}
 
 
 def pick_serial(explicit):
@@ -122,6 +165,10 @@ def main():
     ap.add_argument("package")
     ap.add_argument("--serial", help="多设备在线时必填")
     ap.add_argument("--db-name", help="有多个 databases/ 候选时人工指定用哪个")
+    ap.add_argument("--atx-init", action="store_true",
+                    help="设备初始化：连 uiautomator2 并健康检查（首次自动装 atx 常驻组件），为切 u2 dump 后端做准备")
+    ap.add_argument("--dump-backend", choices=["shell", "u2"], default=None,
+                    help="写回时设置 target.json 的 dump_backend（默认不改，保持既有/shell；确认 atx 稳定后再显式切 u2）")
     ap.add_argument("--write", action="store_true", help="确认无误后写回 config/target.json（默认只打印不落盘）")
     args = ap.parse_args()
 
@@ -129,6 +176,19 @@ def main():
     r = detect(args.package, serial)
     if args.db_name:
         r["db_name"] = args.db_name
+
+    atx_ok = None
+    if args.atx_init:
+        print("\n=== atx 健康检查（uiautomator2，切 u2 后端前的设备初始化）===")
+        hc = atx_healthcheck(serial)
+        atx_ok = hc["ok"]
+        if hc["ok"]:
+            speedup = 500.0 / max(hc["dump_ms"], 1)
+            print(f"  ✓ atx 就绪  u2={hc['version']}  connect={hc['connect_ms']:.0f}ms  "
+                  f"dump_hierarchy={hc['dump_ms']:.0f}ms（shell 后端 ~500ms，约快 {speedup:.1f}×）")
+        else:
+            print(f"  ✗ atx 未就绪：{hc['err']}")
+            print("    建议 dump_backend 保持 shell（切 u2 会连不上）。")
 
     print("=== 探测结果 ===")
     print(f"  package        = {r['package']}")
@@ -153,6 +213,13 @@ def main():
     cfg = json.loads(base.read_text()) if base.exists() else {}
     for k in ("package", "serial", "app_name", "app_version", "main_activity", "build", "db_name"):
         cfg[k] = r[k]
+    if args.dump_backend:
+        if args.dump_backend == "u2" and atx_ok is False:
+            print("[init_target] 警告：atx 健康检查没过，仍按你的显式要求写入 dump_backend=u2；"
+                  "跑之前先 `--atx-init` 确认连得上，否则所有 dump 会失败。")
+        cfg["dump_backend"] = args.dump_backend
+        print(f"[init_target] dump_backend 设为 {args.dump_backend}")
+    CFG_PATH.parent.mkdir(parents=True, exist_ok=True)  # 新 App 工作区 apps/<slug>/ 可能还不存在
     CFG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n")
     print(f"\n[init_target] 已写回 {CFG_PATH}")
 

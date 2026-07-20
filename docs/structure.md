@@ -2,35 +2,52 @@
 
 ## 目录
 
+> **多 App 布局（2026-07-17 起，见 decisions #27）**：每个被测 App 一套独立工作区
+> `apps/<slug>/{target.json, flows/, cases/, ledger/}`。活跃 App 由 `config/active.json` 的
+> `active`（或环境变量 `AITEST_APP`）决定；所有工具经 `tools/_appctx.py` 解析出当前 App 的路径。
+> `config/`（账号级凭证 + 模板 + active.json + ad_rules）、`evidence/`、`seeds/`、`assets/`、
+> `.dumpcache/`、`tools/`、`docs/`、`desktop/` 是**跨 App 共享**，仍在仓库根。
+
 ```
 AI_auto_test/
 ├── README.md            # 冷启动入口：装什么、怎么跑
-├── config/
-│   ├── target.example.json   # 被测 App 配置模板（拷成 target.json 用）
-│   ├── target.json           # 实际配置（gitignore）
+├── config/              # 账号级 + 全局（共享，不 per-app）
+│   ├── active.json           # {active: "<slug>"}：当前活跃 App（tools/_appctx 读它）
+│   ├── target.example.json   # 被测 App 配置模板
 │   ├── service_account.json  # Google 服务账号密钥，sheets_sync 用（gitignore）
-│   ├── oauth_client.json     # OAuth 桌面客户端密钥，doc_report 用（gitignore，你从 GCP 下）
-│   └── oauth_token.json      # doc_report 首次授权后缓存的 token（gitignore，自动生成）
-├── tools/
-│   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/db/sp/seed/logscan/alarm...）
-│   ├── compile_cases.py # 把 cases/*.yaml 汇编进 queue.csv（幂等，保留运行时状态）
-│   ├── sheets_sync.py   # 把 ledger 推到 Google Sheets（单向覆盖，服务账号）；推完自动套美化格式（墨绿表头/冻结/隔行底纹/状态色标，STYLE 字典配置，幂等）
-│   └── doc_report.py    # 把 ledger + 证据截图渲染成 Google Doc 图文报告（单向覆盖，OAuth）
-├── flows/               # 固化回归脚本（纯选择器 bash，绑定当前 App UI，换 App 整个替换）；见 docs/flow-freeze.md
-│   ├── flow_cut_save.sh # 单流程范例（裁剪→保存），按 serial 参数化可并行
-│   └── flow_multi.sh    # 多选流程范例（合并/混合），ENTRY 指定入口
-├── cases/               # 用例定义（YAML，一句话目标→执行就绪）；_TEMPLATE.yaml 是字段模板，CUT-CORE-01 是唯一保留的 MP3 Cutter 示例（换 App 时删/换）
+│   ├── oauth_client.json     # OAuth 桌面客户端密钥，doc_report 用（gitignore）
+│   ├── oauth_token*.json     # OAuth token 缓存（gitignore，自动生成）
+│   └── ad_rules.json         # 通用广告/弹窗清障规则库（adbkit sweep 用）
+├── apps/                # ★ 每个被测 App 一套独立工作区（per-app）
+│   └── <slug>/               # 如 MP3Cutter/
+│       ├── target.json       # 该 App 配置（package/serial/version/sheet_id/doc_id/run_id…；gitignore）
+│       ├── flows/            # 该 App 的固化回归脚本（flow_*.sh，绑定该 App UI）；见 flow-freeze.md
+│       ├── cases/            # 该 App 用例定义（YAML）；_TEMPLATE.yaml 字段模板
+│       └── ledger/           # 该 App 本机执行产物（gitignore）
+│           ├── summary.csv   # 摘要：全局计数
+│           ├── structure.csv # 结构视图：模块→目的→覆盖用例
+│           ├── queue.csv     # 测试队列：全量真值，一行一个用例
+│           ├── board.csv     # 本轮投影（scope 命中），随时可重建
+│           ├── evidence.csv  # 证据链：一行一份证据物料 + 断言（纯追加，见 #23）
+│           ├── issues.csv    # 问题清单：BUG/RISK/GAP/BLOCK
+│           ├── runs.csv      # 执行批次台账：一行一 run_id（看板锚点）
+│           ├── excluded.csv  # 排除用例
+│           ├── log.csv       # 状态变更日志：只追加
+│           └── archive/<run_id>/  # 开新一轮时上一轮 log/evidence/issues 整份归档
+├── tools/               # 跨 App 通用框架工具（共享）
+│   ├── _appctx.py       # ★ 多 App 上下文：解析活跃 App → 各路径（所有工具都 import 它）
+│   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/db/sp/seed/logscan/sweep...）
+│   ├── compile_cases.py # cases/*.yaml → ledger/queue.csv（幂等，保留运行时状态）
+│   ├── run_flow.py      # 固化脚本统一执行入口（自动计时 + attempt 隔离）
+│   ├── auto_repair.py   # ★「大脑Claude」自愈：run_flow 失败→claude诊断→只改导航/健壮性→重跑(≤3次)
+│   ├── new_run.py       # 开一轮新回归（建看板 + 生成 run_id + 归档重置）
+│   ├── sheets_sync.py   # ledger → Google Sheets（单向覆盖，服务账号，瞬时5xx自动重试）；桌面执行台每轮收尾自动调
+│   ├── doc_report.py    # ledger + 证据 → Google Doc 图文报告（OAuth）
+│   └── migrate_to_multiapp.py # 一次性：单 App 布局 → apps/<slug>/（幂等）
 ├── .claude/skills/adb-testcase-gen/  # skill：一句话目标→真机探查→YAML 用例
-├── ledger/              # 本机执行产物，7 个 CSV 对应原表 7 个 Tab（gitignore：多人各自本机跑会冲突，Google Sheet 才是团队共享真值）
-│   ├── summary.csv      # 摘要：全局计数
-│   ├── structure.csv    # 结构视图：模块→目的→覆盖用例（导航图）
-│   ├── queue.csv        # 测试队列：主看板，一行一个用例
-│   ├── evidence.csv     # 证据链：一行一份证据物料 + 断言
-│   ├── issues.csv       # 问题清单：BUG/RISK/GAP/BLOCK
-│   ├── excluded.csv     # 排除用例：需外部依赖，划出范围
-│   └── log.csv          # 状态变更日志："挂号"流水，只追加
-├── seeds/               # 造数据用的 .sql（执行时按用例现写）
-├── evidence/            # 证据产物：evidence/<日期>/<用例ID>/{screenshots,ui,db,sp,logs}
+├── desktop/             # ★ Tauri2+Vue3 桌面壳（可视化：证据查看/执行台/看板）
+├── seeds/               # 造数据用脚本/.sql（共享）
+├── evidence/            # 证据物料：evidence/<slug>/<ver>/<run_id>/<用例>/<serial>/<attempt>/{screenshots,ui,logs}
 └── docs/
     ├── RUNBOOK.md       # 执行大脑协议（先读这个）
     ├── structure.md     # 本文件

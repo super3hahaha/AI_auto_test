@@ -19,26 +19,18 @@
 import argparse, csv, json, os, shutil, subprocess, sys, shlex, datetime, pathlib, re, time
 import xml.etree.ElementTree as ET
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-CFG_PATHS = [ROOT / "config/target.json", ROOT / "config/target.example.json"]
-CACHE_ROOT = ROOT / ".dumpcache"
-
-
-def load_cfg():
-    for p in CFG_PATHS:
-        if p.exists():
-            return json.loads(p.read_text())
-    sys.exit("找不到配置：请复制 config/target.example.json 为 config/target.json 并填好 package 等字段。")
-
-
-CFG = load_cfg()
+from _appctx import REPO, LEDGER, DUMPCACHE, load_cfg  # 多 App 路径解析
+ROOT = REPO            # 下文用 ROOT 指仓库根处（config 创证 / evidence / .dumpcache / relative_to）保持不变
+CACHE_ROOT = DUMPCACHE
+CFG = load_cfg()       # 当前活跃 App 的 apps/<slug>/target.json（AITEST_APP / config/active.json 决定）
 PKG = CFG["package"]
 MAIN_ACTIVITY = CFG.get("main_activity", "")
 DB = CFG.get("db_name", "")
 SERIAL = CFG.get("serial", "")
 EVID_ROOT = ROOT / CFG.get("evidence_root", "evidence")
-EVID_LEDGER = ROOT / "ledger/evidence.csv"  # 采证即登记的账本（每次采集自动追加一行）
+EVID_LEDGER = LEDGER / "evidence.csv"  # 采证即登记的账本（每次采集自动追加一行）；LEDGER=apps/<slug>/ledger
 APP = CFG.get("app_slug") or CFG.get("app_name") or PKG.split(".")[-1]  # 证据目录用的简称，跟展示用 app_name 分开（见 gotchas.md）
+DUMP_BACKEND = CFG.get("dump_backend", "shell")  # UI dump 后端：shell(默认,纯adb) / u2(uiautomator2,需装atx,快约4倍)；--dump-backend 可覆盖
 _VER = None
 
 
@@ -167,8 +159,7 @@ def cmd_ui(args):
     # 占位断言，不如先重新 dump 一次，大概率下一帧画面已经稳定、能拿到真实值。
     attempts = 3 if fields else 1
     for attempt in range(attempts):
-        shell("uiautomator dump /sdcard/uidump.xml")
-        adb("pull", "/sdcard/uidump.xml", str(out))
+        _dump_xml_to(out)  # 按当前后端(shell/u2)dump 成 XML 落到证据目录，别绕过后端抽象
         if not fields:
             break
         try:
@@ -214,8 +205,44 @@ def cmd_shot(args):
     if getattr(args, "used_dump", False) and not ui_dir.exists():
         print(f"[shot] 警告：--used-dump 但 {ui_dir} 下没有任何 UI dump 文件，确认真的引用了 dump 数据吗？", file=sys.stderr)
     etype = "screenshots+UI XML" if getattr(args, "used_dump", False) else "screenshots"
+
+    # ---- 真实断言门控（可选）----
+    # 历史坑：shot 只截图+登记，result 默认写死「通过」，含义其实是「脚本走到了这行」而非「断言成立」，
+    # 广告全屏盖住首页也照样记「通过」（假阳性，见 gotchas.md）。给 shot 挂上真实检查：
+    #   --assert-text：这些文案/描述(text 或 content-desc 子串)必须在屏——首页/结果页控件在＝界面真的露出；
+    #   --assert-gone：这些标志不该在屏（如广告残留）。
+    # 任一不满足→result 记「失败」（可 --assert-fail-result 改）并非 0 退出，让「通过」不再是无脑默认值。
+    # 注意：WebView 插屏（AdMob Creative Preview）内容不进 uiautomator 树，--assert-gone 对它是盲区；
+    # 靠 --assert-text 断言「首页控件必须在屏」才能兜住"被广告全屏盖住"这种情形（广告在上，首页控件就不在树里）。
+    result = getattr(args, "shot_result", "通过")
+    want = getattr(args, "assert_text", None) or []
+    gone = getattr(args, "assert_gone", None) or []
+    fails = []
+    if want or gone:
+        timeout = getattr(args, "assert_timeout", 0.0) or 0.0
+        start = time.monotonic()
+        nodes, missing = [], list(want)
+        while True:
+            nodes = list(_dump_tree())
+            missing = [v for v in want if not _present_any(nodes, v)]
+            if not missing or timeout <= 0 or time.monotonic() - start >= timeout:
+                break
+            time.sleep(0.5)
+        fails += [f"必须出现的控件未在屏：{v!r}" for v in missing]
+        fails += [f"不该出现的标志仍在屏：{v!r}" for v in gone if _present_any(nodes, v)]
+        if fails:
+            result = getattr(args, "assert_fail_result", None) or "失败"
+
     _append_evidence(case, args.name, etype, out, assertion=getattr(args, "note", "") or "",
-                     result=getattr(args, "shot_result", "通过"))  # note→断言列；result→结果列（默认「通过」=这步走到了）
+                     result=result)  # note→断言列；result→结果列（默认「通过」，挂了断言则按检查真判）
+
+    if fails:
+        for f in fails:
+            print(f"[shot] ✗ {f}", file=sys.stderr)
+        sys.exit(f"[shot] {args.name} 断言不成立（已按「{result}」登记），共 {len(fails)} 项——"
+                 f"截到图 ≠ 断言成立。")
+    if want or gone:
+        print(f"[shot] ✓ 断言成立（{len(want)} 项在屏 / {len(gone)} 项已消失）")
 
 
 def cmd_tap(args):
@@ -273,10 +300,48 @@ def _cache_path(screen_id):
     return d / f"{_safe(screen_id)}.xml"
 
 
+_U2_DEV = None
+
+
+def _u2_device():
+    """惰性连接 uiautomator2，进程内缓存。只有 DUMP_BACKEND=u2 时才会走到这里 import/连接——
+    没装 u2 库或没初始化 atx 的机器，用默认 shell 后端完全不受影响。"""
+    global _U2_DEV
+    if _U2_DEV is None:
+        try:
+            # uiautomator2 依赖的 urllib3 在 import 时会打 NotOpenSSLWarning（LibreSSL 环境），
+            # 每个 adbkit 子进程各刷一行、污染 run_flow 输出——import 时就地静音掉，与功能无关。
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                import uiautomator2 as u2
+        except ImportError:
+            sys.exit("[dump] dump_backend=u2 但未安装 uiautomator2：先 `pip install uiautomator2`，"
+                     "或把 target.json 的 dump_backend 改回 shell（或加 --dump-backend shell）。")
+        try:
+            _U2_DEV = u2.connect(SERIAL) if SERIAL else u2.connect()
+        except Exception as e:
+            sys.exit(f"[dump] u2 连接设备失败（serial={SERIAL or '默认'}）：{e}。"
+                     "设备在线吗？atx 常驻组件初始化过吗（选设备时 u2.connect 会自动装）？")
+    return _U2_DEV
+
+
 def _dump_tree(cache_screen=None):
-    """dump 当前界面 UI 树并解析为节点列表（不落证据目录，纯用于定位）。
-    临时文件按 serial 隔离，支持多设备并行。cache_screen 给定时，顺手把这次 dump
-    存进 .dumpcache/<screen_id>，供紧接着的下一条命令 --from-cache 复用，省一次重复 dump。"""
+    """dump 当前界面 UI 树并解析为节点迭代器（不落证据目录，纯用于定位）。
+    两个后端由 DUMP_BACKEND 选（target.json 的 dump_backend / 全局 --dump-backend 覆盖，默认 shell）：
+    - shell：`adb shell uiautomator dump` + pull，零设备端依赖；
+    - u2：uiautomator2 `dump_hierarchy`，需设备装 atx 常驻组件，单次快约 4 倍（实测 ~118ms vs ~510ms）。
+    两者底层同为 UiAutomator 无障碍树，输出 XML 字段(text/content-desc/resource-id/bounds)与解析逻辑完全通用，
+    切后端上层 _find/_match_nodes/sweep 等一律不用改；差别只在速度与设备端依赖。
+    ⚠️ WebView 内容不进无障碍树这类盲区两个后端相同——换 u2 只提速、不会让 WebView 广告变得可见（见 gotchas.md）。
+    cache_screen 给定时把这次 dump 存进 .dumpcache/<screen_id> 供紧接着的命令 --from-cache 复用。"""
+    if DUMP_BACKEND == "u2":
+        return _dump_tree_u2(cache_screen)
+    return _dump_tree_shell(cache_screen)
+
+
+def _dump_tree_shell(cache_screen=None):
+    # 临时文件按 serial 隔离，支持多设备并行。
     dev = f"/sdcard/_sel_{_safe(SERIAL)}.xml"
     tmp = _scratch("sel.xml")
     if os.path.exists(tmp):
@@ -293,12 +358,83 @@ def _dump_tree(cache_screen=None):
         sys.exit("[dump] UI 树解析失败（dump 可能为空或界面在动画中）。稍后重试或先 `ui` 观察。")
 
 
+def _u2_dump_xml(retries=2):
+    """u2 dump_hierarchy，带重连重试。atx server 会被系统省电策略/内存压力瞬时杀掉，在飞的那次
+    dump 抛「Remote end closed connection」——这是 u2 后端的固有脆弱点（保活，见 gotchas.md/decisions #30）。
+    撞上就丢弃死连接、重连一次再来（u2.connect 内建 healthcheck 会把 server 重新拉起），
+    别让一次瞬断崩掉整条 flow。连续失败才放弃。"""
+    global _U2_DEV
+    last = "未知"
+    for i in range(retries + 1):
+        try:
+            xml = _u2_device().dump_hierarchy()
+            if xml and "<hierarchy" in xml:
+                return xml
+            last = "dump_hierarchy 返回空/无 <hierarchy>"
+        except Exception as e:
+            last = str(e)
+            _U2_DEV = None  # 丢弃可能已死的连接；下次 _u2_device() 重连并触发 healthcheck 拉起 server
+        if i < retries:
+            print(f"[dump] u2 dump 第{i + 1}次失败（{last}），重连重试…", file=sys.stderr)
+            time.sleep(1.0)
+    sys.exit(f"[dump] u2 dump 连续 {retries + 1} 次失败：{last}。atx server 反复掉线——"
+             "把设备加进省电白名单，或临时改用 --dump-backend shell / target.json 切回 shell。")
+
+
+def _dump_xml_to(path):
+    """按当前后端把 UI 树 dump 成 XML 文件落到 path——给 cmd_ui 用（它要把 XML 存进证据目录 + 打印全树，
+    需要的是原始 XML 文件而非节点迭代器，所以不复用 _dump_tree）。两后端产物同构。"""
+    path = pathlib.Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if DUMP_BACKEND == "u2":
+        path.write_text(_u2_dump_xml(), encoding="utf-8")
+    else:
+        shell("uiautomator dump /sdcard/uidump.xml")
+        adb("pull", "/sdcard/uidump.xml", str(path))
+
+
+def _dump_tree_u2(cache_screen=None):
+    xml = _u2_dump_xml()  # 带重连重试，瞬断不崩
+    # 缓存槽仍写成磁盘 XML，跟 shell 后端产物同构，--from-cache 走 _nodes_from 读文件两边通用
+    if cache_screen:
+        _cache_path(cache_screen).write_text(xml, encoding="utf-8")
+    try:
+        return ET.fromstring(xml).iter("node")
+    except ET.ParseError:
+        sys.exit("[dump] UI 树解析失败（dump 可能为空或界面在动画中）。稍后重试或先 `ui` 观察。")
+
+
 def _center(bounds):
     m = _BOUNDS.search(bounds or "")
     if not m:
         return None
     x1, y1, x2, y2 = map(int, m.groups())
     return (x1 + x2) // 2, (y1 + y2) // 2
+
+
+def _match_corner_tr(nodes):
+    """找「右上角关闭 X」的中心坐标——给 sweep 的 by=corner-tr 用。
+    某些全屏插屏（AdMob 视频创意 Episode/Watch Now、倒计时 → 阶段）的关闭键是无 text/desc/id 的
+    小 Image/Button（clickable 有真有假），选择器规则够不着，但**恒在屏幕极右上角**（见 gotchas.md）。
+    策略：屏宽从所有节点最大 x2 估；取中心落在右上角(cx>0.85W、40≤cy≤160，避开顶部状态栏区)、
+    面积最小的那个节点的中心（关闭 X 是小方块，最小面积最像它）。找不到返回 None（不乱点）。
+    只在 AdActivity 这类 scope 下由规则触发，普通界面不会误伤。"""
+    boxes = []
+    for n in nodes:
+        m = _BOUNDS.search(n.get("bounds") or "")
+        if m:
+            boxes.append(tuple(map(int, m.groups())))
+    if not boxes:
+        return None
+    W = max(x2 for _, _, x2, _ in boxes)
+    best = None  # (area, (cx,cy))
+    for x1, y1, x2, y2 in boxes:
+        cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+        area = (x2 - x1) * (y2 - y1)
+        if cx > W * 0.85 and 40 <= cy <= 160 and 0 < area < 40000:
+            if best is None or area < best[0]:
+                best = (area, (cx, cy))
+    return best[1] if best else None
 
 
 def _match_nodes(nodes, attr, value, partial):
@@ -311,6 +447,13 @@ def _match_nodes(nodes, attr, value, partial):
             if c:
                 hits.append((c, v, n.get("bounds")))
     return hits
+
+
+def _present_any(nodes, value, partial=True):
+    """value 在 text 或 content-desc 任一命中即算「在屏」。非致命，只返回 True/False。
+    nodes 必须是已 list() 的节点列表（_dump_tree 返回的是一次性迭代器，直接传会被首次匹配耗尽）。"""
+    return bool(_match_nodes(nodes, "text", value, partial)
+                or _match_nodes(nodes, "content-desc", value, partial))
 
 
 def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cache=None,
@@ -448,6 +591,17 @@ def cmd_sweep(args):
                 continue
             for sel in rule.get("match", []):
                 by = sel.get("by", "id")
+                if by == "corner-tr":
+                    # 右上角关闭 X（无 text/desc/id 的 Image/Button）——结构化定位，不靠盲点坐标。
+                    # 放规则 match 列表最后，前面的 text/desc/id 选择器优先；都没命中才兜这一发。
+                    c = _match_corner_tr(nodes)
+                    if c:
+                        cx, cy = c
+                        hit = (rule.get("id"), by, f"@({cx},{cy})", cx, cy)
+                        if not args.dry_run:
+                            shell(f"input tap {cx} {cy}")
+                        break
+                    continue
                 hits = _match_nodes(nodes, _ATTR[by], sel["value"], sel.get("partial", False))
                 if hits:
                     (cx, cy), v, _b = hits[0]
@@ -695,6 +849,8 @@ def build_parser():
     p = argparse.ArgumentParser(description="adbkit —— ADB 封装工具层")
     p.add_argument("--case", help="当前用例 ID，证据归到该用例目录")
     p.add_argument("--serial", help="目标设备序列号，覆盖 config.serial（多设备并行时按次指定）")
+    p.add_argument("--dump-backend", dest="dump_backend", choices=["shell", "u2"], default=None,
+                   help="UI dump 后端，覆盖 target.json 的 dump_backend：shell(纯adb,零依赖) / u2(uiautomator2,需装atx,快约4倍)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("devices").set_defaults(fn=cmd_devices)
@@ -714,6 +870,16 @@ def build_parser():
                    help="这条 note 断言引用了 ui dump 里的数据（比如控件文本里的精确数值），不是纯看截图写的——"
                         "证据类型登记为 screenshots+UI XML。由调用方（执行大脑/固化脚本作者）显式声明，"
                         "不按文件是否存在猜，因为「dump 有没有喂给判断」只有写断言的人自己知道")
+    s.add_argument("--assert-text", dest="assert_text", action="append", default=[], metavar="文案",
+                   help="真实门控：该文案/描述(text 或 content-desc 子串)必须在屏，本步才记「通过」，可重复。"
+                        "任一没命中→记「失败」并非0退出。首页/结果页断言应挂本项，别让「通过」纯靠截到图。")
+    s.add_argument("--assert-gone", dest="assert_gone", action="append", default=[], metavar="文案",
+                   help="真实门控：该文案/描述不该在屏（如广告残留标志），出现则记失败，可重复。"
+                        "注意 WebView 插屏内容不进 uiautomator 树，对其为盲区——广告兜底应优先用 --assert-text 断言首页控件在屏。")
+    s.add_argument("--assert-timeout", dest="assert_timeout", type=float, default=0.0,
+                   help="--assert-text 轮询等待秒数(默认0=单次即判)，给首页控件慢一拍出现留余量")
+    s.add_argument("--assert-fail-result", dest="assert_fail_result", default="失败",
+                   help="断言不成立时写入结果列的判定词(默认「失败」；词表见 case_result.py：通过/失败/阻塞/覆盖缺口/需复核)")
     s.set_defaults(fn=cmd_shot)
     s = sub.add_parser("tap"); s.add_argument("x"); s.add_argument("y"); s.set_defaults(fn=cmd_tap)
     # 按选择器点击：坐标从当前设备 UI 树现算，天然跨分辨率
@@ -795,4 +961,6 @@ if __name__ == "__main__":
     args = build_parser().parse_args()
     if getattr(args, "serial", None):
         SERIAL = args.serial  # 覆盖 config.serial
+    if getattr(args, "dump_backend", None):
+        DUMP_BACKEND = args.dump_backend  # 覆盖 config.dump_backend
     args.fn(args)

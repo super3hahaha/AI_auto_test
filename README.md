@@ -7,17 +7,17 @@ AI 当测试工程师、用 ADB 驱动安卓模拟器的自动化测试框架。
 
 - `tools/adbkit.py` —— 手和眼：ADB 封装。感知 `ui/find/waitfor/focus`；操作 `tapid/taptext/tapdesc`（选择器点击，坐标现算跨分辨率，`--from` 复用 dump、`--timeout` 等待重试）+ `tap/text/key/swipe`；清障 `dismiss`(单弹窗) / `sweep`(通用广告&权限&系统弹窗清障，规则库驱动，见下)；证据 `shot/logscan`(按PID过滤)/`output-check`(查MediaStore)/`alarm/db/sp`；`--serial` 多设备。
 - `config/ad_rules.json` —— 通用广告/弹窗**清障规则库**（跨 App 通用、随仓库版本管理）。每条规则 = `作用页(scope) + 命中选择器(match) → tap_matched`。`adbkit.py sweep` 读它：认当前前台页 → dump 一次 → 命中就点，幂等且尽力而为（没广告不算失败，始终 exit0；连续 `--patience` 轮无命中即收工）。广告关闭类靠 scope 卡在对应 SDK 全屏页才动手（不误伤正常界面），权限/系统弹窗类作用页为任意页面。加新规则先 `adbkit.py focus` 看目标页的组件串定 scope。调用时机由执行大脑掌握（进广告位后 / 步骤之间兜底）。
-- `tools/compile_cases.py` —— 把 `cases/*.yaml` 汇编进 `queue.csv`（幂等，保留运行时状态）。
+- `tools/compile_cases.py` —— 把 `apps/<slug>/cases/*.yaml` 汇编进 `queue.csv`（幂等，保留运行时状态）。
 - `tools/init_target.py <包名>` —— 换被测 App 时，只给包名自动探测 `serial`/`app_version`/`main_activity`/`build`(debuggable 判定)/`db_name` 并生成/更新 `config/target.json`（默认只打印不落盘，`--write` 才写回；`app_name`/`app_version` 要人工核对再确认，见 `docs/gotchas.md`）。
-- `flows/flow_cut_save.sh` —— 示例：把一条用例编译成纯选择器的可执行流程，按 serial 参数化，可多设备并行。
+- `apps/<slug>/flows/flow_cut_save.sh` —— 示例：把一条用例编译成纯选择器的可执行流程，按 serial 参数化，可多设备并行。
 - `tools/sheets_sync.py` —— 把账本推到 Google Sheets。
 - `tools/doc_report.py` —— 把账本 + 证据截图渲染成一份 **Google Doc 图文报告**（指标概览 / 执行清单 + 状态追踪 / 结构覆盖 / 问题清单 / 内嵌截图 / 变更时间线）。用 OAuth（你本人授权），Doc 与截图都归你所有。
-- `cases/*.yaml` —— 用例定义；由 skill `adb-testcase-gen` 从一句话目标生成。`_TEMPLATE.yaml` 是通用字段模板；`CUT-CORE-01.yaml` 是唯一保留的 **MP3 Cutter 示例**（跑通给你看完整流程用的，换被测 App 时替换/删除，见下）。仓库定位是通用框架，不带完整业务用例集——本机可以写自己的 `cases/*.yaml`，`.gitignore` 里已经排除了一份体量较大的示例回归集（`regression.yaml`），避免真实业务内容混进框架库。
-- `ledger/*.csv` —— 账本（运行时真值）。`queue.csv` 是**全量真值**（所有用例 + 运行时状态）；`board.csv` 是按 `config/target.json` 的 `scope` 从 queue 投影出的**本轮清单**（看板/报告只显示本轮范围，见「本轮回归范围」一节），其余 CSV 对应看板各 tab。**本机执行产物，不进 git**（多人协作会冲突，团队共享真值是 Sheet），fresh clone 先跑 `python3 tools/compile_cases.py` 从 `cases/*.yaml` 重新汇编（会一并生成 board.csv）。
+- `apps/<slug>/cases/*.yaml` —— 用例定义；由 skill `adb-testcase-gen` 从一句话目标生成。`_TEMPLATE.yaml` 是通用字段模板；`CUT-CORE-01.yaml` 是唯一保留的 **MP3 Cutter 示例**（跑通给你看完整流程用的，换被测 App 时替换/删除，见下）。仓库定位是通用框架，不带完整业务用例集——本机可以写自己的 `apps/<slug>/cases/*.yaml`，`.gitignore` 里已经排除了一份体量较大的示例回归集（`regression.yaml`），避免真实业务内容混进框架库。
+- `apps/<slug>/ledger/*.csv` —— 账本（运行时真值）。`queue.csv` 是**全量真值**（所有用例 + 运行时状态）；`board.csv` 是按 `config/target.json` 的 `scope` 从 queue 投影出的**本轮清单**（看板/报告只显示本轮范围，见「本轮回归范围」一节），其余 CSV 对应看板各 tab。**本机执行产物，不进 git**（多人协作会冲突，团队共享真值是 Sheet），fresh clone 先跑 `python3 tools/compile_cases.py` 从 `apps/<slug>/cases/*.yaml` 重新汇编（会一并生成 board.csv）。
 - `docs/RUNBOOK.md` —— 执行大脑的行动协议（**新会话先读它**）。
 - `docs/structure.md` / `docs/gotchas.md` / `docs/decisions.md` —— 结构、已知坑、架构决策。
 
-> ⚠️ Google Sheet 是**只读展示视图**（从 YAML 渲染）。要增删/改用例请在对话里说，由 Claude 改 `cases/*.yaml`；**别在表里手改**，会被下次同步覆盖。详见 `docs/decisions.md`。
+> ⚠️ Google Sheet 是**只读展示视图**（从 YAML 渲染）。要增删/改用例请在对话里说，由 Claude 改 `apps/<slug>/cases/*.yaml`；**别在表里手改**，会被下次同步覆盖。详见 `docs/decisions.md`。
 
 ## 数据流：从生成用例到执行
 
@@ -35,10 +35,10 @@ AI 当测试工程师、用 ADB 驱动安卓模拟器的自动化测试框架。
 
 | 机制 | 怎么跑 | 特点 | 何时用 |
 |---|---|---|---|
-| **① 固化脚本** | `run_flow.py <ID> flows/xxx.sh` | 纯选择器、无 AI 逐屏推理，快、可多设备并行；自动计时 + 登记 | 已探通并固化过脚本、UI 没变 |
+| **① 固化脚本** | `run_flow.py <ID> apps/<slug>/flows/xxx.sh` | 纯选择器、无 AI 逐屏推理，快、可多设备并行；自动计时 + 登记 | 已探通并固化过脚本、UI 没变 |
 | **② 主循环逐屏** | 用 `adbkit.py` 一屏屏 `ui→tap→shot→logscan` 探路 + 采证 | 慢但健壮，能应对没跑过 / UI 变了；也是固化脚本的来源 | `固化脚本` 列为空，或脚本跑挂要回退重探 |
 
-> **硬规则**：跑固化脚本一律走 `run_flow.py`，绝不裸 `bash flows/xxx.sh`（否则 `log.csv`/`queue.csv` 不留痕）。无论哪种机制，通过/失败判定都要人工看 `output-check`/`logscan` 后补一行登记。
+> **硬规则**：跑固化脚本一律走 `run_flow.py`，绝不裸 `bash apps/<slug>/flows/xxx.sh`（否则 `log.csv`/`queue.csv` 不留痕）。无论哪种机制，通过/失败判定都要人工看 `output-check`/`logscan` 后补一行登记。
 
 与「执行机制」正交的是**范围口径**（一次跑多少）：跑单条 / 跑本轮全部（从 board 范围内挑待执行，一条条到没有待执行为止——"待执行"以 `queue.csv` 实时状态为准）/ 重跑某条。「本轮」由 `scope` 框定，见下方「本轮回归范围」。
 
@@ -58,7 +58,7 @@ python3 tools/adbkit.py launch
 python3 tools/adbkit.py --case SMOKE-01 ui  step1     # 打印控件树 + 存 XML
 python3 tools/adbkit.py --case SMOKE-01 shot step1
 
-# 4. 提供用例 → 写进 cases/*.yaml → 汇编进本机账本
+# 4. 提供用例 → 写进 apps/<slug>/cases/*.yaml → 汇编进本机账本
 python3 tools/compile_cases.py
 
 # 5. 让 Claude Code 按 docs/RUNBOOK.md 跑主循环
@@ -66,15 +66,15 @@ python3 tools/compile_cases.py
 python3 tools/sheets_sync.py
 ```
 
-> fresh clone（新机器/新协作者）注意：`ledger/`、`assets/`（除 README）、`config/target.json` 等凭证文件都不进 git，是每人本机自备/生成的。`bash seeds/gen_assets.sh` 补生成类素材 → 自备 `real_tagged.ogg` 与真实歌曲（见 `assets/README.md`）→ `bash seeds/push_media.sh <serial>` 推到设备 → `python3 tools/preflight.py` 自检就位。
+> fresh clone（新机器/新协作者）注意：`apps/<slug>/ledger/`、`assets/`（除 README）、`config/target.json` 等凭证文件都不进 git，是每人本机自备/生成的。`bash seeds/gen_assets.sh` 补生成类素材 → 自备 `real_tagged.ogg` 与真实歌曲（见 `assets/README.md`）→ `bash seeds/push_media.sh <serial>` 推到设备 → `python3 tools/preflight.py` 自检就位。
 
 ## 用例 ID 命名规则
 
-`cases/*.yaml` 里每条用例的 `id` 字段遵循 **`模块前缀-子类别-序号`** 三段式（见 `cases/_TEMPLATE.yaml`），换被测 App 时也照这个模式起名：
+`apps/<slug>/cases/*.yaml` 里每条用例的 `id` 字段遵循 **`模块前缀-子类别-序号`** 三段式（见 `apps/<slug>/cases/_TEMPLATE.yaml`），换被测 App 时也照这个模式起名：
 
 - **模块前缀**：所属功能模块的英文缩写。如 `CUT` = 音频裁剪（Cut）、`MERGE` = 音频合并、`MIX` = 音频混合、`SPLIT` = 音频拆分。
 - **子类别**：这条用例具体测什么方向，几个常见词：
-  - `CORE` —— **核心路径**（happy path）：这个模块最基本、最主要的功能链路，回归里最该先跑通、最该稳定的一条（通常配 `category: 冒烟/核心路径`，是优先固化成 `flows/flow_*.sh` 冒烟脚本的候选）。
+  - `CORE` —— **核心路径**（happy path）：这个模块最基本、最主要的功能链路，回归里最该先跑通、最该稳定的一条（通常配 `category: 冒烟/核心路径`，是优先固化成 `apps/<slug>/flows/flow_*.sh` 冒烟脚本的候选）。
   - `EDGE` —— **边界/异常输入**（edge case）：故意喂给 App 不常见或超出常规范围的输入（如非标准采样率），验证异常分支的健壮性，不是主路径。
   - `FMT` —— **格式矩阵**（format）：同一功能在多种文件格式（mp3/wav/aac/flac/ogg 等）下是否都正常。
   - `COUNT` —— **数量边界**：输入数量在 0/1/多个/上限等边界值下的行为。
@@ -82,16 +82,16 @@ python3 tools/sheets_sync.py
   - `MODE` —— **模式/选项分支**：同一功能下不同保存模式/选项（如"保存所有片段" vs "保存为单一文件"）。
 - **序号**：同一模块+子类别下的第几条，从 `01` 开始，全局（同一模块前缀内）唯一，不要撞车。
 
-例：`CUT-CORE-01` = 音频裁剪模块的核心路径用例第 1 条；`CUT-EDGE-01` = 音频裁剪模块的边界/异常输入用例第 1 条。新起子类别词不强制局限于上面这几个，只要在 `cases/*.yaml` 里保持"一眼看出测的是什么方向"就行。
+例：`CUT-CORE-01` = 音频裁剪模块的核心路径用例第 1 条；`CUT-EDGE-01` = 音频裁剪模块的边界/异常输入用例第 1 条。新起子类别词不强制局限于上面这几个，只要在 `apps/<slug>/cases/*.yaml` 里保持"一眼看出测的是什么方向"就行。
 
 ## 换一个被测 App（框架复用）
 
-`cases/CUT-CORE-01.yaml`、`flows/flow_cut_save.sh` 是 MP3 Cutter 的最小示例，留着给你看一条用例从定义到固化脚本的完整跑法。换新 App 时：
+`apps/<slug>/cases/CUT-CORE-01.yaml`、`apps/<slug>/flows/flow_cut_save.sh` 是 MP3 Cutter 的最小示例，留着给你看一条用例从定义到固化脚本的完整跑法。换新 App 时：
 
-1. 删掉/替换这两个文件（`cases/_TEMPLATE.yaml` 留着，是通用模板）。
+1. 删掉/替换这两个文件（`apps/<slug>/cases/_TEMPLATE.yaml` 留着，是通用模板）。
 2. `config/target.json` 里换 `package`/`db_name`/`serial` 等指向新 App。
-3. 用 skill `adb-testcase-gen`（或直接对话说测试目标）重新生成 `cases/*.yaml`。
-4. 稳定路径再按 `docs/flow-freeze.md` 固化成新的 `flows/flow_*.sh`。
+3. 用 skill `adb-testcase-gen`（或直接对话说测试目标）重新生成 `apps/<slug>/cases/*.yaml`。
+4. 稳定路径再按 `docs/flow-freeze.md` 固化成新的 `apps/<slug>/flows/flow_*.sh`。
 
 ## 本轮回归范围（scope / board.csv）
 
@@ -155,7 +155,7 @@ python3 tools/doc_report.py --new        # 另建一份新 Doc
 
 ## 证据类型说明
 
-`ledger/evidence.csv` 的"证据类型"列记录每一条证据是怎么采到的、能证明什么，对应 `adbkit.py` 的不同子命令：
+`apps/<slug>/ledger/evidence.csv` 的"证据类型"列记录每一条证据是怎么采到的、能证明什么，对应 `adbkit.py` 的不同子命令：
 
 | 证据类型 | 采集命令 | 是什么 / 能证明什么 | 是否要求 debuggable |
 |---|---|---|---|

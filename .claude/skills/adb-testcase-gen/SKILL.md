@@ -3,8 +3,8 @@ name: adb-testcase-gen
 description: >
   把用户的"一句话测试目标"扩写成本项目（AI_auto_test）执行就绪的 YAML 用例。生成前先用
   tools/adbkit.py 真机探一眼被测 App（launch + ui dump + 必要的导航），把步骤和预期锚在
-  真实控件文案/输出位置上；产出写到 cases/<id>.yaml，并用 compile_cases.py 汇编进
-  ledger/queue.csv。当用户给出一句话测试目标、说"生成用例/写个用例/加个 case/帮我出用例"，
+  真实控件文案/输出位置上；产出写到活跃 App 的 apps/<slug>/cases/<id>.yaml，并用 compile_cases.py
+  汇编进 apps/<slug>/ledger/queue.csv。当用户给出一句话测试目标、说"生成用例/写个用例/加个 case/帮我出用例"，
   或在本自动化测试框架里描述想测什么时触发。仅用于本项目的 ADB 自动化测试用例，不产出 xlsx。
 ---
 
@@ -23,9 +23,10 @@ description: >
 ## 流程
 
 ### 第 0 步：加载项目上下文
-- Read `config/target.json`：拿 `package`、`serial`、是否有 `db_name`（空=非 debug，预期只能走黑盒）。
+- **先确定活跃 App slug**（多 App 架构，见 decisions #27）：读 `config/active.json` 的 `active`；没有则取 `apps/` 下唯一子目录。后面所有 per-app 路径都在 `apps/<slug>/` 下，本 skill 里的 `<slug>` 都指它。
+- Read `apps/<slug>/target.json`：拿 `package`、`serial`、是否有 `db_name`（空=非 debug，预期只能走黑盒）。
 - Read `docs/RUNBOOK.md` 的结果分档与问题前缀规范（保持一致）。
-- 读 `ledger/queue.csv` 和 `cases/` 已有 ID，**新 ID 不要撞车**；ID 用 `模块前缀-序号`（如 `CUT-CORE-01`、`FMT-01`）。
+- 读 `apps/<slug>/ledger/queue.csv` 和 `apps/<slug>/cases/` 已有 ID，**新 ID 不要撞车**；ID 用 `模块前缀-序号`（如 `CUT-CORE-01`、`FMT-01`）。
 
 ### 第 1 步：解析目标
 从一句话里提取：模块、优先级（没说默认 P1；"冒烟/核心/首要"→P0）、真正想验证的行为。目标含糊或有歧义 → 先问用户一句，别硬猜。
@@ -38,11 +39,11 @@ python3 tools/adbkit.py --case PROBE ui probe-home     # 打印控件树
 ```
 - 按目标路径点几下（`tap`/`text`），每到关键界面再 `ui` 一次，记下**真实按钮文案、resource-id、可见状态**，以及产物出现在哪（列表/通知/文件页）。
 - 探查用 `--case PROBE`，产物丢进临时目录即可，不污染正式用例证据。
-- 若目标涉及外部依赖（需账号/文件选择器/特定素材）当前真机跑不了，如实标注，并考虑归入 `ledger/excluded.csv`。
+- 若目标涉及外部依赖（需账号/文件选择器/特定素材）当前真机跑不了，如实标注，并考虑归入 `apps/<slug>/ledger/excluded.csv`。
 - 设备没连或 launch 失败：告诉用户，退化为"纯根据目标生成骨架"，并在 notes 里标 `未经真机探查，预期待执行时校准`。
 
 ### 第 3 步：写 YAML
-按 `cases/_TEMPLATE.yaml` 的字段写到 `cases/<id>.yaml`。预期要引用第 2 步看到的**真实文案**。一个目标可拆多条（正常路径 + 关键边界），但别过度膨胀——先覆盖主路径。
+按 `apps/<slug>/cases/_TEMPLATE.yaml` 的字段写到 `apps/<slug>/cases/<id>.yaml`。预期要引用第 2 步看到的**真实文案**。一个目标可拆多条（正常路径 + 关键边界），但别过度膨胀——先覆盖主路径。
 
 ### 第 4 步：汇编并回报
 ```

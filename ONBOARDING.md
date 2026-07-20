@@ -36,7 +36,7 @@ cp config/target.example.json config/target.json
 这几类文件**故意不进 git**（版权/体积/多人协作冲突原因，详见 [docs/decisions.md](docs/decisions.md) #13），fresh clone 后需要自己生成一遍：
 
 ```bash
-# 3.1 从 cases/*.yaml 汇编出本机账本（ledger/ 是空的，只有 .gitkeep）
+# 3.1 从 apps/<slug>/cases/*.yaml 汇编出本机账本（apps/<slug>/ledger/ 是空的，只有 .gitkeep）
 python3 tools/compile_cases.py
 
 # 3.2 生成测试音频素材（合成正弦波，可重复生成）
@@ -62,17 +62,17 @@ bash seeds/push_media.sh <serial>
 ## 5. 跑一次示例，验证整套链路通
 
 ```bash
-bash flows/flow_cut_save.sh <serial>
+bash apps/<slug>/flows/flow_cut_save.sh <serial>
 ```
 
-这是内置的最小示例（裁剪一段音频→保存→校验结果），对应用例 `cases/CUT-CORE-01.yaml`。跑通了说明环境、adbkit、素材都配置对了。
+这是内置的最小示例（裁剪一段音频→保存→校验结果），对应用例 `apps/<slug>/cases/CUT-CORE-01.yaml`。跑通了说明环境、adbkit、素材都配置对了。
 
 ## 接入自己的 App
 
-1. 删掉/替换示例文件：`cases/CUT-CORE-01.yaml`、`flows/flow_cut_save.sh`（`cases/_TEMPLATE.yaml` 留着，是通用字段模板）。
+1. 删掉/替换示例文件：`apps/<slug>/cases/CUT-CORE-01.yaml`、`apps/<slug>/flows/flow_cut_save.sh`（`apps/<slug>/cases/_TEMPLATE.yaml` 留着，是通用字段模板）。
 2. `config/target.json` 里的 `package`/`db_name`/`serial` 换成你的 App。
-3. 用一句话描述测试目标，触发 skill `adb-testcase-gen`（对话里说"帮我生成用例"之类），它会自己用 adbkit 探真机、把步骤/预期锚在真实控件上，写出 `cases/<id>.yaml`。
-4. 路径探稳定、要反复回归的核心流程，按 [docs/flow-freeze.md](docs/flow-freeze.md) 固化成 `flows/flow_*.sh`。
+3. 用一句话描述测试目标，触发 skill `adb-testcase-gen`（对话里说"帮我生成用例"之类），它会自己用 adbkit 探真机、把步骤/预期锚在真实控件上，写出 `apps/<slug>/cases/<id>.yaml`。
+4. 路径探稳定、要反复回归的核心流程，按 [docs/flow-freeze.md](docs/flow-freeze.md) 固化成 `apps/<slug>/flows/flow_*.sh`。
 5. 让 Claude Code 按 [docs/RUNBOOK.md](docs/RUNBOOK.md) 的协议接管执行——新会话冷启动时它会自己先读这份文档。
 
 ## 多人协作：Git 提交流程

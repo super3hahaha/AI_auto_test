@@ -14,19 +14,12 @@ logscan/结果判定 仍然要人工做（脚本本身只知道"跑完了没崩"
 serial 不传则读 config/target.json 的 serial。
 脚本本身 exit code != 0 时会记成"固化脚本异常退出"，exit code 会带进备注。
 """
-import csv, json, os, subprocess, sys, argparse, datetime, pathlib, time
+import csv, json, os, subprocess, sys, argparse, datetime, pathlib, time, signal
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-LOG = ROOT / "ledger/log.csv"
-QUEUE = ROOT / "ledger/queue.csv"
-CFG_PATHS = [ROOT / "config/target.json", ROOT / "config/target.example.json"]
-
-
-def _load_cfg():
-    for p in CFG_PATHS:
-        if p.exists():
-            return json.loads(p.read_text())
-    return {}
+from _appctx import REPO, LEDGER, load_cfg as _load_cfg  # 多 App 路径解析
+ROOT = REPO
+LOG = LEDGER / "log.csv"
+QUEUE = LEDGER / "queue.csv"
 
 
 def _append_log(ts, case, action, old_status, new_status, evidence, note):
@@ -76,11 +69,27 @@ def main():
     _append_log(start_ts, a.case, "开始执行", old_status, "执行中", "",
                 f"跑固化脚本 {a.script}（run_flow.py 自动计时）")
 
+    # 桌面壳「中止任务」按钮向进程组发 SIGTERM（可捕获）。补记一行「已中止」再退出，账本不留
+    # 悬空的「执行中」行（见 memory: 任何真机执行都要登记）。SIGKILL 不可捕获则兜不住——桌面侧用 TERM。
+    def _on_term(signum, frame):
+        end_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _append_log(end_ts, a.case, "完成执行", "执行中", "已中止", "", "任务被用户中止（SIGTERM）")
+        os._exit(143)
+    signal.signal(signal.SIGTERM, _on_term)
+
     # attempt：本次执行的开始时刻（HHMMSS），export 给脚本里所有 adbkit 采证命令复用，
     # 让同一台设备上同一 case 的每次重跑各落一个 attempt 目录、画面不覆盖。一次执行内稳定
     # （整批脚本共享这一个值，不是每条 shot 各取当前时刻）。见 docs/desktop-app-prd.md「★ 证据数据模型」。
     attempt = start_dt.strftime("%H%M%S")
-    env = {**os.environ, "ADBKIT_ATTEMPT": attempt}
+    # ⚠️ 强制 LC_ALL=C 让 flow 脚本里的 /bin/bash 走「字节模式」。macOS 系统自带 /bin/bash 是 3.2
+    # (2007)，在 UTF-8 locale 下处理「变量紧贴多字节字面量」(脚本里如 "$END（$TOTAL，"——变量后
+    # 直接跟全角标点、无花括号无空格)时有多字节 bug，会把边界处字节搅坏成非法 UTF-8：桌面壳日志里
+    # 中文字段显示成 ����，(在 Rust 改 lossy 读流前)还会崩读流报 BrokenPipe 把跑完的用例冤判失败。
+    # 字节模式下 bash 3.2 把 UTF-8 当不透明字节原样透传(grep/cut/echo 都不碰多字节)，反而干净；
+    # adbkit(Python) 子进程 stdout 在 C locale 下仍是 UTF-8(PEP540 UTF-8 模式)，不受影响。
+    # 用 LC_ALL 而非仅 LC_CTYPE：LC_ALL 优先级最高，能压住 GUI 环境里可能继承来的 LC_ALL=…UTF-8。
+    # 详见 gotchas.md「/bin/bash 3.2 UTF-8 多字节 bug」。
+    env = {**os.environ, "ADBKIT_ATTEMPT": attempt, "LC_ALL": "C", "LC_CTYPE": "C"}
 
     t0 = time.monotonic()
     result = subprocess.run(["bash", str(script_path), serial], env=env)
@@ -105,17 +114,39 @@ def main():
     _update_queue_times(a.case, start_ts, end_ts)
 
     print(f"\n[run_flow] {a.case} 耗时 {elapsed:.1f}秒，exit={result.returncode}，已写入 log.csv/queue.csv")
-    print("[run_flow] 别忘了：这里只记了耗时和是否跑崩，通过/失败判定还得自己跑 output-check/logscan 确认后更新")
 
-    # 脚本跑时 adbkit 已把每张截图/output-check/logscan 采证即登记（默认「过程留痕」）。
-    # 这里列出本轮该用例的证据清单，提示判定后把关键的用 case_result --evi 升级为「关键，供报告用」。
-    ev = ROOT / "ledger/evidence.csv"
+    # 本轮该用例这一次执行(attempt)已自动登记的证据行——既用来列清单，也用来判断脚本有没有内联
+    # 跑过 output-check / logscan，据此收敛下面那句判定提醒。
+    # 只圈「本次执行」这一个 attempt：evidence.csv 会累积同一 case 历次重跑的所有行，只按 用例ID
+    # 过滤会把今天所有 attempt 的 01-home 全列出来（误导）。证据路径含 .../<serial>/<attempt>/，
+    # 用它精确圈到本次这一批（attempt=本次开始时刻 HHMMSS）。
+    ev = LEDGER / "evidence.csv"
+    mine = []
     if ev.exists():
-        mine = [r for r in csv.DictReader(open(ev, encoding="utf-8")) if r.get("用例ID") == a.case]
-        if mine:
-            print(f"\n[run_flow] 本轮已自动登记 {len(mine)} 条证据（默认「过程留痕」）——判定后把关键的用 case_result --evi 升级：")
-            for r in mine:
-                print(f"    [{r.get('证据类型','')}] {r.get('文件/链接','')}  ({r.get('截图预览','')})")
+        scope = f"/{serial}/{attempt}/"
+        mine = [r for r in csv.DictReader(open(ev, encoding="utf-8"))
+                if r.get("用例ID") == a.case and scope in (r.get("文件/链接") or "")]
+
+    # 判定提醒收敛：exit code 只说明「脚本跑没跑崩」，不等于「功能结果对不对」。但很多固化脚本
+    # 已在脚本内部把 output-check(产物核对)/logscan(崩溃扫描) 跑掉了（证据落在下面清单里），
+    # 此时还无脑提示「你得自己去跑 output-check/logscan」是误导。按本轮证据产物的文件名后缀判断
+    # 各自跑没跑（output-check→output-check.txt；logscan→*-crash-scan.txt，最稳），只对「确实还没跑」
+    # 的那几项提示自己补跑；两项都内联跑过就改成「依据已就绪，复核结果即可」。
+    def _did(suffix):
+        return any(suffix in (r.get("文件/链接") or "") for r in mine)
+    todo = [name for name, done in (("output-check", _did("output-check.txt")),
+                                    ("logscan", _did("-crash-scan.txt"))) if not done]
+    if todo:
+        print(f"[run_flow] 注意：exit={result.returncode} 只表示脚本跑完没崩、不等于功能判定通过；"
+              f"还需自己跑 {' / '.join(todo)} 确认后再更新用例状态。")
+    else:
+        print("[run_flow] 判定依据已就绪：脚本已内联跑过 output-check + logscan（结果见上方流程日志与下方证据清单），"
+              "复核无异常即可更新用例状态，不必重复执行。")
+
+    if mine:
+        print(f"\n[run_flow] 本轮已自动登记 {len(mine)} 条证据（默认「过程留痕」）——判定后把关键的用 case_result --evi 升级：")
+        for r in mine:
+            print(f"    [{r.get('证据类型','')}] {r.get('文件/链接','')}  ({r.get('截图预览','')})")
     sys.exit(result.returncode)
 
 

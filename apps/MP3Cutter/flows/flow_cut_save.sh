@@ -166,6 +166,33 @@ if $AK waitfor text 音频已保存 --timeout 15 >/dev/null 2>&1; then
   else
     log "MediaStore 校验未通过：$(tail -1 <<< "$OC")"
   fi
+
+  # 2026-07-20 新增：结果页对刚生成的音频重命名为 cut+完成日期时间(精确到分钟，如
+  # cut20260720_1802)，验证
+  # 重命名链路本身（不只是改 UI 文案，MediaStore _data 路径也要跟着变，已实测确认）。
+  # 点文件名旁的铅笔图标(id/iv_rename，实测点它会弹「重命名」对话框)：EditText(id=file_name)
+  # 已预填原文件名且已获焦，光标不一定在末尾——先 MOVE_END 再连续退格清空（原名长度不定，
+  # 退格次数给足 40 次兜底，清不干净也不会误删到对话框外）。button1(重命名)在文本未变化时是
+  # disabled 的，只要新文件名和原名不同就会置为 enabled，天然满足。
+  NEWNAME="cut$(date +%Y%m%d_%H%M)"
+  $AK tapid iv_rename --timeout 5 >/dev/null
+  $AK waitfor id file_name --timeout 5 >/dev/null
+  $AK key 123 >/dev/null   # KEYCODE_MOVE_END
+  for i in $(seq 1 40); do $AK key 67 >/dev/null; done   # KEYCODE_DEL 连续退格清空原名
+  $AK text "$NEWNAME" >/dev/null
+  $AK tapid button1 --timeout 5 >/dev/null   # 对话框内「重命名」确认键（系统 AlertDialog 正向按钮，非 App 自定义 id）
+  if $AK waitfor text "$NEWNAME.mp3" --timeout 8 >/dev/null 2>&1; then
+    $AK --case "$CASE" shot 06-renamed "结果页文件名已重命名为 $NEWNAME.mp3" >/dev/null
+    log "重命名: 结果页文件名 ✓ $NEWNAME.mp3"
+    if OC2=$($AK --case "$CASE" output-check --expect "$NEWNAME" 2>&1); then
+      log "重命名 MediaStore 校验通过：$(grep -E '完整性检查通过' <<< "$OC2" | tr '\n' ' ')"
+    else
+      log "重命名 MediaStore 校验未通过：$(tail -1 <<< "$OC2")"
+    fi
+  else
+    $AK --case "$CASE" shot 06-rename-fail "未见重命名后的文件名 $NEWNAME.mp3，重命名疑似失败" --result 失败 >/dev/null
+    log "重命名: 未见 '$NEWNAME.mp3'，已截图待查"
+  fi
 else
   $AK --case "$CASE" shot 05-fail "未见「音频已保存」，保存疑似失败" --result 失败 >/dev/null
   log "结果: 未见'音频已保存'，已截图待查"

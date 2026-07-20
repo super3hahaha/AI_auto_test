@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onActivated, watch } from "vue";
-import { api, type FlowRow, type DeviceRow, type ApkInfo } from "../api";
+import { api, type FlowRow, type DeviceRow, type ApkInfo, type ResourceFile } from "../api";
 import { store } from "../store";
 import { runStore } from "../runStore";
 import RunMonitor from "./RunMonitor.vue";
@@ -149,15 +149,59 @@ async function doUpload() {
   }
 }
 
+// ── 左栏底部：测试资源（assets/，所有 App 共用；固化脚本用相对路径 assets/<文件名> 引用）──
+const resourceFiles = ref<ResourceFile[]>([]);
+const resErr = ref("");
+const uploadingRes = ref(false);
+
+async function loadResources() {
+  try {
+    resourceFiles.value = await api.listResourceFiles();
+  } catch (e: any) {
+    resErr.value = String(e);
+  }
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+async function uploadResource() {
+  resErr.value = "";
+  try {
+    const p = await api.pickResourceFile();
+    if (!p) return;
+    uploadingRes.value = true;
+    await api.uploadResourceFile(p);
+    await loadResources();
+  } catch (e: any) {
+    resErr.value = String(e);
+  } finally {
+    uploadingRes.value = false;
+  }
+}
+
+async function removeResource(name: string) {
+  resErr.value = "";
+  try {
+    await api.deleteResourceFile(name);
+    await loadResources();
+  } catch (e: any) {
+    resErr.value = String(e);
+  }
+}
+
 function selectApp(slug: string) {
   if (slug === store.activeSlug) return;
   store.setActive(slug).then(loadAll);
 }
 
 watch(() => store.activeSlug, () => { pickedCases.value = []; loadAll(); });
-onMounted(loadAll);
+onMounted(() => { loadAll(); loadResources(); });
 // keep-alive 保活后切回本 tab 时刷新设备/用例列表；正在执行则不动，避免打断在跑的任务与日志。
-onActivated(() => { if (!runStore.running) loadAll(); });
+onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); } });
 </script>
 
 <template>
@@ -177,28 +221,48 @@ onActivated(() => { if (!runStore.running) loadAll(); });
     <div v-if="err" class="err">{{ err }}</div>
 
     <div class="cols">
-      <!-- ── 左：App 库 ── -->
-      <div class="col app-col card">
-        <div class="col-hd">
-          <span>App 库</span>
-          <button class="primary sm" @click="openUpload">+ 上传 APK</button>
-        </div>
-        <div class="col-body">
-          <div v-if="!store.apps.length" class="muted empty-hint">
-            还没有被测 App。点「上传 APK」注册第一个。
+      <!-- ── 左：App 库 + 测试资源 ── -->
+      <div class="col app-col">
+        <div class="card applist">
+          <div class="col-hd">
+            <span>App 库</span>
+            <button class="primary sm" @click="openUpload">+ 上传 APK</button>
           </div>
-          <div
-            v-for="a in store.apps"
-            :key="a.slug"
-            class="app-item"
-            :class="{ on: a.slug === store.activeSlug }"
-            @click="selectApp(a.slug)"
-          >
-            <div class="app-name">
-              {{ a.slug }}
-              <span v-if="a.slug === store.activeSlug" class="dot">●</span>
+          <div class="col-body">
+            <div v-if="!store.apps.length" class="muted empty-hint">
+              还没有被测 App。点「上传 APK」注册第一个。
             </div>
-            <div class="app-sub muted">{{ a.app_version || "—" }} · {{ a.package }}</div>
+            <div
+              v-for="a in store.apps"
+              :key="a.slug"
+              class="app-item"
+              :class="{ on: a.slug === store.activeSlug }"
+              @click="selectApp(a.slug)"
+            >
+              <div class="app-name">
+                {{ a.slug }}
+                <span v-if="a.slug === store.activeSlug" class="dot">●</span>
+              </div>
+              <div class="app-sub muted">{{ a.app_version || "—" }} · {{ a.package }}</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card resbox">
+          <div class="col-hd">
+            <span>测试资源</span>
+            <button class="primary sm" :disabled="uploadingRes" @click="uploadResource">+ 上传文件</button>
+          </div>
+          <div class="col-body">
+            <div v-if="resErr" class="err">{{ resErr }}</div>
+            <div v-if="!resourceFiles.length" class="muted empty-hint">
+              还没有素材文件。上传后存到项目 <span class="mono">assets/</span> 目录，固化脚本按文件名引用。
+            </div>
+            <div v-for="f in resourceFiles" :key="f.name" class="res-item">
+              <span class="mono res-name" :title="f.name">{{ f.name }}</span>
+              <span class="muted res-size">{{ formatSize(f.size) }}</span>
+              <button class="sm danger" title="删除" @click="removeResource(f.name)">✕</button>
+            </div>
           </div>
         </div>
       </div>
@@ -359,7 +423,15 @@ h2 { margin: 0; font-weight: 500; }
 
 .cols { display: flex; gap: 12px; flex: 1; min-height: 0; }
 .col { display: flex; flex-direction: column; min-height: 0; }
-.app-col { width: 210px; flex-shrink: 0; }
+.app-col { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
+.applist { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.resbox { flex-shrink: 0; max-height: 40%; display: flex; flex-direction: column; }
+.res-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px; font-size: 12px; border-radius: var(--radius); }
+.res-item:hover { background: var(--surface-1); }
+.res-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.res-size { flex-shrink: 0; font-size: 11px; }
+button.danger { color: var(--text-danger); background: transparent; border: none; cursor: pointer; padding: 2px 4px; }
+button.danger:hover { background: var(--bg-danger); border-radius: var(--radius); }
 .case-col { flex: 1; min-width: 0; }
 .dev-col { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .col-hd { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 0.5px solid var(--border); font-size: 13px; font-weight: 500; }

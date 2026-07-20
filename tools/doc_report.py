@@ -800,7 +800,9 @@ def main():
         else:
             date = datetime.date.today().strftime("%Y-%m-%d")
         report_prefix = cfg.get("report_title", "AI+ADB 自动化测试 · 执行报告")
-        doc_title = f"{report_prefix} - {date}"
+        app_name = cfg.get("app_name", "").strip()
+        now_hm = datetime.datetime.now().strftime("%H:%M")
+        doc_title = f"{app_name + ' ' if app_name else ''}{report_prefix} - {date} {now_hm}"
         doc_id = docs.documents().create(body={"title": doc_title}).execute()["documentId"]
         print(f"[doc] 新建报告 Doc：{doc_title}（{doc_id}）")
 

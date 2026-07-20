@@ -628,6 +628,79 @@ pub fn import_device_aliases(app: AppHandle, path: String) -> Result<usize, Stri
     Ok(count)
 }
 
+// ---------------------------------------------------------------------------
+// 测试资源（assets/）：所有 App 共用一份素材目录，固化脚本用相对路径
+// assets/<文件名> 引用（见 apps/MP3Cutter/flows/flow_cut_save.sh）。app 只负责
+// 拷进/列出/删除这个目录，不解析文件内容。
+// ---------------------------------------------------------------------------
+#[derive(Serialize)]
+pub struct ResourceFile {
+    pub name: String,
+    pub size: u64,
+}
+
+fn assets_dir(root: &Path) -> PathBuf {
+    root.join("assets")
+}
+
+/// 列出 assets/ 下的素材文件（不含子目录、不含 README.md）
+#[tauri::command]
+pub fn list_resource_files(app: AppHandle) -> Result<Vec<ResourceFile>, String> {
+    let root = root_of(&app)?;
+    let dir = assets_dir(&root);
+    let mut out = vec![];
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().to_string();
+            if name == "README.md" || name.starts_with('.') {
+                continue;
+            }
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            out.push(ResourceFile { name, size });
+        }
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    Ok(out)
+}
+
+/// 把本地选中的文件拷进 assets/（保留原文件名；同名直接覆盖）
+#[tauri::command]
+pub fn upload_resource_file(app: AppHandle, src_path: String) -> Result<ResourceFile, String> {
+    let root = root_of(&app)?;
+    let dir = assets_dir(&root);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let src = Path::new(&src_path);
+    let name = src
+        .file_name()
+        .ok_or("选中的路径没有文件名")?
+        .to_string_lossy()
+        .to_string();
+    if name == "README.md" {
+        return Err("README.md 是目录说明文件，不能用作素材名".into());
+    }
+    let dst = dir.join(&name);
+    fs::copy(src, &dst).map_err(|e| format!("拷贝失败：{e}"))?;
+    let size = fs::metadata(&dst).map(|m| m.len()).unwrap_or(0);
+    Ok(ResourceFile { name, size })
+}
+
+/// 删除 assets/ 下的一个素材文件
+#[tauri::command]
+pub fn delete_resource_file(app: AppHandle, name: String) -> Result<(), String> {
+    let root = root_of(&app)?;
+    let dir = assets_dir(&root);
+    let p = dir.join(&name);
+    // 防止 name 里带 ../ 逃出 assets/ 目录
+    if !p.starts_with(&dir) {
+        return Err("非法文件名".into());
+    }
+    fs::remove_file(&p).map_err(|e| e.to_string())
+}
+
 /// 设目标设备：写回 apps/<slug>/target.json 的 serial（app 允许写 config 的少数几处之一）
 #[tauri::command]
 pub fn set_target_serial(app: AppHandle, app_slug: String, serial: String) -> Result<(), String> {

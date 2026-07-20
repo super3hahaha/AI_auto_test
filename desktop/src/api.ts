@@ -68,6 +68,10 @@ export interface KV {
   key: string;
   value: string;
 }
+export interface ResourceFile {
+  name: string;
+  size: number;
+}
 export interface ClaudeCliStatus {
   installed: boolean;
   path: string;
@@ -115,6 +119,12 @@ export const api = {
   pickImportDevicesPath: () =>
     open({ multiple: false, filters: [{ name: "JSON", extensions: ["json"] }] }) as Promise<string | null>,
   importDeviceAliases: (path: string) => invoke<number>("import_device_aliases", { path }),
+
+  // 测试资源（assets/，所有 App 共用）：上传/列表/删除，固化脚本用相对路径 assets/<文件名> 引用
+  listResourceFiles: () => invoke<ResourceFile[]>("list_resource_files"),
+  pickResourceFile: () => open({ multiple: false }) as Promise<string | null>,
+  uploadResourceFile: (srcPath: string) => invoke<ResourceFile>("upload_resource_file", { srcPath }),
+  deleteResourceFile: (name: string) => invoke<void>("delete_resource_file", { name }),
 
   // Claude CLI 安装/登录状态（「脚本自愈」功能依赖它）
   checkClaudeCli: () => invoke<ClaudeCliStatus>("check_claude_cli"),

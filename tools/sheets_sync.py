@@ -19,12 +19,13 @@
   python3 tools/sheets_sync.py board log       # 只推指定 tab
   python3 tools/sheets_sync.py --no-format     # 只推数据不套格式
 """
-import csv, json, sys, pathlib
+import csv, json, sys, pathlib, time
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-LEDGER = ROOT / "ledger"
-CFG = json.loads((ROOT / "config/target.json").read_text()) if (ROOT / "config/target.json").exists() else {}
-SA = ROOT / "config/service_account.json"
+from _appctx import REPO, LEDGER as APP_LEDGER, load_cfg  # 多 App 路径解析
+ROOT = REPO
+LEDGER = APP_LEDGER                 # apps/<slug>/ledger（per-app）
+CFG = load_cfg()                    # apps/<slug>/target.json（per-app）
+SA = ROOT / "config/service_account.json"     # 账号级凭证：共享
 
 sys.path.insert(0, str(ROOT / "tools"))
 from compile_cases import project_board_from_queue  # 复用 scope→board 投影
@@ -217,6 +218,23 @@ def build_requests(stem, sheet_id, ncols, nrows, existing_bandings, existing_cf_
     return reqs
 
 
+def _retry(fn, *, what="", tries=4):
+    """Google Sheets API 常抛瞬时 5xx / 配额（429）错误。桌面端执行台每轮收尾都会自动同步，
+    半路 502 会留下「部分 tab 已刷、其余仍旧」的破碎表——所以对易失败的写调用做指数退避重试。"""
+    delay = 2
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            msg = str(e)
+            transient = any(s in msg for s in ("502", "503", "500", "429", "Server Error", "temporary"))
+            if not transient or i == tries - 1:
+                raise
+            print(f"[sync] {what} 瞬时失败（{msg[:60]}…），{delay}s 后重试（{i + 1}/{tries - 1}）")
+            time.sleep(delay)
+            delay *= 2
+
+
 def main():
     try:
         import gspread
@@ -259,9 +277,10 @@ def main():
         except gspread.WorksheetNotFound:
             ncols = max((len(r) for r in rows), default=1)
             ws = sh.add_worksheet(title=tab, rows=max(len(rows) + 10, 20), cols=max(ncols, 1))
-        ws.clear()
+        _retry(lambda: ws.clear(), what=f"{tab} 清空")
         if rows:
-            ws.update(values=rows, range_name="A1", value_input_option="RAW")
+            _retry(lambda: ws.update(values=rows, range_name="A1", value_input_option="RAW"),
+                   what=f"{tab} 写入")
         pushed[stem] = (ws.id, max((len(r) for r in rows), default=1), len(rows))
         print(f"[sync] {stem}.csv → {tab}（{len(rows)} 行）")
 
@@ -280,8 +299,9 @@ def main():
         return
 
     # 拉现有的隔行底纹 / 条件格式，供清理用（保证重跑幂等）
-    meta = sh.fetch_sheet_metadata({
-        "fields": "sheets(properties(sheetId,title),bandedRanges(bandedRangeId),conditionalFormats)"})
+    meta = _retry(lambda: sh.fetch_sheet_metadata({
+        "fields": "sheets(properties(sheetId,title),bandedRanges(bandedRangeId),conditionalFormats)"}),
+        what="拉取元数据")
     band_by_id, cf_by_id = {}, {}
     for s in meta.get("sheets", []):
         sid = s["properties"]["sheetId"]
@@ -297,12 +317,12 @@ def main():
         if not reqs:
             continue
         try:
-            sh.batch_update({"requests": reqs})
+            _retry(lambda: sh.batch_update({"requests": reqs}), what=f"{TAB_NAME[stem]} 套格式")
         except Exception as e:
             # 兜底：底纹已存在但没被 fetch 捕获时，去掉 addBanding 再试一次
             if "alternating background" in str(e):
                 reqs = [r for r in reqs if "addBanding" not in r]
-                sh.batch_update({"requests": reqs})
+                _retry(lambda: sh.batch_update({"requests": reqs}), what=f"{TAB_NAME[stem]} 套格式(去底纹)")
             else:
                 print(f"[format] {TAB_NAME[stem]} 套格式失败：{str(e)[:160]}")
                 continue

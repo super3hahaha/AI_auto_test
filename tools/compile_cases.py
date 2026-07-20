@@ -10,32 +10,31 @@
 """
 import csv, sys, glob, pathlib, json, re, yaml
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-CASES = ROOT / "cases"
-QUEUE = ROOT / "ledger/queue.csv"
-BOARD = ROOT / "ledger/board.csv"
-CFG_PATHS = [ROOT / "config/target.json", ROOT / "config/target.example.json"]
+from _appctx import LEDGER, CASES, load_cfg  # 多 App 路径解析（CASES=apps/<slug>/cases, LEDGER=apps/<slug>/ledger）
+QUEUE = LEDGER / "queue.csv"
+BOARD = LEDGER / "board.csv"
 
 HEADER = ["完成","执行顺序","用例ID","模块","测试目的","一句话测试目标","测试分类","优先级",
           "当前状态","执行结果","用户/业务场景","纯模拟器执行范围","Seed Data/前置数据",
           "历史覆盖情况","证据链接","关键截图","问题ID","开始时间","结束时间","备注","固化脚本"]
 
 STRUCT_HEADER = ["层级","模块","测试目的","用例数量","覆盖用例","优先级","阅读重点"]
-STRUCT = ROOT / "ledger/structure.csv"
-SUMMARY = ROOT / "ledger/summary.csv"
-EVID = ROOT / "ledger/evidence.csv"
+STRUCT = LEDGER / "structure.csv"
+SUMMARY = LEDGER / "summary.csv"
+EVID = LEDGER / "evidence.csv"
 
 # ledger/ 不进 git（见 docs/decisions.md #13），fresh clone 后这些只追加的账本文件
 # 不存在；首次跑 compile 时补上表头，避免 case_result.py 之类第一次 append 时缺表头。
 BOOTSTRAP_HEADERS = {
-    ROOT / "ledger/log.csv": ["时间", "用例ID", "动作", "原状态", "新状态", "证据", "备注"],
-    ROOT / "ledger/issues.csv": ["问题ID", "用例ID", "严重级别", "标题", "预期结果", "实际结果",
+    LEDGER / "log.csv": ["时间", "用例ID", "动作", "原状态", "新状态", "证据", "备注"],
+    LEDGER / "issues.csv": ["问题ID", "用例ID", "严重级别", "标题", "预期结果", "实际结果",
                                   "复现步骤", "证据链接", "状态", "负责人备注"],
-    ROOT / "ledger/excluded.csv": ["排除用例", "为什么需要外部依赖"],
+    LEDGER / "excluded.csv": ["排除用例", "为什么需要外部依赖"],
 }
 
 
 def bootstrap_ledger():
+    LEDGER.mkdir(parents=True, exist_ok=True)  # 新 App 工作区首次 compile 时账本目录可能还不存在
     for path, header in BOOTSTRAP_HEADERS.items():
         if not path.exists():
             with open(path, "w", newline="", encoding="utf-8") as f:
@@ -62,10 +61,7 @@ def load_cases():
 
 
 def load_scope():
-    for p in CFG_PATHS:
-        if p.exists():
-            return (json.loads(p.read_text()).get("scope") or "").strip()
-    return ""
+    return (load_cfg().get("scope") or "").strip()
 
 
 def parse_scope(raw, all_ids, all_prios):

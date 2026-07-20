@@ -1,0 +1,157 @@
+:root {
+  --surface-0: #f5f4ef;
+  --surface-1: #f1efe8;
+  --surface-2: #ffffff;
+  --text-primary: #1a1a18;
+  --text-secondary: #5f5e5a;
+  --text-muted: #96948c;
+  --text-accent: #185fa5;
+  --text-success: #0f6e56;
+  --text-danger: #a32d2d;
+  --text-warning: #854f0b;
+  --bg-accent: #e6f1fb;
+  --bg-success: #e1f5ee;
+  --bg-danger: #fcebeb;
+  --bg-warning: #faeeda;
+  --border: rgba(0, 0, 0, 0.12);
+  --border-strong: rgba(0, 0, 0, 0.22);
+  --border-accent: #378add;
+  --radius: 8px;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Microsoft YaHei", sans-serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --surface-0: #1c1c1a;
+    --surface-1: #26262b;
+    --surface-2: #33322f;
+    --text-primary: #f2f0ea;
+    --text-secondary: #b4b2a9;
+    --text-muted: #888780;
+    --text-accent: #85b7eb;
+    --text-success: #5dcaa5;
+    --text-danger: #f09595;
+    --text-warning: #ef9f27;
+    --bg-accent: #0c447c;
+    --bg-success: #085041;
+    --bg-danger: #501313;
+    --bg-warning: #633806;
+    --border: rgba(255, 255, 255, 0.14);
+    --border-strong: rgba(255, 255, 255, 0.26);
+    --border-accent: #378add;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+body {
+  font-family: var(--font-sans);
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-size: 14px;
+  -webkit-font-smoothing: antialiased;
+}
+button {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--surface-2);
+  border: 0.5px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+button:hover {
+  background: var(--surface-1);
+}
+button:active {
+  transform: scale(0.98);
+}
+button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+button.primary {
+  background: var(--border-accent);
+  color: #fff;
+  border-color: var(--border-accent);
+}
+button.danger {
+  color: var(--text-danger);
+  border-color: var(--text-danger);
+}
+input,
+select {
+  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-primary);
+  background: var(--surface-2);
+  border: 0.5px solid var(--border-strong);
+  border-radius: var(--radius);
+  padding: 7px 10px;
+  outline: none;
+}
+input:focus,
+select:focus {
+  border-color: var(--border-accent);
+  box-shadow: 0 0 0 2px var(--bg-accent);
+}
+a {
+  color: var(--text-accent);
+  cursor: pointer;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 6px;
+}
+
+.pill {
+  display: inline-block;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 20px;
+}
+.pill-accent {
+  background: var(--bg-accent);
+  color: var(--text-accent);
+}
+.pill-success {
+  background: var(--bg-success);
+  color: var(--text-success);
+}
+.pill-danger {
+  background: var(--bg-danger);
+  color: var(--text-danger);
+}
+.pill-warning {
+  background: var(--bg-warning);
+  color: var(--text-warning);
+}
+.pill-muted {
+  background: var(--surface-1);
+  color: var(--text-muted);
+}
+.card {
+  background: var(--surface-2);
+  border: 0.5px solid var(--border);
+  border-radius: 12px;
+}
+.muted {
+  color: var(--text-muted);
+}
+.mono {
+  font-family: var(--font-mono);
+}

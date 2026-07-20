@@ -165,7 +165,8 @@
 - **为什么不复用已有的 `dismiss`**：`dismiss` 是「点弹窗外部空白关掉单个已知标志弹窗」，一次一个、要调用方指定选择器和外部坐标；广告清障要的是「一批规则、认页、点控件本身（不是点外部）、可轮询等跳过按钮出现」，语义不同，另起 `sweep` 更清楚，两者并存。
 - **关键设计**：① **scope 门控**——广告关闭类只在对应 SDK 全屏页（如 `AdActivity`/`AppLovinFullscreen`）才动 Skip/Close，避免在 App 正常界面误伤同名文案的按钮；权限/系统类才用 `任意页面`。② **text/desc 用 partial**——广告按钮常是 `Skip Ad`/`跳过广告 5s` 带后缀，精确匹配会漏，靠 scope 已经兜住误伤风险，所以放开子串；权限/系统类用精确 id。③ **每轮只点一个 + 重 dump**——点完界面就变，一轮一个再重扫最稳。④ **尽力而为、幂等**——没广告是正常状态，`sweep` 始终 exit0，不当失败；连续 `--patience` 轮无命中即收工，界面干净时快速退出，不干等满 `--rounds`。⑤ **认页靠 `_current_focus()`**——取 `dumpsys window` 的 `mCurrentFocus` 整行做子串匹配，不解析精确组件（各 Android 版本组件写法不一，子串更稳）；配套加了 `focus` 命令方便加新规则时看 scope 该填什么。
 - **代价/边界**：`sweep` 是黑盒点击、不产证据（跟被测功能无关的清障动作，不该污染 evidence.csv）；调用时机由执行大脑掌握（进广告位后、步骤之间兜底），不自动串进每条用例。规则命中依赖 dump 到的控件文案，纯 SurfaceView/WebView 渲染、控件树里拿不到文字的广告，本方案点不到（属已知盲区，遇到再按 desc/坐标兜）。
-- **固化脚本织入（2026-07-17）**：`flows/flow_cut_save.sh` 已按上述纪律织入——定义 `sweep()` helper（命中才 log、始终不阻断，`grep && || true` 对 `set -e` 安全），在广告高发点各兜一发：启动后、点「音频裁剪」后、点「转换」后。其中点转换后那发最关键（MP3 Cutter 常在此弹插屏，会盖住结果页让 `waitfor 音频已保存` 超时误判失败），给了 `--rounds 10 --interval 1` 覆盖广告倒计时窗口。同时把原来固定点两次 `permission_allow_button` 换成一发 `sweep`（perm-allow 规则覆盖 allow/allow_all/foreground 变体、顺序无关、有几个点几个，比固定点两次稳）；App 专属弹窗（隐私同意 desc=同意、文件访问 id=btn、新手引导遮罩）不在通用库里，仍单独点。刻意不在 `sweep` 前保留会超时空等的显式 `tapid --timeout`，避免"先 sweep 点掉、再 tapid 空等 6s"的冗余延迟。
+- **固化脚本织入（2026-07-17）**：`flows/flow_cut_save.sh` 已按上述纪律织入——定义 `sweep()` helper（命中才 log、始终不阻断，`grep && || true` 对 `set -e` 安全），在广告高发点各兜一发：启动后、点「音频裁剪」后、点「转换」后。其中点转换后那发最关键（MP3 Cutter 常在此弹插屏，会盖住结果页让 `waitfor 音频已保存` 超时误判失败），给了 `--rounds 10 --interval 1` 覆盖广告倒计时窗口。同时把原来固定点两次 `permission_allow_button` 换成一发 `sweep`（perm-allow 规则覆盖 allow/allow_all/foreground 变体、顺序无关、有几个点几个，比固定点两次稳）；文件访问弹窗（App 内自定义 id=btn）、新手引导遮罩仍是 App 专属控件，单独点。刻意不在 `sweep` 前保留会超时空等的显式 `tapid --timeout`，避免"先 sweep 点掉、再 tapid 空等 6s"的冗余延迟。
+- **2026-07-20 补充**：隐私同意弹窗（Google UMP 风格，desc=同意/text=同意，无 resource-id）改收进通用库，新增 `consent-agree` 规则（scope `任意页面`，因为它渲染在 App 主 Activity 内、不是独立 SDK 全屏页，没有专属窗口可 scope）。起因：`CUT-CORE-01` 真机冒烟卡在这一屏——固化脚本里原来的 `tapdesc 同意 --timeout 6` 兜底没赶上（弹窗是异步网络加载的 UMP 表单，出现时机比预期晚），已改由 `sweep` 统一兜底并删除该行。`desc=同意`/`text=同意` 用精确匹配（不加 partial）——同 `perm-allow` 一样，字面本身已经足够特定，不易误伤。
 
 ## 26. 视频播放器类 App 的证据类型：新增 `playback` + `framediff`（2026-07-17 讨论定，命令待实现）
 
@@ -178,3 +179,38 @@
 - **画面轴是两条正交判断**：`framediff`（定量/阈值）抓冻结/黑屏，但花屏/撕裂/偏色是**高帧差**、会被放过 → 必须叠 **AI 目视**（定性）兜画质，两者共用同一批截图。
 - **已知边界（决定可用性，动手前必验）**：① `screencap` 对 SurfaceView/硬件 overlay/DRM 视频可能全黑，`framediff` 直接失效——用前先验视频区截不截得到，全黑则退回 `SurfaceFlinger --latency`/`gfxinfo` 或人工目视。② 自研/H5/WebView 播放器可能不发 MediaSession，`--session` 取不到——"推进"轴改走 UI 进度条两次采样递增（归 `screenshots`），别丢掉推进轴。③ 无声视频不适用出声轴，判定退化成 推进∧画面。
 - **状态**：`playback`/`framediff` 两个命令**尚未落进 `adbkit.py`**，本条与 `evidence-video-playback.md` 是规格；实现待办见 `todo.md`。`framediff` 依赖 Pillow+numpy，实现前确认宿主机装得了。
+
+## 27. 转向多 App：每个被测 App 一套 `apps/<slug>/` 工作区（2026-07-17）
+
+- **背景**：框架原本"一次一个 App"——`config/target.json` 单包名、`flows/`/`cases/`/`ledger/` 扁平绑定当前 App，换 App 靠整个替换（#14）。桌面壳做执行台时用户要「左边选 App、脚本库按 App 分类、可同时管理多个 App 的回归」，即真正的多 App 平台。用户明确选了「完整多 App：连 ledger/看板也按 App 分」。
+- **决定（合并式工作区）**：每个 App 一个目录 `apps/<slug>/{target.json, flows/, cases/, ledger/}`，App 身份集中在一处。活跃 App 由 `config/active.json` 的 `active`、或环境变量 `AITEST_APP`、或 apps/ 下唯一子目录 决定（优先级依次）。抽 `tools/_appctx.py` 统一解析活跃 App → 各路径，所有工具 import 它取 `LEDGER/CASES/TARGET_CFG` 等，不再各自 `ROOT / "ledger"` 硬拼。
+- **哪些 per-app / 哪些共享**：per-app = `target.json`（含 serial/sheet_id/doc_id/run_id）、flows、cases、ledger。共享（仍在仓库根）= `config/`（账号级凭证 service_account/oauth_*、模板 target.example.json、active.json、ad_rules.json）、`evidence/`（路径内已按 app_slug 分，见 run_id 数据模型）、`seeds/`、`assets/`、`.dumpcache/`、`tools/`、`docs/`、`desktop/`。**seeds/assets 暂留共享**（当前单 App，flows 用 cwd 相对路径引用；等第二个 App 真需要独立素材时再拆，避免现在无谓 churn）。
+- **frozen_script 路径**：cases YAML 的 `frozen_script` 迁移时重写成 `apps/<slug>/flows/xxx.sh`（`run_flow`/desktop 都按仓库根解析该路径，全路径最省歧义）；compile 重建 queue 时带上。
+- **桌面壳用 env 传 App**：Claude Code 每条 Bash 独立 shell、`export` 不跨调用（同 attempt 那条），但桌面壳 spawn python 时可一次性设 `AITEST_APP`，工具即认对 App；命令行手动跑靠 active.json。
+- **迁移**：一次性脚本 `tools/migrate_to_multiapp.py`（幂等）把现有 MP3Cutter 搬进 `apps/MP3Cutter/` + 重写 frozen_script + 建 active.json。已跑，验证 compile_cases/adbkit/preflight 均从 apps/MP3Cutter 正确读写。
+- **代价/边界**：所有文档里 `flows/`、`cases/`、`ledger/` 的裸路径引用需逐步更新为 `apps/<slug>/…`（RUNBOOK/ONBOARDING 等尚有残留，见 todo）；`adb-testcase-gen` skill 写用例要写到 `apps/<活跃slug>/cases/`。`--app <slug>` CLI 覆盖暂未做（模块级解析在 argparse 前），靠 AITEST_APP/active.json 已够；真需要再让工具延迟解析。
+
+## 28. 执行台「大脑 Claude」固化脚本自愈闭环（2026-07-20）
+
+- **背景**：固化脚本天生脆（硬编码控件文案/坐标/等待，App 会弹新广告/改文案/加引导），执行台跑 `run_flow` 常因这类环境抖动异常退出。用户要「勾选大脑 Claude → 失败由 claude 接管，看哪步挂了、改固化脚本、重跑到成功，三次失败再叫人」。落地为 `tools/auto_repair.py`（执行台勾选时 Rust `run_flow_repair` 代替 `run_flow` spawn 它）。
+- **最关键的边界——绝不洗绿**：失败分两类，处置完全不同。**A 脚本/环境脆**（弹窗没兜住、文案变、等待不够、坐标错）→ 允许 claude 改脚本，但**只许改「导航与健壮性」**（补 sweep、修文案匹配、加/延等待、修坐标、加重试）；**B 被测 App 真缺陷**（功能真失败、崩溃、关键校验到真实不符）→ **一个字节都不改**，这是测试发现，立即停。用户拍板：判 A 只改导航健壮性、**断言/关键值核对/output-check 判定逻辑一律不许动**；判 B **立即停 + 写 `log.csv`「需人工介入·疑似App缺陷」，不写 issues.csv**（正式判定/登记仍回 Claude Code 做，守「桌面侧不判定」的铁律 #27）。这条按死在 claude 的 `--append-system-prompt` 里——把真 bug 改写成通过是本框架最严重的错误。
+- **为什么循环留在 python、claude 只做一次诊断+改**：重试循环（确定性、≤3 次、每次重跑仍经 `run_flow.py` 保证账本配对记时）留在 `auto_repair.py`；claude 每次只被调一次做「诊断 + 必要时改脚本」，不让它自己开重试循环——更可控、每次重跑都记账、桌面侧仍是"spawn 一个 python 工具 + 流式日志"的老模子。
+- **claude 调用形态**：`claude -p <prompt> --append-system-prompt <规则> --allowedTools Read Edit Glob Grep --permission-mode acceptEdits --add-dir <repo> --max-turns 40 --output-format text`。只给读 + 编辑权限（**不给 Bash**：设备操作/重跑都归 python，claude 碰不到），`acceptEdits` 让它无人值守落编辑不卡权限提示。诊断结论末尾用机器标记 `AUTOREPAIR_VERDICT: SCRIPT_FIX|APP_DEFECT|UNKNOWN` 单独成行，python 解析最后一个。改脚本前先备份 `<script>.bak`（只留最近一次）+ 打 unified diff 回显到桌面日志，便于事后 review claude 到底动了什么。UNKNOWN/超时/无改动一律保守停并记「需人工介入」。
+- **退出码约定**：0=最终通过；2=判 App 缺陷已停；3=判脚本脆但没产生改动；4=无法判定/claude 不可用；5=自愈 3 次仍未过。执行台按码显示不同状态（2 显示「疑似 App 缺陷·需回 Claude Code 判定」）。
+- **前置依赖**：本机装了并登录 claude CLI（设置页新增「Claude CLI」卡片探测：安装路径 + `security find-generic-password -s "Claude Code-credentials"` **只查存在性不读密钥**判登录、`~/.claude.json` `oauthAccount` 出账号/组织/订阅徽章）。claude 找不到时 `auto_repair` 退回普通执行（跑一次不自愈）。
+- **代价/边界**：每次重跑是完整 `pm clear` 重跑（几分钟/次，3 次可能十几分钟）；claude 单次诊断上限 360s（超时按无法判定停）；claude 判类别的准确度决定成败——A/B 误判成 B 只是白停（安全），误判成 A 去改脚本才危险，故系统提示里"拿不准当 B"+ 只许动导航层双保险。`-p` 不喂 stdin 会空等 3s 并告警，已在 subprocess 里 `stdin=DEVNULL` 消掉（见 gotchas）。
+
+## 29. 执行台拆「场景库 / 执行台」双子 tab + 独立监控页 + 真中止（2026-07-20）
+
+- **背景**：原执行台把「选 App/用例/设备 → 执行 → 看分组日志」全挤在一页。用户要拆两个子 tab：**场景库**（选择，原页）+ **执行台**（新监控页）；在场景库点「执行选中」自动跳到执行台 tab 实时看。截图给的是布局参考（机型×语言矩阵/模拟器/AI通过/逐步报告等概念当前框架没有），落到现状：**设备×用例** 矩阵、真机 adb、证据存 CSV。三个岔路用户拍板：矩阵=设备×用例、中止=真 kill、格子只显状态（逐步报告这次不做，看证据仍去「证据」tab）。
+- **运行状态提升到模块级 `runStore`（不在组件里）**：要支持"两个子 tab 共享一份运行态 + 切 tab/切子 tab 不丢 + 后端子进程还在跑时 UI 不失联"，运行态（cells 矩阵/events 日志/running/编排循环）必须独立于组件生命周期。放 `desktop/src/runStore.ts`（reactive 单例）：场景库触发 `runStore.start()`、监控页 `RunMonitor.vue` 只读渲染。编排（串行 for 设备 × for 用例、newBoard 先跑 new_run）也搬进 runStore。配合早先给 Runner 加的 `<keep-alive>`（decisions 无独立条，见组件注释）双保险。
+- **cell 状态映射退出码**：waiting/running/pass(exit0)/healed(自愈模式exit0且日志含"自愈成功")/fail/app_defect(自愈exit2)/needs_human(自愈exit3/4/5)/aborted。筛选 tab=全部/通过/失败/需人工（非截图那套成功/AI通过/部分成功——用户说名字不用抄）。
+- **中止 = 真 kill 进程组**：新增 Tauri 命令 `abort_run`。`stream_child` 加 `track` 参数：run_flow/auto_repair 用 `track=true` → `cmd.process_group(0)` 放进独立进程组、组 pid 记进全局 `RUN_PGID`（一次只跑一个 run，单槽够）；装机/注册/new_run 用 false 不登记。`abort_run` 对 `RUN_PGID` 发 `kill -TERM -<pgid>`，负号=整组，python→bash→adb→claude 一网打尽。用 **SIGTERM（可捕获）不用 SIGKILL**：`run_flow.py` 装 SIGTERM 处理器补记一行「已中止」再 `os._exit(143)`，账本不留悬空「执行中」行（见 memory 登记铁律）。已用 scratchpad 最小模型验证：进程组继承正确、阻塞在 subprocess 时处理器仍触发、整组子进程被带走、退出码 143。auto_repair 不单独装处理器（中止若发生在 flow 运行中由 run_flow 子进程补记；若发生在两格之间/claude 调用中则仅 UI 标记，属可接受缺口）。
+- **代价/边界**：单 run 假设（`RUN_PGID` 单槽）——执行台本就串行编排、跑时禁开新 run，成立。中止在"两格之间"极窄窗口点会返回 false（没有活跃子进程），UI 有提示。逐步报告（点格子看截图/录屏/logcat）本次未做——当前框架无录屏能力，格子只显状态，证据去「证据」tab。
+
+## 30. UI dump 后端做成可插拔（shell 默认 / u2 opt-in），不硬切（2026-07-20）
+
+- **背景**：`adb shell uiautomator dump` 每次冷起 uiautomator 进程，实测单次 ~510ms（dump ~480 + pull ~30）；uiautomator2 的 `dump_hierarchy` 走设备常驻 server，实测 ~118ms，**快约 4×**。频繁 dump 的场景（sweep 15 轮循环、waitfor 轮询、多设备并行）墙钟收益明显。
+- **为什么抽象而不是直接换**：u2 快的代价是设备上要**常驻 atx-agent + 两个 apk 并保活**（会被 doze/省电杀），跟本框架"纯 adb、不给设备装东西、pm clear 复现首启"的黑盒哲学有让步。所以 `_dump_tree` 拆成 `_dump_tree_shell` / `_dump_tree_u2` 两后端，`target.json` 的 `dump_backend` 字段（+ `--dump-backend` 覆盖）切换，**默认 shell 零风险**，单台验证稳定后再按 App/按设备切 u2。两后端输出同为 UiAutomator 层级 XML，字段/bounds 一致，`_nodes_from`/`_match_nodes`/`_present_any`/sweep/find 等上层一律不改。
+- **设备初始化**：`init_target.py --atx-init` 做 `u2.connect`（首次自动装 atx）+ `dump_hierarchy` 健康检查；`--dump-backend u2 --write` 才落盘切后端。运行期保活靠 adbkit `_u2_device()` 惰性缓存 + u2 库 connect 内建 healthcheck。
+- **未定论**：切 u2 是否顺带修好"WebView 插屏广告跳不过"——观察到 shell dump 与 u2 dump 在 AdMob 插屏上节点数不同（23 vs 85），但未干净复现"shell 单独跑必失败、u2 必成功"（一次污染测量见 gotchas.md），故**不以此为切 u2 的理由**，只认提速这个确定收益。

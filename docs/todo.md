@@ -1,5 +1,9 @@
 # todo —— 暂缓/待办事项
 
+## 0. 「大脑 Claude」自愈闭环真机端到端验证（2026-07-20，已建待验）
+
+`tools/auto_repair.py` + 执行台「🧠 大脑 Claude」勾选 + 设置页「Claude CLI」状态卡已建齐并通过编译；`claude -p` 调用机制已用最小合成场景独立验证（分类正确、只改导航行、断言不动、marker 可解析，见 decisions #28）。**尚未在真机跑过完整闭环**：需勾选大脑跑一个会真失败的固化用例，验证 ① 脚本脆场景 claude 改完能重跑通过 ② App 缺陷场景能正确停在 exit 2 并写 log.csv「需人工介入」不误改脚本 ③ 三次耗尽的路径。跑之前先确认设备在线 + claude 已登录（设置页卡片）。
+
 ## 1. doc_report.py 向 Period Calendar 参照模板对齐目录结构（2026-07-02 提出，暂缓）
 
 **背景**：用户给了一张 Period Calendar 项目的 Google Doc 目录截图作参照（这是另一个项目的报告，`decisions.md` #12 也引用过同一份参照），想让本项目 `tools/doc_report.py` 的报告目录往这个方向靠。已对比现状 vs 截图，出了方案，**用户决定先不动手，记下来以后再说**。
@@ -14,7 +18,7 @@
 2. 新增「测试执行看板」章节——放 Sheet 超链接（从 `config/target.json` 或 summary.csv 取），**不做 Sheet 截图/看板快照**（用户明确选了"只放超链接"，截图要额外接导出流程，成本不值）。
 3. 新增「测试范围」章节——汇总 structure.csv 的模块清单 + 优先级范围 + 被测包/设备的概述性文字，区别于现有"结构视图"逐条清单。
 4. 新增「执行方式」章节——说明 ADB 自动化主循环 + 人工介入点，可直接复用 `summary.csv` 里已有的"阅读与执行规则"那几行（第15-30行）。
-5. 「分组执行结果」——**不新增字段**，直接用 `ledger/queue.csv` 已有的「测试分类」列（对应 `cases/*.yaml` 的 `category` 字段，如"冒烟/核心路径"）做分组依据，把现有"②执行清单"从平铺列表改成按测试分类分组、组内列用例；没有分类的归"未分类"。
+5. 「分组执行结果」——**不新增字段**，直接用 `apps/<slug>/ledger/queue.csv` 已有的「测试分类」列（对应 `apps/<slug>/cases/*.yaml` 的 `category` 字段，如"冒烟/核心路径"）做分组依据，把现有"②执行清单"从平铺列表改成按测试分类分组、组内列用例；没有分类的归"未分类"。
 6. 「失败/缺口登记」——现有"④问题清单/覆盖缺口"改个标题名对齐即可，内容不用大改。
 7. 新增「证据记录规则」章节——把 `summary.csv` 里已有的证据规则文字（第24-26行：证据规则/失败处理/输出校验）原样搬进 Doc。
 8. 「下一步」章节——**明确不做**，用户当场拍板跳过。
@@ -55,7 +59,7 @@
 **待办**：
 - `adbkit.py` 加 `playback` 子命令：`--session` 跑 `dumpsys media_session`（内建"采样—等 N 秒—再采样"，比 `position` 递增）、`--audio` 跑 `dumpsys audio`（判 player 状态 `started`），可组合；按包名过滤；`_append_evidence` 类型写 `playback`，产物落 `evidence/.../logs/`。
 - `adbkit.py` 加 `framediff` 子命令：从 ui dump 拿视频 View bounds → 中心 60% 裁剪 → `screencap` 隔 ~1s 拍 3 帧 → 单帧有效性（mean_luma<16 黑屏 / std<8 平色）+ 首末帧 changed_ratio（差>12 才算变，>2% 判在动）。依赖 **Pillow+numpy**（实现前确认宿主机装得了）；类型写 `screenshots`。阈值（16/8/2%/12）在真机素材上标定。
-- 实现后可固化成 `flows/flow_video_play.sh`（按证据链 0→4 时序编排 `shot`/`playback`/`framediff`/`logscan`）。
+- 实现后可固化成 `apps/<slug>/flows/flow_video_play.sh`（按证据链 0→4 时序编排 `shot`/`playback`/`framediff`/`logscan`）。
 
 **动手前必验的两个前置**（决定命令可用性，见 `evidence-video-playback.md` 边界节）：① `screencap` 对被测播放器的视频区截不截得到（SurfaceView/DRM 会全黑，framediff 报废）；② 被测播放器发不发 MediaSession（不发则 `--session` 取不到，推进轴改走 UI 进度条）。
 

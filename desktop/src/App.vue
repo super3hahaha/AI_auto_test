@@ -1,0 +1,160 @@
+<script setup lang="ts">
+import { ref, onMounted } from "vue";
+import { store } from "./store";
+import Setup from "./views/Setup.vue";
+import Overview from "./views/Overview.vue";
+import Devices from "./views/Devices.vue";
+import Runner from "./views/Runner.vue";
+import Evidence from "./views/Evidence.vue";
+import Boards from "./views/Boards.vue";
+
+type View = "overview" | "devices" | "runner" | "evidence" | "boards" | "setup";
+const active = ref<View>("evidence");
+const ready = ref(false);
+
+const nav: { key: View; label: string }[] = [
+  { key: "overview", label: "概览" },
+  { key: "devices", label: "设备" },
+  { key: "runner", label: "执行台" },
+  { key: "evidence", label: "证据" },
+  { key: "boards", label: "看板" },
+];
+
+onMounted(async () => {
+  await store.loadConfig();
+  if (!store.cfg?.configured) {
+    active.value = "setup";
+  } else {
+    await store.loadApps();
+    await store.loadRuns();
+    // 还没注册任何被测 App → 引导去执行台上传 APK
+    if (!store.apps.length) active.value = "runner";
+  }
+  ready.value = true;
+});
+
+async function onConfigured() {
+  await store.loadApps();
+  await store.loadRuns();
+  active.value = store.apps.length ? "evidence" : "runner";
+}
+
+async function onSwitchApp(e: Event) {
+  const slug = (e.target as HTMLSelectElement).value;
+  await store.setActive(slug);
+}
+</script>
+
+<template>
+  <div class="app" v-if="ready">
+    <aside class="nav">
+      <div class="brand">AI+ADB<br /><span class="muted">测试台</span></div>
+      <div class="appsel" v-if="store.cfg?.configured && store.apps.length">
+        <label class="muted">当前 App</label>
+        <select :value="store.activeSlug" @change="onSwitchApp">
+          <option v-for="a in store.apps" :key="a.slug" :value="a.slug">{{ a.slug }}</option>
+        </select>
+      </div>
+      <nav>
+        <button
+          v-for="n in nav"
+          :key="n.key"
+          class="navitem"
+          :class="{ on: active === n.key }"
+          :disabled="!store.cfg?.configured"
+          @click="active = n.key"
+        >
+          {{ n.label }}
+        </button>
+      </nav>
+      <div class="nav-foot">
+        <button class="navitem" :class="{ on: active === 'setup' }" @click="active = 'setup'">
+          设置
+        </button>
+      </div>
+    </aside>
+
+    <main class="content">
+      <Setup v-if="active === 'setup'" @configured="onConfigured" />
+      <!-- 只保活 Runner：跑固化脚本时切走 tab 不销毁它，执行状态/流式日志得以延续；
+           其余视图仍按原样每次进入重新挂载（切回自动刷新数据）。 -->
+      <keep-alive v-else include="Runner">
+        <Overview v-if="active === 'overview'" />
+        <Devices v-else-if="active === 'devices'" />
+        <Runner v-else-if="active === 'runner'" />
+        <Evidence v-else-if="active === 'evidence'" />
+        <Boards v-else-if="active === 'boards'" @view-evidence="active = 'evidence'" />
+      </keep-alive>
+    </main>
+  </div>
+</template>
+
+<style scoped>
+.app {
+  display: flex;
+  height: 100vh;
+}
+.nav {
+  width: 132px;
+  flex-shrink: 0;
+  background: var(--surface-1);
+  border-right: 0.5px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  padding: 14px 10px;
+}
+.brand {
+  font-size: 15px;
+  font-weight: 500;
+  line-height: 1.3;
+  padding: 4px 8px 16px;
+}
+.brand .muted {
+  font-size: 12px;
+  font-weight: 400;
+}
+.appsel {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 0 8px 14px;
+}
+.appsel label {
+  font-size: 11px;
+}
+.appsel select {
+  width: 100%;
+  font-size: 12px;
+  padding: 4px 6px;
+}
+nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.navitem {
+  text-align: left;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.navitem:hover {
+  background: var(--surface-2);
+}
+.navitem.on {
+  background: var(--bg-accent);
+  color: var(--text-accent);
+}
+.nav-foot {
+  margin-top: auto;
+}
+.content {
+  flex: 1;
+  min-width: 0;
+  overflow: auto;
+  padding: 20px 24px;
+}
+</style>

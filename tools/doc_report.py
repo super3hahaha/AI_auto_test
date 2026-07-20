@@ -27,12 +27,13 @@
   跟 new_run.py 建新 Sheet 是同一套逻辑——不需要每条用例都刷 Doc，只在开新一轮时建+填一次，
   之后想更新就手动重跑（不传 --new，复用当前 doc_id 覆盖式刷新）。
 """
-import csv, json, sys, glob, pathlib, datetime
+import csv, json, sys, glob, pathlib, datetime, re
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-LEDGER = ROOT / "ledger"
-CFG_PATH = ROOT / "config/target.json"
-OAUTH_CLIENT = ROOT / "config/oauth_client.json"
+from _appctx import REPO, LEDGER as APP_LEDGER, TARGET_CFG  # 多 App 路径解析
+ROOT = REPO
+LEDGER = APP_LEDGER                    # apps/<slug>/ledger（per-app）
+CFG_PATH = TARGET_CFG                  # apps/<slug>/target.json（per-app）
+OAUTH_CLIENT = ROOT / "config/oauth_client.json"      # 账号级凭证：共享
 
 
 def _oauth_token_path():
@@ -68,7 +69,6 @@ GREEN = hexc("15803D")
 RED = hexc("B91C1C")
 GREY = hexc("6B7280")
 BLUE = hexc("2563EB")
-TEAL = BLUE  # 参考模板只有一个强调色（蓝），不再单独用墨绿
 WHITE = {"red": 1, "green": 1, "blue": 1}
 
 
@@ -343,6 +343,100 @@ class LiveDoc:
         table_el2 = [el for el in doc2["body"]["content"] if "table" in el][-1]
         self.cursor = table_el2["endIndex"]
 
+    def case_table(self, title, kv_rows, image_uri=None, header_bg=DARK):
+        """纵向 label/value 表（四节「失败用例详情」用）：首行是合并成整行的用例标题，
+        其余每行 [label, value]；image_uri 给定时在最后追加一行「问题截图」并把图插进值列。
+        跟 table() 不同，这里列数固定 2 且首行要跨列合并，索引推算更细，单独写一份。
+        """
+        body_rows = [list(r) for r in kv_rows]
+        if image_uri:
+            body_rows.append(["问题截图", ""])  # 值格留空，稍后单独插图
+        n_rows, n_cols = 1 + len(body_rows), 2
+        self._batch([{"insertTable": {"rows": n_rows, "columns": n_cols, "location": {"index": self.cursor}}}])
+
+        doc = self.docs.documents().get(documentId=self.doc_id).execute()
+        table_el = [el for el in doc["body"]["content"] if "table" in el][-1]
+        table_start = table_el["startIndex"]
+
+        # 列宽：label 列窄、value 列宽（参考模板比例），不然默认等宽会把"证据地址"这类长文本挤得很窄
+        self._batch([{"updateTableColumnProperties": {
+            "tableStartLocation": {"index": table_start}, "columnIndices": [0],
+            "tableColumnProperties": {"width": {"magnitude": 110, "unit": "PT"}, "widthType": "FIXED_WIDTH"},
+            "fields": "width,widthType"}},
+            {"updateTableColumnProperties": {
+                "tableStartLocation": {"index": table_start}, "columnIndices": [1],
+                "tableColumnProperties": {"width": {"magnitude": 358, "unit": "PT"}, "widthType": "FIXED_WIDTH"},
+                "fields": "width,widthType"}}])
+
+        # 合并标题行两列 + 底色（合并会改变 tableRows[0] 的 cell 结构，之后要重新取一次）
+        self._batch([{"mergeTableCells": {"tableRange": {
+            "tableCellLocation": {"tableStartLocation": {"index": table_start}, "rowIndex": 0, "columnIndex": 0},
+            "rowSpan": 1, "columnSpan": 2}}}])
+        if header_bg:
+            self._batch([{"updateTableCellStyle": {
+                "tableCellStyle": {"backgroundColor": {"color": {"rgbColor": header_bg}}},
+                "fields": "backgroundColor",
+                "tableRange": {"tableCellLocation": {"tableStartLocation": {"index": table_start},
+                                                       "rowIndex": 0, "columnIndex": 0},
+                               "rowSpan": 1, "columnSpan": 2}}}])
+
+        doc = self.docs.documents().get(documentId=self.doc_id).execute()
+        table_el = [el for el in doc["body"]["content"] if "table" in el][-1]
+        table = table_el["table"]
+
+        cells = []  # (原始起始 index, 行, 列, 文本)
+        title_cell = table["tableRows"][0]["tableCells"][0]
+        cells.append((title_cell["content"][0]["startIndex"], 0, 0, title))
+        for ri, row in enumerate(table["tableRows"][1:], start=1):
+            for ci, cell in enumerate(row["tableCells"]):
+                text = str(body_rows[ri - 1][ci]) if ci < len(body_rows[ri - 1]) else ""
+                cells.append((cell["content"][0]["startIndex"], ri, ci, text))
+
+        text_reqs = [{"insertText": {"location": {"index": start}, "text": text}}
+                     for start, ri, ci, text in sorted(cells, key=lambda x: -x[0]) if text]
+        if text_reqs:
+            self._batch(text_reqs)
+
+        text_style_reqs = []
+        cumulative = 0
+        for start, ri, ci, text in sorted(cells, key=lambda x: x[0]):
+            if text:
+                real_start = start + cumulative
+                real_end = real_start + u16(text)
+                if ri == 0:
+                    style = {"bold": True, "foregroundColor": {"color": {"rgbColor": WHITE}}}
+                    fields = "bold,foregroundColor"
+                elif ci == 0:
+                    style = {"bold": True, "foregroundColor": {"color": {"rgbColor": DARK}}}
+                    fields = "bold,foregroundColor"
+                else:
+                    style, fields = {"bold": False}, "bold"
+                text_style_reqs.append({"updateTextStyle": {
+                    "range": {"startIndex": real_start, "endIndex": real_end},
+                    "textStyle": style, "fields": fields}})
+                cumulative += u16(text)
+        if text_style_reqs:
+            self._batch(text_style_reqs)
+
+        if image_uri:
+            # 前面的文字插入已经改变了 index，重新查一次拿「问题截图」值格的真实位置
+            doc = self.docs.documents().get(documentId=self.doc_id).execute()
+            table_el = [el for el in doc["body"]["content"] if "table" in el][-1]
+            img_cell = table_el["table"]["tableRows"][-1]["tableCells"][1]
+            img_index = img_cell["content"][0]["startIndex"]
+            try:
+                self._batch([{"insertInlineImage": {
+                    "location": {"index": img_index}, "uri": image_uri,
+                    "objectSize": {"width": {"magnitude": 160, "unit": "PT"}}}}])
+                self.ok += 1
+            except Exception as ex:
+                self.fail += 1
+                print(f"[warn] 插图失败（跳过）：{image_uri} -> {ex}")
+
+        doc2 = self.docs.documents().get(documentId=self.doc_id).execute()
+        table_el2 = [el for el in doc2["body"]["content"] if "table" in el][-1]
+        self.cursor = table_el2["endIndex"]
+
 
 # ============================ 认证 / 服务 ============================
 def get_creds():
@@ -440,6 +534,37 @@ def case_key_evidence(cid, evidence_rows, current_link="", queue_shot=""):
     return pics, texts
 
 
+def evidence_types_for_case(cid, evidence_rows, current_link=""):
+    """本轮该用例出现过的「证据类型」标签去重列表（保留首次出现顺序），用于三节表格的
+    「证据类型」列和四节详情的「证据类型」行——不筛"关键"，只要本轮采集过就算。"""
+    types = []
+    for r in evidence_rows:
+        if r.get("用例ID") != cid:
+            continue
+        if current_link and not r.get("文件/链接", "").startswith(current_link):
+            continue
+        t = (r.get("证据类型") or "").strip()
+        if t and t not in types:
+            types.append(t)
+    return types
+
+
+def format_repro_steps(raw):
+    """把「复现步骤」原始文本整理成 1. 2. 3. 编号形式：多行就按行编号（已带编号的行不重复加），
+    单行按 → / -> 箭头拆分再编号；两种都不是就原样返回，不硬拆没有分隔线索的整段文字。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return raw
+    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+    if len(lines) > 1:
+        return "\n".join(l if re.match(r"^\d+[.、)]", l) else f"{i}. {l}"
+                          for i, l in enumerate(lines, 1))
+    parts = [p.strip() for p in re.split(r"\s*(?:→|->)\s*", lines[0]) if p.strip()]
+    if len(parts) > 1:
+        return "\n".join(f"{i}. {p}" for i, p in enumerate(parts, 1))
+    return lines[0]
+
+
 def case_screenshots_fallback(link):
     """老逻辑兜底：某条用例还没按"截图预览"分级标注时（该列全空），退回目录里前 6 张截图。"""
     if not link:
@@ -451,32 +576,6 @@ def case_screenshots_fallback(link):
     if not pics:  # 退到更深的子目录（按 <serial>/<attempt> 分层，run_id 制下可能深两层）
         pics = sorted(glob.glob(str(base / "**" / "screenshots" / "*.png"), recursive=True))
     return pics[:6]
-
-
-def insert_case_evidence(b, drive, folder_id, want_images, cid, evidence, current_link, queue_shot, max_images=None):
-    """插入一条用例的关键截图 + 文本证据摘录（②失败用例、③通过用例共用这一段渲染逻辑）。
-
-    `max_images`：截图张数上限（③节"核心用例放1张、非核心不放"要求用），None 表示不限制。
-    """
-    pics, key_texts = case_key_evidence(cid, evidence, current_link, queue_shot)
-    if not pics and not key_texts:
-        pics = case_screenshots_fallback(current_link)  # 该用例还没按新规标注，退回旧逻辑
-    if max_images is not None:
-        pics = pics[:max_images]
-    if want_images:
-        for p in pics:
-            name = f"{cid}__{pathlib.Path(p).parent.parent.name}__{pathlib.Path(p).name}"
-            try:
-                uri = upload_png(drive, folder_id, p, name, build_report._cache)
-                b.image(uri, width_pt=170)
-                b.para([(pathlib.Path(p).name, {"color": GREY, "italic": True})])
-            except Exception as ex:
-                print(f"[warn] 上传截图失败（跳过）：{p} -> {ex}")
-    for t in key_texts:
-        b.para([(f"【{t.get('证据类型','')}·关键】", {"bold": True, "color": TEAL}),
-                (f" {t.get('断言','')}", {})])
-        if t.get("文件/链接"):
-            b.para([("　证据文件：", {"color": GREY}), (t["文件/链接"], {"color": GREY, "italic": True})])
 
 
 def build_report(live, drive, folder_id, want_images):
@@ -512,18 +611,16 @@ def build_report(live, drive, folder_id, want_images):
     b.title("自动化回归测试报告")
     b.para([("Automated Regression Test Report", {"color": GREY, "italic": True})])
     b.newline()
-    b.para([("测试应用：", {"bold": True, "color": DARK}), (cfg.get("app_name") or cfg.get("package", "-"), {"color": GREY})])
+    b.para([("项目名称：", {"bold": True, "color": DARK}), (cfg.get("app_name") or cfg.get("package", "-"), {"color": GREY})])
     if cfg.get("app_version"):
         b.para([("测试版本：", {"bold": True, "color": DARK}), (cfg["app_version"], {"color": GREY})])
-    b.para([("默认设备：", {"bold": True, "color": DARK}), (cfg.get("serial", "-"), {"color": GREY})])
+    # 测试设备：目前 target.json 只存 serial，机型/系统版本没有对应字段，留空不编
+    b.para([("测试设备：", {"bold": True, "color": DARK}), (cfg.get("serial", "-"), {"color": GREY})])
     start_t, end_t = read_log_span()
     exec_span = format_exec_span(start_t, end_t, now)
     b.para([("执行时间：", {"bold": True, "color": DARK}), (exec_span, {"color": GREY})])
     scope_label = summary.get("本轮范围", "全量").split("（")[0]  # 只要"全量/部分"这个结论，括号里的条数明细不放进报告
     b.para([("本轮范围：", {"bold": True, "color": DARK}), (scope_label, {"color": BLUE, "bold": True})])
-    if cfg.get("sheet_id"):
-        sheet_url = f"https://docs.google.com/spreadsheets/d/{cfg['sheet_id']}/edit"
-        b.para([("对应看板：", {"bold": True, "color": DARK}), (sheet_url, {"link": sheet_url})])
     b.newline()
 
     # ---- 一、执行结论（规则拼装，不做环比/发布建议——ledger 没有上一轮通过率、也没有发布决策逻辑）----
@@ -556,9 +653,9 @@ def build_report(live, drive, folder_id, want_images):
     b.newline()
     live.flush(b)
 
-    # ---- 三、失败用例详情（表格）----
+    # ---- 三、失败用例列表（表格）----
     b = DocBuilder()
-    b.heading("三、失败用例详情", 1, color=DARK)
+    b.heading("三、失败用例列表", 1, color=DARK)
     live.flush(b)
     if issues:
         rows = []
@@ -566,41 +663,88 @@ def build_report(live, drive, folder_id, want_images):
             cid = r.get("用例ID", "")
             qrow = queue_by_cid.get(cid)
             name = (qrow.get("一句话测试目标") or qrow.get("测试目的", "")) if qrow else ""
-            rows.append([cid, name, qrow.get("模块", "") if qrow else "", r.get("实际结果", ""), r.get("问题ID", "")])
+            types = evidence_types_for_case(cid, evidence, qrow.get("证据链接", "") if qrow else "")
+            rows.append([cid, name, qrow.get("模块", "") if qrow else "", r.get("实际结果", ""), " / ".join(types) or "-"])
         live.table(
-            headers=["用例编号", "用例名称", "所属模块", "失败原因", "问题ID"],
+            headers=["用例编号", "用例名称", "所属模块", "失败原因", "证据类型"],
             rows=rows,
-            cell_color_fn=lambda ri, ci, text: BLUE if ci == 4 else None,
         )
     else:
         b = DocBuilder()
         b.para([("本轮无失败用例。", {"color": GREY})])
         live.flush(b)
     b = DocBuilder()
-    b.para([("注：截图/证据列为缺陷单编号，对应示意图见下节", {"color": GREY, "italic": True})])
+    b.para([("注：证据类型列为该用例本轮采集到的证据类型去重罗列，完整证据地址见下节「失败用例详情」。", {"color": GREY, "italic": True})])
     b.newline()
     live.flush(b)
 
-    # ---- 四、失败用例示意图（每条用例一张关键截图）----
+    # ---- 四、失败用例详情（每条用例一张 label/value 表：失败原因/测试版本/测试日期/
+    #      前置条件/测试用例/复现步骤/问题现象/证据类型/证据地址/问题截图）----
     b = DocBuilder()
-    b.heading("四、失败用例示意图", 1, color=DARK)
+    b.heading("四、失败用例详情", 1, color=DARK)
     if not want_images:
-        b.para([("（本次以 --no-images 生成，未嵌入截图；证据目录见「失败用例详情」的问题ID/本地账本）", {"color": GREY, "italic": True})])
+        b.para([("（本次以 --no-images 生成，未嵌入截图；证据地址见下表「证据地址」行）", {"color": GREY, "italic": True})])
+    live.flush(b)
+    date_str = (start_t or now)[:10] if (start_t or now) else ""
     for r in issues:
         cid = r.get("用例ID", "")
         qrow = queue_by_cid.get(cid)
-        b.heading_runs([
-            (f"{r.get('问题ID','')} · {cid}  ", {"color": BLUE}),
-            (r.get("标题", ""), {}),
-        ], 3, size=11)
-        if qrow and qrow.get("证据链接"):
-            b.para([("证据目录：", {"color": GREY}), (qrow.get("证据链接", ""), {"color": GREY})])
-            insert_case_evidence(b, drive, folder_id, want_images, cid, evidence,
-                                  qrow.get("证据链接", ""), qrow.get("关键截图", ""), max_images=1)
+        current_link = qrow.get("证据链接", "") if qrow else ""
+        title = f"{r.get('问题ID','')} · {cid}  {r.get('标题','')}"
+
+        seed = (qrow.get("Seed Data/前置数据", "") if qrow else "").strip()
+        goal = (qrow.get("一句话测试目标") or qrow.get("测试目的", "")) if qrow else ""
+        steps = format_repro_steps(r.get("复现步骤", ""))
+        symptom = r.get("实际结果", "").strip()
+        types = evidence_types_for_case(cid, evidence, current_link)
+
+        kv = []
+        if symptom:
+            kv.append(["失败原因", symptom])
+        if cfg.get("app_version"):
+            kv.append(["测试版本", cfg["app_version"]])
+        if date_str:
+            kv.append(["测试日期", date_str])
+        if seed:
+            kv.append(["前置条件", seed])
+        if goal:
+            kv.append(["测试用例", goal])
+        if steps:
+            kv.append(["复现步骤", steps])
+        if symptom:
+            kv.append(["问题现象", symptom])
+        if types:
+            kv.append(["证据类型", " / ".join(types)])
+        if current_link:
+            kv.append(["证据地址", current_link])
+
+        # 关键截图 + 关键文本证据——沿用「关键」标注筛选，避免把某条用例反复重跑的历史证据都堆进来
+        pics, key_texts = case_key_evidence(cid, evidence, current_link, qrow.get("关键截图", "") if qrow else "") \
+            if current_link else ([], [])
+        if key_texts:
+            kv.append(["证据摘录", "\n".join(
+                f"【{t.get('证据类型','')}】{t.get('断言','')}" for t in key_texts)])
+
+        img_uri = None
+        if want_images and current_link:
+            if not pics:
+                pics = case_screenshots_fallback(current_link)
+            if pics:
+                p = pics[0]
+                name = f"{cid}__{pathlib.Path(p).parent.parent.name}__{pathlib.Path(p).name}"
+                try:
+                    img_uri = upload_png(drive, folder_id, p, name, build_report._cache)
+                except Exception as ex:
+                    print(f"[warn] 上传截图失败（跳过）：{p} -> {ex}")
+
+        live.case_table(title, kv, image_uri=img_uri)
+        b = DocBuilder()
         b.newline()
+        live.flush(b)
     if not issues:
-        b.para([("本轮无失败用例，无需示意图。", {"color": GREY})])
-    live.flush(b)
+        b = DocBuilder()
+        b.para([("本轮无失败用例，无需详情。", {"color": GREY})])
+        live.flush(b)
 
     # ---- 五、结论与建议（规则生成：按优先级列待办，不编具体技术方案）----
     b = DocBuilder()

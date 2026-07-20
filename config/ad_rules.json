@@ -1,5 +1,5 @@
 {
-  "_comment": "通用广告/弹窗清障规则库，供 `adbkit.py sweep` 读取。跨 App 通用、随仓库版本管理。每条规则：id 唯一标识；scope 作用页（子串匹配当前前台窗口组件串，'任意页面'/'*' 表示不限页）；action 目前只有 tap_matched（点命中控件中心）；match 选择器列表（按顺序试，第一个命中即点，by ∈ id/text/desc，partial 缺省 false=精确/id 后缀匹配，true=子串）；enabled 缺省 true。广告关闭类只在对应广告 SDK 全屏页触发（scope 卡住），text/desc 用 partial 兜住'Skip Ad'/'跳过广告 5s'这类带后缀的文案；权限/系统弹窗类作用页为任意页面、用精确 id。来源：同事共享的 ad-*/perm-*/system-* 规则。",
+  "_comment": "通用广告/弹窗清障规则库，供 `adbkit.py sweep` 读取。跨 App 通用、随仓库版本管理。每条规则：id 唯一标识；scope 作用页（子串匹配当前前台窗口组件串，'任意页面'/'*' 表示不限页）；action 目前只有 tap_matched（点命中控件中心）；match 选择器列表（按顺序试，第一个命中即点，by ∈ id/text/desc/corner-tr，partial 缺省 false=精确/id 后缀匹配，true=子串；corner-tr 无 value，按结构点右上角关闭 X——用于视频/倒计时插屏那种无 text/desc/id 的关闭键，务必放 match 列表最后当兜底）；enabled 缺省 true。广告关闭类只在对应广告 SDK 全屏页触发（scope 卡住），text/desc 用 partial 兜住'Skip Ad'/'跳过广告 5s'这类带后缀的文案；权限/系统弹窗类作用页为任意页面、用精确 id。来源：同事共享的 ad-*/perm-*/system-* 规则。",
   "version": 1,
   "rules": [
     {
@@ -17,7 +17,8 @@
         {"by": "text", "value": "关闭", "partial": true},
         {"by": "desc", "value": "Skip", "partial": true},
         {"by": "desc", "value": "Close", "partial": true},
-        {"by": "desc", "value": "Continue to app", "partial": true}
+        {"by": "desc", "value": "Continue to app", "partial": true},
+        {"by": "corner-tr", "_note": "末位兜底：视频/倒计时创意的关闭X无text/desc/id，选择器够不着，按右上角结构位置点"}
       ]
     },
     {
@@ -66,6 +67,15 @@
         {"by": "text", "value": "Close", "partial": true},
         {"by": "text", "value": "跳过", "partial": true},
         {"by": "text", "value": "关闭", "partial": true}
+      ]
+    },
+    {
+      "id": "consent-agree",
+      "scope": "任意页面",
+      "action": "tap_matched",
+      "match": [
+        {"by": "desc", "value": "同意"},
+        {"by": "text", "value": "同意"}
       ]
     },
     {

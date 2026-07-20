@@ -8,8 +8,8 @@
 """
 import json, subprocess, sys, pathlib
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-CFG = json.loads((ROOT / "config/target.json").read_text())
+from _appctx import load_cfg, LEDGER, SLUG  # 多 App 路径解析
+CFG = load_cfg()
 PKG = CFG["package"]
 SERIAL = CFG.get("serial", "")
 
@@ -66,8 +66,8 @@ def main():
 
     # 4) 看板
     sid = CFG.get("sheet_id", "")
-    print(f"[看板] 当前 sheet_id={sid or '(无)'}")
-    runs = ROOT / "ledger/runs.csv"
+    print(f"[看板] 当前 App={SLUG or '(未指定)'}；sheet_id={sid or '(无)'}")
+    runs = LEDGER / "runs.csv"
     if runs.exists():
         last = runs.read_text().strip().splitlines()[-1]
         print(f"  最近一轮: {last}")
@@ -76,8 +76,8 @@ def main():
     # 5) 冷启动指引
     print("\n=== 开跑前必读 ===")
     print("  · docs/RUNBOOK.md —— 执行协议（选择器点击/失败处理/结果分档）")
-    print("  · cases/regression.yaml 头注 —— 各模块已探明的真实选择器与流程")
-    print("  · flows/flow_cut_save.sh / flow_multi.sh —— 已固化的可跑流程脚本")
+    print(f"  · apps/{SLUG or '<slug>'}/cases/*.yaml 头注 —— 各模块已探明的真实选择器与流程")
+    print(f"  · apps/{SLUG or '<slug>'}/flows/*.sh —— 已固化的可跑流程脚本")
     print("  · 证据落 evidence/<app>/<ver>/<run_id>/<case>/<serial>/<attempt>/{screenshots,ui,logs}（gitignore，本地）")
 
     print("\n" + ("✅ 就绪，可开跑" if ok else "⚠️ 有缺项，先按上面补齐再跑"))

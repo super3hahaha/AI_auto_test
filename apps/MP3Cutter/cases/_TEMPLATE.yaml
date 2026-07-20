@@ -17,5 +17,5 @@
   category: 冒烟/核心路径       # 测试分类（可选）
   scope: 真机执行               # 执行范围（可选）
   notes: 备注（可选，如"首启有评分弹窗先关"）
-  frozen_script: flows/flow_xxx.sh  # 可选。路径已探通且稳定通过后才填，主循环选到
+  frozen_script: apps/MP3Cutter/flows/flow_xxx.sh  # 可选。路径已探通且稳定通过后才填，主循环选到
     # 这条用例时改跑脚本、不再逐屏感知；没固化就别填这个字段（留空=走主循环）

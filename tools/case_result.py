@@ -14,18 +14,10 @@
 """
 import csv, json, subprocess, sys, argparse, datetime, pathlib
 
-ROOT = pathlib.Path(__file__).resolve().parent.parent
-Q = ROOT / "ledger/queue.csv"
-LOG = ROOT / "ledger/log.csv"
-EVID = ROOT / "ledger/evidence.csv"
-CFG_PATHS = [ROOT / "config/target.json", ROOT / "config/target.example.json"]
-
-
-def _load_cfg():
-    for p in CFG_PATHS:
-        if p.exists():
-            return json.loads(p.read_text())
-    return {}
+from _appctx import LEDGER, load_cfg as _load_cfg  # 多 App 路径解析
+Q = LEDGER / "queue.csv"
+LOG = LEDGER / "log.csv"
+EVID = LEDGER / "evidence.csv"
 
 
 def detect_coverage():

@@ -66,7 +66,7 @@ python3 tools/compile_cases.py
 python3 tools/sheets_sync.py
 ```
 
-> fresh clone（新机器/新协作者）注意：`apps/<slug>/ledger/`、`assets/`（除 README）、`config/target.json` 等凭证文件都不进 git，是每人本机自备/生成的。`bash seeds/gen_assets.sh` 补生成类素材 → 自备 `real_tagged.ogg` 与真实歌曲（见 `assets/README.md`）→ `bash seeds/push_media.sh <serial>` 推到设备 → `python3 tools/preflight.py` 自检就位。
+> fresh clone（新机器/新协作者）注意：`apps/<slug>/ledger/`、`assets/`（除 README）、`config/target.json` 等凭证文件都不进 git，是每人本机自备/生成的。本机自备真实音频素材（见 `assets/README.md`）→ `bash seeds/push_media.sh <serial>` 推到设备 → `python3 tools/preflight.py` 自检就位。
 
 ## 用例 ID 命名规则
 

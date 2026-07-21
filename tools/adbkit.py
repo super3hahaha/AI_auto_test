@@ -3,7 +3,7 @@
 
 执行大脑（Claude Code）通过调用本脚本的子命令来感知屏幕、操作设备、采集证据。
 所有产物统一落到 evidence/<app>/<ver>/<run_id>/<case>/<serial>/<attempt>/ 下，供证据链引用
-（run_id/attempt 见 docs/desktop-app-prd.md「★ 证据数据模型」；旧机器无 run_id 时退回纯日期段）。
+（run_id/attempt 见 docs/decisions.md #31；旧机器无 run_id 时退回纯日期段）。
 
 配置：读 config/target.json（没有则读 config/target.example.json）。
 用法示例：
@@ -41,7 +41,7 @@ def today():
 def run_seg():
     """证据目录的"执行批次"段：优先 config.run_id（格式 YYYYMMDD-HHMM，由 new_run 生成），
     为空则退回 today()（legacy 的纯日期，向后兼容——没跑过新版 new_run 的机器行为不变）。
-    见 docs/desktop-app-prd.md「★ 证据数据模型」。"""
+    见 docs/decisions.md #31。"""
     return CFG.get("run_id") or today()
 
 
@@ -76,7 +76,7 @@ def evid_dir(case, sub):
     # SERIAL 非空时再按设备分一层 .../case/<serial>——多设备矩阵跑各存各的不撞，单设备省掉设备段；
     # 环境变量 ADBKIT_ATTEMPT 非空时再加一层 .../<serial>/<attempt>——同一台设备上同一 case 重跑
     # 各留一份画面不覆盖（attempt=执行开始 HHMMSS，由 run_flow / 主循环挂号处 export，一次执行内稳定；
-    # 未设则不加这层，避免每条 shot 各取当前时刻把同一次执行的截图散进多个目录）。见 desktop-app-prd.md。
+    # 未设则不加这层，避免每条 shot 各取当前时刻把同一次执行的截图散进多个目录）。见 docs/decisions.md #31。
     # 用例ID 只放 case，serial/attempt 段由这里自动加，绝不掺进 --case
     # （否则 evidence.csv 的用例ID 列会被污染，跟 queue/board 对不上）。
     d = EVID_ROOT / _safe(APP) / _safe(app_version()) / _safe(run_seg()) / case
@@ -437,6 +437,37 @@ def _match_corner_tr(nodes):
     return best[1] if best else None
 
 
+def _match_outside_panel(nodes, panel_ids):
+    """找「弹窗外空白处」的一个安全落点——给 sweep 的 by=outside-panel 用。
+    某些系统 AlertDialog（如好评弹窗）设置了 setCanceledOnTouchOutside(true)，点击弹窗
+    内容区（decorView）之外的任意位置就会关闭，不需要在弹窗里找具体的关闭按钮/文案。
+    策略：按 panel_ids（如 parentPanel/customPanel）找到弹窗内容区的合并包围盒，优先取
+    面板下方的空白居中点（实测：面板正上方紧贴边界~60px 处点击不会关闭——大概率还在
+    Dialog Window 的阴影/触摸容差范围内算"内部"；下方留足 ≥150px 间距实测能关闭，见
+    docs/gotchas.md）；下方空间不够才退而取上方（同样要求 ≥150px 间距）。都不够
+    （说明弹窗本身占满全屏）返回 None，不乱点。"""
+    boxes = []
+    for n in nodes:
+        rid = n.get("resource-id") or ""
+        if any(rid == pid or rid.endswith("/" + pid) for pid in panel_ids):
+            m = _BOUNDS.search(n.get("bounds") or "")
+            if m:
+                boxes.append(tuple(map(int, m.groups())))
+    if not boxes:
+        return None
+    px1 = min(b[0] for b in boxes); py1 = min(b[1] for b in boxes)
+    px2 = max(b[2] for b in boxes); py2 = max(b[3] for b in boxes)
+    W = max(px2, max((int(m.group(3)) for n in nodes if (m := _BOUNDS.search(n.get("bounds") or ""))), default=px2))
+    H = max(py2, max((int(m.group(4)) for n in nodes if (m := _BOUNDS.search(n.get("bounds") or ""))), default=py2))
+    cx = (px1 + px2) // 2
+    GAP = 150  # 离面板边界的最小间距；实测 60px 太近点不掉，见上方 docstring
+    if H - py2 >= GAP + 40:  # 优先面板下方（实测能可靠关闭）
+        return cx, min(H - 40, py2 + GAP)
+    if py1 >= GAP + 120:  # 下方不够才退而取上方（避开状态栏 ~80px）
+        return cx, max(120, py1 - GAP)
+    return None  # 面板几乎占满全屏，找不到安全空白处，别乱点
+
+
 def _match_nodes(nodes, attr, value, partial):
     hits = []
     for n in nodes:
@@ -602,6 +633,18 @@ def cmd_sweep(args):
                             shell(f"input tap {cx} {cy}")
                         break
                     continue
+                if by == "outside-panel":
+                    # 点弹窗外空白处关闭（setCanceledOnTouchOutside 类弹窗，如好评弹窗）。
+                    # sel["of"] 给弹窗内容区的 id 列表（如 parentPanel/customPanel），
+                    # 面板不在树里（弹窗还没渲染/已关）就不命中，不乱点。
+                    c = _match_outside_panel(nodes, sel.get("of", []))
+                    if c:
+                        cx, cy = c
+                        hit = (rule.get("id"), by, f"@({cx},{cy})", cx, cy)
+                        if not args.dry_run:
+                            shell(f"input tap {cx} {cy}")
+                        break
+                    continue
                 hits = _match_nodes(nodes, _ATTR[by], sel["value"], sel.get("partial", False))
                 if hits:
                     (cx, cy), v, _b = hits[0]
@@ -649,6 +692,37 @@ def cmd_key(args):
 
 def cmd_swipe(args):
     print(shell(f"input swipe {args.x1} {args.y1} {args.x2} {args.y2} {args.ms}").stdout)
+
+
+def cmd_longdrag(args):
+    """长按后拖动（真正的"长按+拖拽"手势，用于列表项/时间轴音轨这类需要先触发长按
+    才能进入拖拽态的控件）。`input swipe`/`input draganddrop` 是一次性插值的触摸事件流，
+    起手到开始移动之间几乎没有停顿，够不着 App 内部"按住不放 ≥ 长按阈值(~500ms)才认为
+    进入拖拽态"的判断，实测两者都拖不动（见 docs/gotchas.md）。
+    本命令按真实手势拆成三段离散的 `input motionevent`：DOWN 按住原地不动 hold_ms
+    （默认 1200ms）→ 分 steps 段线性插值 MOVE 到终点（默认 600ms/8 段）→ UP 松手。
+    多次 adb shell 调用之间的"手指仍按住"状态由 Android 输入分发层维护，不依赖是不是
+    同一个 adb 进程发的，所以能跨多次 shell 调用维持同一次触摸序列。
+    【hold_ms 取值坑，2026-07-21 实测踩过】系统长按阈值理论上 ~500ms，但 700ms 这个
+    "刚过线"的值在真机上时灵时不灵（同一段代码、同样坐标，第一次能拖动，MIX-CORE-01
+    固化脚本里再跑几次就完全拖不动了，日志里两次显示的坐标和时序参数肉眼看不出区别）；
+    换成 1200ms 后反复重跑都稳定拖得动。怀疑是 adb shell 子进程调度/网络往返的时序抖动，
+    在 700ms 这种边界值上偶尔把两次事件之间的真实间隔拖到长按阈值以下。**别把 hold_ms
+    调回 700ms 附近这类"看起来够用"的边界值**，宁可多等一点也要稳（1200ms 对整条用例
+    的耗时影响可忽略）。"""
+    x1, y1, x2, y2 = args.x1, args.y1, args.x2, args.y2
+    hold_s = args.hold_ms / 1000.0
+    step_s = (args.duration_ms / max(1, args.steps)) / 1000.0
+    shell(f"input motionevent DOWN {x1} {y1}")
+    time.sleep(hold_s)
+    for i in range(1, args.steps + 1):
+        ix = round(x1 + (x2 - x1) * i / args.steps)
+        iy = round(y1 + (y2 - y1) * i / args.steps)
+        shell(f"input motionevent MOVE {ix} {iy}")
+        time.sleep(step_s)
+    shell(f"input motionevent UP {x2} {y2}")
+    print(f"[longdrag] ({x1},{y1}) 按住 {args.hold_ms}ms → 分{args.steps}段拖至 ({x2},{y2})，"
+          f"耗时约 {args.duration_ms}ms，已松手")
 
 
 def _runas_prefix():
@@ -747,7 +821,12 @@ def _field(row, name):
 # 另存为弹窗「格式」下拉的显示名 → mime_type 里应出现的关键字（不完整，遇到新格式按 mime_type 实测结果补）。
 FORMAT_MIME_HINTS = {
     "MP3": "mpeg", "M4A": "mp4", "M4R": "mp4", "WAV": "wav",
-    "AAC": "aac", "FLAC": "flac", "OGG": "ogg", "WMA": "wma",
+    # AAC 音频常见被封进 MP4/M4A 容器（mime_type=audio/mp4），不是独立的 audio/aac；
+    # 实测 MP3Cutter 另存为选「AAC」格式导出的产物 mime_type 就是 audio/mp4（2026-07-21，
+    # CUT-FMT-01 真机跑到），按 mime_type 单一字符串猜格式时曾误判成"格式不一致"，
+    # 实际文件名后缀/大小/时长都对，只是容器 mime 与编解码器名不是一一对应——两个 hint
+    # 命中任一个都算一致，别只留 "aac" 单值。
+    "AAC": ("aac", "mp4"), "FLAC": "flac", "OGG": "ogg", "WMA": "wma",
 }
 
 
@@ -803,7 +882,8 @@ def cmd_output_check(args):
                     if args.expect_format:
                         mime = (_field(newest, "mime_type") or "").lower()
                         hint = FORMAT_MIME_HINTS.get(args.expect_format.upper(), args.expect_format.lower())
-                        ok = hint in mime
+                        hints = (hint,) if isinstance(hint, str) else hint
+                        ok = any(h in mime for h in hints)
                         verdict = "一致" if ok else "不一致"
                         extra += f"；与预期格式{args.expect_format!r}对比{verdict}（实际mime_type={mime or '空'}）"
                         print(f"[output-check] {'✓' if ok else '✗'} 格式对比{verdict}：预期{args.expect_format!r} vs 实际mime_type={mime or '空'}")
@@ -931,6 +1011,13 @@ def build_parser():
     for a in ("x1", "y1", "x2", "y2"):
         s.add_argument(a)
     s.add_argument("ms", nargs="?", default="300"); s.set_defaults(fn=cmd_swipe)
+    s = sub.add_parser("longdrag")
+    for a in ("x1", "y1", "x2", "y2"):
+        s.add_argument(a, type=int)
+    s.add_argument("--hold-ms", type=int, default=1200, dest="hold_ms")
+    s.add_argument("--duration-ms", type=int, default=600, dest="duration_ms")
+    s.add_argument("--steps", type=int, default=8)
+    s.set_defaults(fn=cmd_longdrag)
     s = sub.add_parser("db"); s.add_argument("label"); s.set_defaults(fn=cmd_db)
     s = sub.add_parser("sql"); s.add_argument("query"); s.set_defaults(fn=cmd_sql)
     s = sub.add_parser("seed"); s.add_argument("file"); s.set_defaults(fn=cmd_seed)

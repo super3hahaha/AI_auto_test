@@ -103,6 +103,15 @@
       "match": [
         {"by": "id", "value": "com.android.systemui:id/ok"}
       ]
+    },
+    {
+      "id": "dialog-outside-tap-fallback",
+      "_note": "兜底：好评弹窗等 setCanceledOnTouchOutside(true) 的系统 AlertDialog（decor 用标准 android:id/parentPanel|customPanel，无固定关闭按钮/文案，各 App 好评弹窗措辞不同）——点弹窗内容区外的空白处关闭，不点弹窗内任何按钮。放规则表最后，前面更具体的规则（perm-allow/consent-agree/ad-*-close）优先命中。",
+      "scope": "任意页面",
+      "action": "tap_matched",
+      "match": [
+        {"by": "outside-panel", "of": ["parentPanel", "customPanel"]}
+      ]
     }
   ]
 }

@@ -8,7 +8,7 @@
 **先跑 `python3 tools/preflight.py`**，它一次性报告并指出缺项：设备是否在线、App 是否已装+debuggable、**测试素材是否在设备上**（缺了给补法）、当前看板、以及"必读清单"。别在没自检的情况下直接开跑——"找不到 dump / 测试资源"就是漏了这步。
 
 运行时状态放在哪（新会话要知道）：
-- **测试素材**：运行时在**设备 `/sdcard/Music`**（不在 repo 里）；源文件在 `assets/`（gitignore）。缺了用 `bash seeds/push_media.sh <serial>` 补推；生成类用 `seeds/gen_assets.sh` 重建，真实 `real_tagged.ogg` 见 `assets/README.md`。
+- **测试素材**：运行时在**设备 `/sdcard/Music`**（不在 repo 里）；源文件在 `assets/`（gitignore），全是本机自备的真实音频，见 `assets/README.md`。缺了用 `bash seeds/push_media.sh <serial>` 补推。
 - **已探明的选择器/流程**：已固化的都在 `apps/<slug>/flows/flow_*.sh`（示例见 `apps/<slug>/flows/flow_cut_save.sh`）；本机若有更完整的规格用例集（如 `apps/<slug>/cases/regression.yaml`，gitignore、不在库里，仅原作者本机有）也可参考。**先读它们，别从零重探。**
 - **UI dump / 证据**：现场执行时落 `evidence/<date>/<case>/{ui,screenshots,logs}`（gitignore，本地）。新会话不依赖旧 dump，按主循环现场重 dump。
 
@@ -79,7 +79,7 @@
 
 1. **选用例**：先看 `config/target.json` 的 `scope`（本轮范围）——只在**本轮范围内**（`board.csv` 里的用例，即 scope 命中的那些）挑第一个 `当前状态=待执行` 且优先级最高（P0>P1>P2>P3）的行。**待执行状态以全量真值 `queue.csv` 为准**（board 的状态列只供云端展示，可能不是最新）；scope 为空则本轮=全量，等同直接看 queue。
 2. **挂号（开工）**：往 `apps/<slug>/ledger/log.csv` 追加一行 `动作=开始执行, 原状态=待执行, 新状态=执行中`；把 queue 该行 `当前状态` 改成 `执行中`、填 `开始时间`。**同时为本次执行设一个 attempt 标识并 export，供本条用例后续所有 adbkit 采证命令复用**：
-   > **挂号时定下本次执行的 attempt 值**（一次执行取一次当前时刻 `HHMMSS`，如 `140122`）。adbkit 采证会把它拼进证据路径 `.../<case>/<serial>/<attempt>/...`，让**同一台设备上同一 case 的每次重跑各留一份画面、不覆盖**（`<serial>` 只区分不同设备，区分不了同机重跑，靠 attempt——数据模型见 `docs/desktop-app-prd.md`「★ 证据数据模型」）。
+   > **挂号时定下本次执行的 attempt 值**（一次执行取一次当前时刻 `HHMMSS`，如 `140122`）。adbkit 采证会把它拼进证据路径 `.../<case>/<serial>/<attempt>/...`，让**同一台设备上同一 case 的每次重跑各留一份画面、不覆盖**（`<serial>` 只区分不同设备，区分不了同机重跑，靠 attempt——数据模型见 `docs/decisions.md` #31）。
    > **怎么传（主循环逐屏模式）**：Claude Code 每条 Bash 调用是独立 shell、`export` 不跨调用留存，所以**本条用例本次执行的每条 adbkit 采证命令都要就地带上同一个 `ADBKIT_ATTEMPT=<值>` 前缀**，例如 `ADBKIT_ATTEMPT=140122 python3 tools/adbkit.py --case CUT-CORE-01 shot 03-editor "…"`。整条用例这一趟全用**同一个**值；**重跑同一条 = 重新挂号 = 换一个新值**（别在一趟中途改，否则同一次的截图会散进多个 attempt 目录）。
    > **固化脚本模式（`run_flow.py`）无需操心**：它在同一个 bash 进程里注入一次 env，脚本内所有 adbkit 自动继承同一个 attempt。未带 `ADBKIT_ATTEMPT` 时 adbkit 退回不加 attempt 段（legacy 结构，同机重跑会覆盖）。
 3. **判断走脚本还是主循环**：看该行 `固化脚本` 列——非空（如 `apps/<slug>/flows/flow_cut_save.sh`）就直接跑这个脚本（无 AI 逐屏推理，快）；为空就走下面 4-5 步主循环。这一列由 `apps/<slug>/cases/*.yaml` 里的 `frozen_script` 字段编译而来，别手改 queue 里的这一格，改就去改 YAML 再 `compile_cases.py`。脚本跑挂了（选择器找不到）说明 UI 变了，回退主循环重探，然后把新脚本路径更新回 YAML（见 `flow-freeze.md`）。

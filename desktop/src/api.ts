@@ -49,6 +49,8 @@ export interface EvidenceRow {
 export interface FlowRow {
   case_id: string;
   module: string;
+  purpose: string;
+  priority: string;
   script: string;
   has_flow: boolean;
   last_result: string;
@@ -71,6 +73,10 @@ export interface KV {
 export interface ResourceFile {
   name: string;
   size: number;
+}
+export interface TextResource {
+  key: string;
+  value: string;
 }
 export interface ClaudeCliStatus {
   installed: boolean;
@@ -103,6 +109,8 @@ export const api = {
   readTextFile: (relPath: string) => invoke<string>("read_text_file", { relPath }),
   listFlows: (slug: string) => invoke<FlowRow[]>("list_flows", { appSlug: slug }),
   listDevices: (slug: string) => invoke<DeviceRow[]>("list_devices", { appSlug: slug }),
+  // 序列号→别名映射（纯读 config/device_aliases.json，不依赖设备在线）；证据按设备分组显示友好名用
+  readDeviceAliases: () => invoke<KV[]>("read_device_aliases"),
   setTargetSerial: (slug: string, serial: string) =>
     invoke<void>("set_target_serial", { appSlug: slug, serial }),
   readSummary: (slug: string) => invoke<KV[]>("read_summary", { appSlug: slug }),
@@ -125,6 +133,11 @@ export const api = {
   pickResourceFile: () => open({ multiple: false }) as Promise<string | null>,
   uploadResourceFile: (srcPath: string) => invoke<ResourceFile>("upload_resource_file", { srcPath }),
   deleteResourceFile: (name: string) => invoke<void>("delete_resource_file", { name }),
+
+  // 文本资源（config/text_resources.json，所有 App 共用）：key-value 登记，固化脚本用 key 取值
+  listTextResources: () => invoke<TextResource[]>("list_text_resources"),
+  upsertTextResource: (key: string, value: string) => invoke<void>("upsert_text_resource", { key, value }),
+  deleteTextResource: (key: string) => invoke<void>("delete_text_resource", { key }),
 
   // Claude CLI 安装/登录状态（「脚本自愈」功能依赖它）
   checkClaudeCli: () => invoke<ClaudeCliStatus>("check_claude_cli"),
@@ -159,10 +172,10 @@ export const api = {
   pickApk: () =>
     open({ multiple: false, filters: [{ name: "APK", extensions: ["apk"] }] }) as Promise<string | null>,
   probeApk: (apkPath: string) => invoke<ApkInfo>("probe_apk", { apkPath }),
-  installApk(apkPath: string, serial: string, onLine: (line: string) => void) {
+  installApk(apkPath: string, pkg: string, serial: string, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;
-    return invoke<number>("install_apk", { apkPath, serial, onEvent: ch });
+    return invoke<number>("install_apk", { apkPath, package: pkg, serial, onEvent: ch });
   },
   registerApp(slug: string, pkg: string, serial: string, onLine: (line: string) => void) {
     const ch = new Channel<string>();

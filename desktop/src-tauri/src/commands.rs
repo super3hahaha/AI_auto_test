@@ -1,5 +1,5 @@
 // 后端命令层：读账本 CSV / 定位证据 / 列设备与固化脚本 / 流式跑 python 脚本 / 多 App 注册。
-// 设计原则（见 docs/desktop-app-prd.md + decisions #27）：
+// 设计原则（见 docs/decisions.md #27、#31）：
 //   - app 只读账本 + 触发现有 python 工具，绝不自己写账本；
 //   - 多 App：每个被测 App 一套 apps/<slug>/{target.json,flows,cases,ledger}，读类命令收 appSlug、
 //     执行类 spawn python 时设 AITEST_APP=<slug>（命令行手动跑则靠 config/active.json）。
@@ -15,7 +15,7 @@ use std::sync::Mutex;
 // 一次只跑一个 run（执行台串行编排 + 跑时禁开新 run），故一个全局槽足够。
 static RUN_PGID: Mutex<Option<i32>> = Mutex::new(None);
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::ipc::Channel;
 use tauri::{AppHandle, Manager};
@@ -438,6 +438,8 @@ pub fn read_text_file(app: AppHandle, rel_path: String) -> Result<String, String
 pub struct FlowRow {
     pub case_id: String,
     pub module: String,
+    pub purpose: String,     // 测试目的，来自用例 YAML 的 purpose 字段（比 module 更具体，如版本专属缺陷会标注在这里）
+    pub priority: String,    // P0>P1>P2>P3，来自用例 YAML 的 priority 字段
     pub script: String,     // 固化脚本路径（空=走主循环）
     pub has_flow: bool,
     pub last_result: String,
@@ -462,6 +464,8 @@ pub fn list_flows(app: AppHandle, app_slug: String) -> Result<Vec<FlowRow>, Stri
         out.push(FlowRow {
             case_id: get(r, &header, "用例ID").to_string(),
             module: get(r, &header, "模块").to_string(),
+            purpose: get(r, &header, "测试目的").to_string(),
+            priority: get(r, &header, "优先级").to_string(),
             has_flow: !script.trim().is_empty(),
             script,
             last_result: get(r, &header, "执行结果").to_string(),
@@ -578,6 +582,17 @@ pub fn list_devices(app: AppHandle, app_slug: String) -> Result<Vec<DeviceRow>, 
     let default_serial = cfg.get("serial").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let aliases = device_aliases(&root);
     adb_devices(&default_serial, &aliases)
+}
+
+/// 读取序列号→别名映射本身（不走 adb，纯读 config/device_aliases.json）。
+/// 证据查看器按设备分组时用它把路径里的 serial 显示成友好名，无需设备在线。
+#[tauri::command]
+pub fn read_device_aliases(app: AppHandle) -> Result<Vec<KV>, String> {
+    let root = root_of(&app)?;
+    Ok(device_aliases(&root)
+        .into_iter()
+        .map(|(key, value)| KV { key, value })
+        .collect())
 }
 
 /// 新增/编辑设备别名登记（config/device_aliases.json）。序列号不存在则新建条目。
@@ -701,6 +716,71 @@ pub fn delete_resource_file(app: AppHandle, name: String) -> Result<(), String> 
     fs::remove_file(&p).map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// 文本资源（config/text_resources.json）：key-value 登记，跨 App 共享，固化脚本
+// 通过 tools/_appctx.py 的 get_text_resource(key) 按 key 取值（见 assets 类比：
+// 文件资源固化脚本用相对路径引用，文本资源固化脚本用 key 引用）。
+// ---------------------------------------------------------------------------
+#[derive(Serialize, Deserialize, Clone)]
+pub struct TextResource {
+    pub key: String,
+    pub value: String,
+}
+
+fn text_resources_path(root: &Path) -> PathBuf {
+    root.join("config/text_resources.json")
+}
+
+fn read_text_resources(root: &Path) -> Vec<TextResource> {
+    let p = text_resources_path(root);
+    let text = match fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(_) => return vec![],
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_text_resources(root: &Path, list: &[TextResource]) -> Result<(), String> {
+    let p = text_resources_path(root);
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&p, serde_json::to_string_pretty(list).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())
+}
+
+/// 列出文本资源（config/text_resources.json，跨 App 共享）
+#[tauri::command]
+pub fn list_text_resources(app: AppHandle) -> Result<Vec<TextResource>, String> {
+    let root = root_of(&app)?;
+    Ok(read_text_resources(&root))
+}
+
+/// 新增/编辑一条文本资源：key 已存在则覆盖 value，否则新增
+#[tauri::command]
+pub fn upsert_text_resource(app: AppHandle, key: String, value: String) -> Result<(), String> {
+    let key = key.trim().to_string();
+    if key.is_empty() {
+        return Err("key 不能为空".into());
+    }
+    let root = root_of(&app)?;
+    let mut list = read_text_resources(&root);
+    match list.iter_mut().find(|r| r.key == key) {
+        Some(r) => r.value = value,
+        None => list.push(TextResource { key, value }),
+    }
+    write_text_resources(&root, &list)
+}
+
+/// 删除一条文本资源
+#[tauri::command]
+pub fn delete_text_resource(app: AppHandle, key: String) -> Result<(), String> {
+    let root = root_of(&app)?;
+    let mut list = read_text_resources(&root);
+    list.retain(|r| r.key != key);
+    write_text_resources(&root, &list)
+}
+
 /// 设目标设备：写回 apps/<slug>/target.json 的 serial（app 允许写 config 的少数几处之一）
 #[tauri::command]
 pub fn set_target_serial(app: AppHandle, app_slug: String, serial: String) -> Result<(), String> {
@@ -801,6 +881,56 @@ fn stream_child(mut cmd: Command, on_event: Channel<String>, track: bool) -> Res
         *RUN_PGID.lock().unwrap() = None;
     }
     Ok(status.code().unwrap_or(-1))
+}
+
+/// 同 stream_child，但额外把所有输出行拼回一个 String 返回，供调用方按内容做判断
+/// （目前只给 install_apk 探测 INSTALL_FAILED_VERSION_DOWNGRADE 用，不做通用抽象）。
+fn stream_child_capture(mut cmd: Command, on_event: Channel<String>) -> Result<(i32, String), String> {
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("启动失败：{e}"))?;
+
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+
+    let cap2 = captured.clone();
+    let ch2 = on_event.clone();
+    let h_err = std::thread::spawn(move || {
+        if let Some(err) = stderr {
+            pump_capture(err, &ch2, &cap2);
+        }
+    });
+    if let Some(out) = stdout {
+        pump_capture(out, &on_event, &captured);
+    }
+    let _ = h_err.join();
+    let status = child.wait().map_err(|e| e.to_string())?;
+    let text = captured.lock().unwrap().clone();
+    Ok((status.code().unwrap_or(-1), text))
+}
+
+/// 同 pump，但每行还追加进共享缓冲区
+fn pump_capture<R: std::io::Read>(r: R, ch: &Channel<String>, cap: &std::sync::Mutex<String>) {
+    let mut reader = BufReader::new(r);
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {
+                while matches!(buf.last(), Some(b'\n' | b'\r')) {
+                    buf.pop();
+                }
+                let line = String::from_utf8_lossy(&buf).into_owned();
+                cap.lock().unwrap().push_str(&line);
+                cap.lock().unwrap().push('\n');
+                let _ = ch.send(line);
+            }
+        }
+    }
 }
 
 /// 中止当前正在跑的 run：向其进程组发 SIGTERM（可捕获，让 run_flow/auto_repair 有机会补记「已中止」
@@ -1135,19 +1265,42 @@ pub fn check_claude_cli() -> ClaudeCliStatus {
 }
 
 /// 装机：adb install -r <apk> 到指定设备。流式回传 adb 输出。
+/// 若失败原因是 INSTALL_FAILED_VERSION_DOWNGRADE（机上装的版本号比 apk 高），自动
+/// `adb uninstall <package>` 卸载旧版本后重装一次——没用 `-d`（allow downgrade）：那个
+/// 只在部分签名/机型上生效，且降级后应用数据结构不兼容时容易直接崩，测试机场景下干净卸载重装更可靠。
+/// package 由前端探测 APK 时（probe_apk）拿到，随装机请求一并传入。
 #[tauri::command]
 pub async fn install_apk(
     apk_path: String,
+    package: String,
     serial: String,
     on_event: Channel<String>,
 ) -> Result<i32, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let mut cmd = Command::new("adb");
-        if !serial.is_empty() {
-            cmd.args(["-s", &serial]);
+        let mk_install = || {
+            let mut cmd = Command::new("adb");
+            if !serial.is_empty() {
+                cmd.args(["-s", &serial]);
+            }
+            cmd.args(["install", "-r", &apk_path]);
+            cmd
+        };
+
+        let (code, out) = stream_child_capture(mk_install(), on_event.clone())?;
+        if code != 0 && out.contains("INSTALL_FAILED_VERSION_DOWNGRADE") {
+            let _ = on_event.send(format!(
+                "检测到版本降级，自动执行 adb uninstall {package} 后重装…"
+            ));
+            let mut uninst = Command::new("adb");
+            if !serial.is_empty() {
+                uninst.args(["-s", &serial]);
+            }
+            uninst.args(["uninstall", &package]);
+            let (_, _) = stream_child_capture(uninst, on_event.clone())?;
+            let (code2, _) = stream_child_capture(mk_install(), on_event)?;
+            return Ok(code2);
         }
-        cmd.args(["install", "-r", &apk_path]);
-        stream_child(cmd, on_event, false)
+        Ok(code)
     })
     .await
     .map_err(|e| e.to_string())?

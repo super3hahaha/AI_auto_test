@@ -79,7 +79,7 @@ def main():
 
     # attempt：本次执行的开始时刻（HHMMSS），export 给脚本里所有 adbkit 采证命令复用，
     # 让同一台设备上同一 case 的每次重跑各落一个 attempt 目录、画面不覆盖。一次执行内稳定
-    # （整批脚本共享这一个值，不是每条 shot 各取当前时刻）。见 docs/desktop-app-prd.md「★ 证据数据模型」。
+    # （整批脚本共享这一个值，不是每条 shot 各取当前时刻）。见 docs/decisions.md #31。
     attempt = start_dt.strftime("%H%M%S")
     # ⚠️ 强制 LC_ALL=C 让 flow 脚本里的 /bin/bash 走「字节模式」。macOS 系统自带 /bin/bash 是 3.2
     # (2007)，在 UTF-8 locale 下处理「变量紧贴多字节字面量」(脚本里如 "$END（$TOTAL，"——变量后

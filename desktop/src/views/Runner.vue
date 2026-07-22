@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onActivated, watch } from "vue";
-import { api, type FlowRow, type DeviceRow, type ApkInfo, type ResourceFile } from "../api";
+import { api, type FlowRow, type DeviceRow, type ApkInfo, type ResourceFile, type TextResource } from "../api";
 import { store } from "../store";
 import { runStore } from "../runStore";
 import RunMonitor from "./RunMonitor.vue";
@@ -9,8 +9,8 @@ import RunMonitor from "./RunMonitor.vue";
 // 运行状态本身放模块级 runStore（跨组件/跨子 tab 共享、独立于组件生命周期），本组件只管选择 UI + 触发编排。
 defineOptions({ name: "Runner" });
 
-// 子 tab：场景库（选择）/ 执行台（实时监控）
-const subTab = ref<"library" | "monitor">("library");
+// 子 tab：场景库（选择）/ 执行台（实时监控）/ 资源库（文件 + 文本资源登记）
+const subTab = ref<"library" | "monitor" | "resources">("library");
 
 // ── 中栏：当前 App 的用例/固化脚本 ──
 const flows = ref<FlowRow[]>([]);
@@ -25,6 +25,13 @@ const confirmNewBoard = ref(false);
 
 const frozen = computed(() => flows.value.filter((f) => f.has_flow));
 const nonFrozen = computed(() => flows.value.filter((f) => !f.has_flow));
+
+// 优先级配色：P0 最紧急(danger) > P1(warning) > P2/P3(muted)
+function priorityPill(p: string) {
+  if (p === "P0") return "pill-danger";
+  if (p === "P1") return "pill-warning";
+  return "pill-muted";
+}
 
 async function loadFlows() {
   if (!store.activeSlug) { flows.value = []; return; }
@@ -130,7 +137,7 @@ async function doUpload() {
     // 1) 逐台装机
     for (const serial of uploadSerials.value) {
       uploadLog.value.push(`$ adb -s ${serial} install -r ${apkPath.value}`);
-      const code = await api.installApk(apkPath.value, serial, (l) => uploadLog.value.push(l));
+      const code = await api.installApk(apkPath.value, apkInfo.value.package, serial, (l) => uploadLog.value.push(l));
       if (code !== 0) { uploadStatus.value = `✖ 装机失败（${serial}，exit ${code}）`; uploading.value = false; return; }
     }
     // 2) 用第一台已装设备注册（init_target.py + 补 app_slug + 建工作区）
@@ -193,21 +200,74 @@ async function removeResource(name: string) {
   }
 }
 
+// ── 资源库右栏：文本资源（config/text_resources.json，key-value，固化脚本按 key 取值）──
+const textResources = ref<TextResource[]>([]);
+const textErr = ref("");
+const newKey = ref("");
+const newValue = ref("");
+const savingText = ref(false);
+
+async function loadTextResources() {
+  try {
+    textResources.value = await api.listTextResources();
+  } catch (e: any) {
+    textErr.value = String(e);
+  }
+}
+
+async function addTextResource() {
+  textErr.value = "";
+  const key = newKey.value.trim();
+  if (!key) { textErr.value = "key 不能为空"; return; }
+  savingText.value = true;
+  try {
+    await api.upsertTextResource(key, newValue.value);
+    newKey.value = "";
+    newValue.value = "";
+    await loadTextResources();
+  } catch (e: any) {
+    textErr.value = String(e);
+  } finally {
+    savingText.value = false;
+  }
+}
+
+async function editTextResource(item: TextResource, value: string) {
+  textErr.value = "";
+  try {
+    await api.upsertTextResource(item.key, value);
+    await loadTextResources();
+  } catch (e: any) {
+    textErr.value = String(e);
+  }
+}
+
+async function removeTextResource(key: string) {
+  textErr.value = "";
+  try {
+    await api.deleteTextResource(key);
+    await loadTextResources();
+  } catch (e: any) {
+    textErr.value = String(e);
+  }
+}
+
 function selectApp(slug: string) {
   if (slug === store.activeSlug) return;
   store.setActive(slug).then(loadAll);
 }
 
 watch(() => store.activeSlug, () => { pickedCases.value = []; loadAll(); });
-onMounted(() => { loadAll(); loadResources(); });
+onMounted(() => { loadAll(); loadResources(); loadTextResources(); });
 // keep-alive 保活后切回本 tab 时刷新设备/用例列表；正在执行则不动，避免打断在跑的任务与日志。
-onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); } });
+onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTextResources(); } });
 </script>
 
 <template>
   <div class="runner">
     <div class="subtabs">
       <button class="stab" :class="{ on: subTab === 'library' }" @click="subTab = 'library'">场景库</button>
+      <button class="stab" :class="{ on: subTab === 'resources' }" @click="subTab = 'resources'">资源库</button>
       <button class="stab" :class="{ on: subTab === 'monitor' }" @click="subTab = 'monitor'">
         执行台<span v-if="runStore.running" class="live-dot" title="正在执行" />
       </button>
@@ -221,7 +281,7 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); } });
     <div v-if="err" class="err">{{ err }}</div>
 
     <div class="cols">
-      <!-- ── 左：App 库 + 测试资源 ── -->
+      <!-- ── 左：App 库 ── -->
       <div class="col app-col">
         <div class="card applist">
           <div class="col-hd">
@@ -247,41 +307,22 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); } });
             </div>
           </div>
         </div>
-
-        <div class="card resbox">
-          <div class="col-hd">
-            <span>测试资源</span>
-            <button class="primary sm" :disabled="uploadingRes" @click="uploadResource">+ 上传文件</button>
-          </div>
-          <div class="col-body">
-            <div v-if="resErr" class="err">{{ resErr }}</div>
-            <div v-if="!resourceFiles.length" class="muted empty-hint">
-              还没有素材文件。上传后存到项目 <span class="mono">assets/</span> 目录，固化脚本按文件名引用。
-            </div>
-            <div v-for="f in resourceFiles" :key="f.name" class="res-item">
-              <span class="mono res-name" :title="f.name">{{ f.name }}</span>
-              <span class="muted res-size">{{ formatSize(f.size) }}</span>
-              <button class="sm danger" title="删除" @click="removeResource(f.name)">✕</button>
-            </div>
-          </div>
-        </div>
       </div>
 
       <!-- ── 中：用例 / 固化脚本 ── -->
       <div class="col case-col card">
-        <div class="col-hd"><span>用例（{{ store.activeSlug || "未选 App" }}）</span></div>
+        <div class="col-hd">
+          <span>用例（{{ store.activeSlug || "未选 App" }}）</span>
+          <button class="sm" @click="loadFlows">刷新</button>
+        </div>
         <div class="col-body">
           <template v-if="frozen.length">
             <label v-for="f in frozen" :key="f.case_id" class="case-item">
               <input type="checkbox" :value="f.case_id" v-model="pickedCases" />
               <span class="case-id mono">{{ f.case_id }}</span>
               <span class="case-mod muted">{{ f.module }}</span>
-              <span
-                v-if="f.last_result"
-                class="pill sm"
-                :class="f.last_result === '通过' ? 'pill-success' : f.last_result === '失败' ? 'pill-danger' : 'pill-muted'"
-                >{{ f.last_result }}</span
-              >
+              <span v-if="f.purpose" class="case-purpose muted">{{ f.purpose }}</span>
+              <span v-if="f.priority" class="pill sm" :class="priorityPill(f.priority)">{{ f.priority }}</span>
             </label>
           </template>
           <div v-else-if="store.activeSlug" class="muted empty-hint">该 App 还没有固化用例（queue.csv 无固化脚本行）。</div>
@@ -292,6 +333,8 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); } });
               <input type="checkbox" disabled />
               <span class="case-id mono">{{ f.case_id }}</span>
               <span class="case-mod muted">{{ f.module }}</span>
+              <span v-if="f.purpose" class="case-purpose muted">{{ f.purpose }}</span>
+              <span v-if="f.priority" class="pill sm" :class="priorityPill(f.priority)">{{ f.priority }}</span>
               <span class="pill pill-muted sm">Claude Code</span>
             </div>
           </template>
@@ -338,6 +381,66 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); } });
     </div>
 
     </div><!-- /场景库 -->
+
+    <!-- ══════ 资源库：文件资源 + 文本资源（key-value），所有 App 共用 ══════ -->
+    <div v-show="subTab === 'resources'" class="resources">
+      <p class="muted sub">
+        文件资源存到 <span class="mono">assets/</span>，固化脚本用文件名引用；文本资源存到
+        <span class="mono">config/text_resources.json</span>，固化脚本用 key 取值（<span class="mono">tools/_appctx.py</span> 的
+        <span class="mono">get_text_resource(key)</span>）。
+      </p>
+      <div class="res-cols">
+        <!-- ── 左：文件资源 ── -->
+        <div class="col card resbox">
+          <div class="col-hd">
+            <span>文件</span>
+            <div class="hd-actions">
+              <button class="sm" @click="loadResources">刷新</button>
+              <button class="primary sm" :disabled="uploadingRes" @click="uploadResource">+ 上传文件</button>
+            </div>
+          </div>
+          <div class="col-body">
+            <div v-if="resErr" class="err">{{ resErr }}</div>
+            <div v-if="!resourceFiles.length" class="muted empty-hint">
+              还没有素材文件。上传后存到项目 <span class="mono">assets/</span> 目录，固化脚本按文件名引用。
+            </div>
+            <div v-for="f in resourceFiles" :key="f.name" class="res-item">
+              <span class="mono res-name" :title="f.name">{{ f.name }}</span>
+              <span class="muted res-size">{{ formatSize(f.size) }}</span>
+              <button class="sm danger" title="删除" @click="removeResource(f.name)">✕</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- ── 右：文本资源（key-value）── -->
+        <div class="col card textbox">
+          <div class="col-hd">
+            <span>文本</span>
+            <button class="sm" @click="loadTextResources">刷新</button>
+          </div>
+          <div class="col-body">
+            <div v-if="textErr" class="err">{{ textErr }}</div>
+            <div class="kv-new">
+              <input v-model="newKey" class="kv-key mono" placeholder="key" @keyup.enter="addTextResource" />
+              <input v-model="newValue" class="kv-val mono" placeholder="value" @keyup.enter="addTextResource" />
+              <button class="primary sm" :disabled="savingText" @click="addTextResource">+ 新建</button>
+            </div>
+            <div v-if="!textResources.length" class="muted empty-hint">
+              还没有文本资源。新建后固化脚本可按 key 取值。
+            </div>
+            <div v-for="t in textResources" :key="t.key" class="kv-item">
+              <span class="mono kv-key-label" :title="t.key">{{ t.key }}</span>
+              <input
+                class="kv-val-input mono"
+                :value="t.value"
+                @change="editTextResource(t, ($event.target as HTMLInputElement).value)"
+              />
+              <button class="sm danger" title="删除" @click="removeTextResource(t.key)">✕</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div><!-- /资源库 -->
 
     <!-- ══════ 执行台：实时监控（矩阵 + 进度 + 过程 + 中止）══════ -->
     <div v-show="subTab === 'monitor'" class="monitor-wrap">
@@ -417,15 +520,27 @@ h2 { margin: 0; font-weight: 500; }
 .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--text-accent); margin-left: 6px; vertical-align: middle; animation: livepulse 1.2s infinite; }
 @keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 .library { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.resources { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.res-cols { display: flex; gap: 12px; flex: 1; min-height: 0; }
+.res-cols .col { flex: 1; min-width: 0; min-height: 0; }
+.textbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.kv-new { display: flex; gap: 6px; padding: 8px; border-bottom: 0.5px solid var(--border); }
+.kv-key { width: 110px; flex-shrink: 0; padding: 5px 8px; font-size: 12px; }
+.kv-val { flex: 1; min-width: 0; padding: 5px 8px; font-size: 12px; }
+.kv-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px; font-size: 12px; border-radius: var(--radius); }
+.kv-item:hover { background: var(--surface-1); }
+.kv-key-label { width: 110px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kv-val-input { flex: 1; min-width: 0; padding: 4px 6px; font-size: 12px; background: transparent; border: 0.5px solid transparent; }
+.kv-val-input:hover, .kv-val-input:focus { border-color: var(--border); background: var(--surface-2); }
 .monitor-wrap { flex: 1; min-height: 0; display: flex; }
 .monitor-wrap :deep(.monitor) { flex: 1; min-width: 0; }
 .err { color: var(--text-danger); background: var(--bg-danger); padding: 8px 12px; border-radius: var(--radius); margin: 6px 0; font-size: 13px; }
 
 .cols { display: flex; gap: 12px; flex: 1; min-height: 0; }
 .col { display: flex; flex-direction: column; min-height: 0; }
-.app-col { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
+.app-col { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .applist { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.resbox { flex-shrink: 0; max-height: 40%; display: flex; flex-direction: column; }
+.resbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .res-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px; font-size: 12px; border-radius: var(--radius); }
 .res-item:hover { background: var(--surface-1); }
 .res-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -435,6 +550,7 @@ button.danger:hover { background: var(--bg-danger); border-radius: var(--radius)
 .case-col { flex: 1; min-width: 0; }
 .dev-col { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .col-hd { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 0.5px solid var(--border); font-size: 13px; font-weight: 500; }
+.hd-actions { display: flex; align-items: center; gap: 6px; }
 .col-body { flex: 1; overflow: auto; padding: 6px; min-height: 0; }
 .empty-hint { padding: 14px 10px; font-size: 12px; line-height: 1.5; }
 
@@ -450,7 +566,8 @@ button.danger:hover { background: var(--bg-danger); border-radius: var(--radius)
 .case-item:hover { background: var(--surface-1); }
 .case-item.locked { opacity: 0.6; cursor: default; }
 .case-id { flex-shrink: 0; }
-.case-mod { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.case-mod { flex-shrink: 0; font-size: 12px; max-width: 25%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.case-purpose { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .divider { font-size: 11px; padding: 10px 8px 4px; border-top: 0.5px solid var(--border); margin-top: 6px; }
 
 .devbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }

@@ -36,8 +36,12 @@ AI_auto_test/
 │           └── archive/<run_id>/  # 开新一轮时上一轮 log/evidence/issues 整份归档
 ├── tools/               # 跨 App 通用框架工具（共享）
 │   ├── _appctx.py       # ★ 多 App 上下文：解析活跃 App → 各路径（所有工具都 import 它）
-│   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/db/sp/seed/logscan/sweep...）
+│   ├── _probe_skip.py   # 临时探针：跳过/关闭按钮出没时 dump 树，看它进不进无障碍树/选择器是什么
+│   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/db/sp/seed/logscan/sweep...），唯一碰 adb 的地方
+│   ├── init_target.py   # 探测包名/版本/主Activity/db_name/debuggable → 写 target.json；--atx-init 装/验 u2 后端
+│   ├── preflight.py     # 开跑前只读自检：设备在线/App装没装/素材是否推到设备/当前看板（零副作用，见上一轮问答）
 │   ├── compile_cases.py # cases/*.yaml → ledger/queue.csv（幂等，保留运行时状态）
+│   ├── case_result.py   # 一条用例收工回写（queue.csv + log.csv + evidence.csv 一次性落）
 │   ├── run_flow.py      # 固化脚本统一执行入口（自动计时 + attempt 隔离）
 │   ├── auto_repair.py   # ★「大脑Claude」自愈：run_flow 失败→claude诊断→只改导航/健壮性→重跑(≤3次)
 │   ├── new_run.py       # 开一轮新回归（建看板 + 生成 run_id + 归档重置）
@@ -45,14 +49,27 @@ AI_auto_test/
 │   ├── doc_report.py    # ledger + 证据 → Google Doc 图文报告（OAuth）
 │   └── migrate_to_multiapp.py # 一次性：单 App 布局 → apps/<slug>/（幂等）
 ├── .claude/skills/adb-testcase-gen/  # skill：一句话目标→真机探查→YAML 用例
-├── desktop/             # ★ Tauri2+Vue3 桌面壳（可视化：证据查看/执行台/看板）
-├── seeds/               # 造数据用脚本/.sql（共享）
+├── desktop/             # ★ Tauri2+Vue3 桌面壳（可视化：设置/设备/执行/证据/看板）
+│   ├── src/views/            # 一个 tab 一个文件，App.vue 用 active 字符串切换（keep-alive 只保活 Runner）
+│   │   ├── Setup.vue          # 首屏：选活跃 App / 配置 target.json，配置完才进主界面
+│   │   ├── Overview.vue       # 总览面板（overview-panel-prd.md）
+│   │   ├── Devices.vue        # 设备列表/选设备
+│   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备)/执行台(内嵌RunMonitor)/资源库(文件assets/ + 文本config/text_resources.json，key-value)
+│   │   ├── RunMonitor.vue     # Runner 内嵌的运行监控子组件（流式日志/状态，不单独作为 tab）
+│   │   ├── Evidence.vue       # 证据查看器（截图/ui dump/日志），MVP-1 首个落地面；左栏按 设备(可收起)→用例→attempt 三层分组(不同设备跑的用例不同)，设备名走 read_device_aliases 映射
+│   │   └── Boards.vue         # 看板视图，点条目可跳到 Evidence
+│   ├── src/{api.ts,store.ts,runStore.ts}  # Tauri invoke 封装 / 全局状态 / 执行态状态
+│   └── src-tauri/             # Rust 壳：commands.rs 是暴露给前端 invoke 的命令集
+├── seeds/               # 造数据用脚本（共享）：push_media.sh 推 assets/ 到设备
 ├── evidence/            # 证据物料：evidence/<slug>/<ver>/<run_id>/<用例>/<serial>/<attempt>/{screenshots,ui,logs}
 └── docs/
     ├── RUNBOOK.md       # 执行大脑协议（先读这个）
     ├── structure.md     # 本文件
     ├── flow-freeze.md   # AI 探路→固化成 flow_*.sh 脚本（回归提速）
     ├── evidence-video-playback.md  # 视频播放器类 App 的证据链（三轴模型 + playback/framediff 规格）
+    ├── overview-panel-prd.md      # 总览面板 PRD
+    ├── todo.md          # 未完成事项/已知待办
+    ├── assets/          # 文档配图（dataflow.png/svg），非测试素材
     ├── decisions.md     # 非显然的架构选择与原因
     └── gotchas.md       # 已知坑
 ```

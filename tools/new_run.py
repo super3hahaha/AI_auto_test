@@ -15,7 +15,7 @@ config.doc_id 指向新的这份；之后想更新 Doc 就手动重跑 `doc_repo
     （issues.csv 不分开没关闭——不管状态如何，只要不是这一轮跑出来的就不该留在新一轮账本里）。
 
 本脚本会为这一轮生成一个执行批次 ID **run_id**（格式 YYYYMMDD-HHMM），写进 config.run_id、记进
-runs.csv（首列），证据目录也按它归档（evidence/<app>/<ver>/<run_id>/...，见 docs/desktop-app-prd.md
+runs.csv（首列），证据目录也按它归档（evidence/<app>/<ver>/<run_id>/...，见 docs/decisions.md #31
 「★ 证据数据模型」）——同日多轮不再撞目录、桌面壳可按批次查证据。
   - queue.csv：运行时字段（当前状态/执行结果/证据链接/关键截图/问题ID/开始时间/结束时间/历史覆盖情况）
     重置为初始值，用例定义本身不变。

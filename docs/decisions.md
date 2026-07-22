@@ -214,3 +214,19 @@
 - **为什么抽象而不是直接换**：u2 快的代价是设备上要**常驻 atx-agent + 两个 apk 并保活**（会被 doze/省电杀），跟本框架"纯 adb、不给设备装东西、pm clear 复现首启"的黑盒哲学有让步。所以 `_dump_tree` 拆成 `_dump_tree_shell` / `_dump_tree_u2` 两后端，`target.json` 的 `dump_backend` 字段（+ `--dump-backend` 覆盖）切换，**默认 shell 零风险**，单台验证稳定后再按 App/按设备切 u2。两后端输出同为 UiAutomator 层级 XML，字段/bounds 一致，`_nodes_from`/`_match_nodes`/`_present_any`/sweep/find 等上层一律不改。
 - **设备初始化**：`init_target.py --atx-init` 做 `u2.connect`（首次自动装 atx）+ `dump_hierarchy` 健康检查；`--dump-backend u2 --write` 才落盘切后端。运行期保活靠 adbkit `_u2_device()` 惰性缓存 + u2 库 connect 内建 healthcheck。
 - **未定论**：切 u2 是否顺带修好"WebView 插屏广告跳不过"——观察到 shell dump 与 u2 dump 在 AdMob 插屏上节点数不同（23 vs 85），但未干净复现"shell 单独跑必失败、u2 必成功"（一次污染测量见 gotchas.md），故**不以此为切 u2 的理由**，只认提速这个确定收益。
+
+## 31. 证据目录用 `run_id`（批次）+ `attempt`（同机重跑）两层身份，替代原来的裸 `date`（2026-07-17，MVP-0 已落地）
+
+- **背景**：原证据路径 `evidence/<app>/<version>/<date>/<case>/<serial>/<step>.png` 用 `date` 当唯一"执行分隔键"，但一天能跑多轮、一条 case 能重跑多次——`date` 全区分不了。结果同日多轮要么互相覆盖截图，要么被日期切散难聚合。桌面壳要做"先选看板/批次→看该批次证据"，这层必须先理顺。
+- **决定（三层身份）**：看板 board（`sheet_id`，可续用多次写）⊇ 执行批次 run（**`run_id`**=`YYYYMMDD-HHMM`，一次"开跑"生成一个）⊇ 执行次 attempt（**`attempt`**=执行开始 `HHMMSS`，同一 run 内同一 case 在同一设备上的第 N 次跑）。`<serial>` 只区分"哪台设备"，区分不了"同机第几次跑"，靠 attempt 解决。新路径：`evidence/<app>/<version>/<run_id>/<case>/<serial>/<attempt>/{screenshots,logs,ui}/<step>.png`。
+- **attempt 必须"一次执行内稳定"**：由 `run_flow.py`（或主循环挂号步）执行前生成一次开始时刻，通过环境变量 `ADBKIT_ATTEMPT` 传给 adbkit 全程复用；Claude Code 每条 Bash 独立 shell、`export` 不跨调用，所以主循环是**每条采证命令就地带 `ADBKIT_ATTEMPT=<值>` 前缀**，而不是 `export` 一次。
+- **兼容**：`config.run_id` 为空时 `run_seg()` 退回纯日期（legacy 兼容）；`ADBKIT_ATTEMPT` 未设时不加 attempt 段（同样退回 legacy 结构）。历史 date 制目录不强行迁移，桌面端按"8 位纯数字=legacy / 带 `-HHMM`=新批次"兼容渲染两种。
+- **runs.csv 升级**：`日期,标题,sheet_id,URL,doc_id,doc_url` → `run_id,日期,标题,sheet_id,URL,doc_id,doc_url`（run_id 置首唯一，sheet_id 可重复=同看板多批），这就是桌面端「看板/批次」列表的数据源；`new_run.py` 归档目录也从 `archive/<date>/` 改成 `archive/<run_id>/`。
+- **代价/边界**：只做了"新建看板"生成新 run_id；"续用看板、开新一批"（`new_run.py --same-board`）**未实现**——会 re-sync 覆盖该 Sheet 上一轮数据，与"每轮独立 Sheet"原则冲突，取舍还没做，需要时单独决策。
+
+## 32. 资源库拆「文件」/「文本」两类，Runner 新增第三个子 tab（2026-07-21）
+
+- **背景**：场景库左栏塞了 App 库 + 测试资源（文件）两个卡片，越来越挤；且只有文件类素材，没有 key-value 文本参数（比如账号/口令/固定文案），固化脚本想引用这类值只能硬编码进脚本或 case yaml。
+- **决定**：Runner.vue 的 `subTab` 由两个值扩到三个：`library`（场景库）/`monitor`（执行台）/`resources`（资源库，新增）。资源库内左右两栏：左「文件」= 原样搬迁的 assets/ 管理（上传/删除，逻辑不变）；右「文本」= 新的 key-value 登记，`config/text_resources.json`（数组 `[{key,value}]`，跨 App 共享，风格照抄 `device_aliases.json`），支持新建/改值(inline 输入框 change 事件)/删除。
+- **脚本取值路径**：Tauri 命令只服务桌面壳 UI（`list/upsert/delete_text_resource`）；固化脚本是 Python，不走 Tauri IPC，所以在 `tools/_appctx.py` 加了 `get_text_resource(key, default=None)`，直接读同一个 JSON 文件。两边共享同一份文件、不重复定义格式。
+- **为什么不用 HashMap 而用数组**：`device_aliases.json` 用 HashMap（`serial→alias`）没问题因为不关心顺序；文本资源在 UI 里要按登记顺序展示，且 Rust `HashMap` 序列化顺序不稳定，故存 `Vec<{key,value}>`，upsert 时线性查找 key 是否存在（量级小，几十条内不成问题）。

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted, watch } from "vue";
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from "vue";
 import { api, fileSrc, type EvidenceRow, type RunRow } from "../api";
 import { store } from "../store";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -7,7 +7,19 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 const rows = ref<EvidenceRow[]>([]);
 const loading = ref(false);
 const err = ref("");
-const selectedCase = ref("");
+// 选中的「设备+用例」对——同一时间只展开一个用例的证据链；同一用例可能在多台设备上跑，故用 serial 一起做标识
+const selDevice = ref("");
+const selCase = ref("");
+const isExpanded = (serial: string, c: string) => selDevice.value === serial && selCase.value === c;
+function toggleCase(serial: string, c: string) {
+  if (isExpanded(serial, c)) {
+    selDevice.value = "";
+    selCase.value = "";
+  } else {
+    selDevice.value = serial;
+    selCase.value = c;
+  }
+}
 const currentIndex = ref(0); // 用下标而非 path 作选中标识——evidence.csv 同路径可重复出现（重跑追加行，decisions #23），path 不唯一会导致方向键卡住
 const onlyKey = ref(false);
 const typeFilter = ref<"all" | "image" | "text">("all");
@@ -30,8 +42,7 @@ async function loadEvidence() {
   err.value = "";
   try {
     rows.value = await api.readEvidence(store.activeSlug, store.selectedRunId);
-    const cs = cases.value;
-    if (cs.length && !cs.includes(selectedCase.value)) selectedCase.value = cs[0];
+    ensureSelection();
     pickFirst();
   } catch (e: any) {
     err.value = String(e);
@@ -41,28 +52,54 @@ async function loadEvidence() {
   }
 }
 
-const cases = computed(() => [...new Set(rows.value.map((r) => r.case_id))]);
-
 function pass(r: EvidenceRow) {
   if (onlyKey.value && !r.is_key) return false;
   if (typeFilter.value === "image" && !r.is_image) return false;
   if (typeFilter.value === "text" && r.is_image) return false;
   return true;
 }
-// 当前用例下、通过筛选的证据行（按采集顺序）
-const items = computed(() => rows.value.filter((r) => r.case_id === selectedCase.value && pass(r)));
+// 当前选中「设备+用例」下、通过筛选的证据行（按采集顺序）
+const items = computed(() =>
+  rows.value.filter((r) => (serialOf(r) || "-") === selDevice.value && r.case_id === selCase.value && pass(r))
+);
 
-// attempt 段（从路径里抠出来做分组标签）：.../<serial>/<attempt>/screenshots/x
-function attemptOf(r: EvidenceRow): string {
+// 证据路径两种历史布局都存在（decisions：早期无 attempt 段）：
+//   新：.../<caseId>/<serial>/<attempt>/{screenshots|logs|ui}/x
+//   旧：.../<caseId>/<serial>/{screenshots|logs|ui}/x
+// 不能用「从媒体目录往前数第 N 段」——旧布局会整体错位一位、把 caseId 当成 serial。
+// 改为锚定已知的 case_id：serial=其后一段，attempt=再后一段（若已是媒体目录则视为无 attempt）。
+const MEDIA = new Set(["screenshots", "logs", "ui"]);
+function segs(r: EvidenceRow): { serial: string; attempt: string } {
   const parts = r.path.split("/");
-  const i = parts.findIndex((p) => p === "screenshots" || p === "logs" || p === "ui");
-  return i > 0 ? parts[i - 1] : "";
+  const ci = parts.indexOf(r.case_id);
+  if (ci >= 0 && ci + 1 < parts.length && !MEDIA.has(parts[ci + 1])) {
+    const serial = parts[ci + 1];
+    const next = parts[ci + 2] || "";
+    return { serial, attempt: MEDIA.has(next) ? "" : next };
+  }
+  // 兜底：找不到 caseId 段时退回媒体目录锚点（假定新布局）
+  const i = parts.findIndex((p) => MEDIA.has(p));
+  return { serial: i >= 2 ? parts[i - 2] : "", attempt: i >= 1 ? parts[i - 1] : "" };
+}
+const attemptOf = (r: EvidenceRow) => segs(r).attempt;
+const serialOf = (r: EvidenceRow) => segs(r).serial;
+
+// 序列号→别名映射（config/device_aliases.json），把 serial 显示成友好名
+const aliasMap = ref<Record<string, string>>({});
+const deviceLabel = (serial: string) =>
+  serial === "-" ? "(未知设备)" : aliasMap.value[serial] || serial;
+
+// 设备分组的收起状态：记住被收起的 serial（默认全展开）
+const collapsedDevices = reactive(new Set<string>());
+function toggleDevice(serial: string) {
+  if (collapsedDevices.has(serial)) collapsedDevices.delete(serial);
+  else collapsedDevices.add(serial);
 }
 
-// 按 attempt 拆分子分组——同一用例可能重复执行多次（同一 attempt 内步骤才应视为一次完整证据链）
-const attemptGroups = computed(() => {
+// 按 attempt 拆分子分组——同一设备上同一用例可能重复执行多次
+function splitByAttempt(list: EvidenceRow[]): [string, EvidenceRow[]][] {
   const m = new Map<string, EvidenceRow[]>();
-  for (const r of items.value) {
+  for (const r of list) {
     const key = attemptOf(r) || "-";
     if (!m.has(key)) m.set(key, []);
     m.get(key)!.push(r);
@@ -73,7 +110,51 @@ const attemptGroups = computed(() => {
     if (b[0] === "-") return -1;
     return b[0].localeCompare(a[0]);
   });
+}
+
+// 侧栏三层树：设备(最外) → 用例 → attempt。不同设备跑的用例不一样，故用例挂在各自设备下。
+const deviceGroups = computed(() => {
+  // serial → (case_id → 行)
+  const dev = new Map<string, Map<string, EvidenceRow[]>>();
+  for (const r of rows.value) {
+    if (!pass(r)) continue;
+    const s = serialOf(r) || "-";
+    if (!dev.has(s)) dev.set(s, new Map());
+    const cm = dev.get(s)!;
+    if (!cm.has(r.case_id)) cm.set(r.case_id, []);
+    cm.get(r.case_id)!.push(r);
+  }
+  // 设备名排序（"-" 兜底键排最后），保证展示稳定
+  return [...dev.entries()]
+    .sort((a, b) => {
+      if (a[0] === "-") return 1;
+      if (b[0] === "-") return -1;
+      return deviceLabel(a[0]).localeCompare(deviceLabel(b[0]));
+    })
+    .map(([serial, cm]) => ({
+      serial,
+      cases: [...cm.entries()].map(([caseId, list]) => ({
+        caseId,
+        count: list.length,
+        attempts: splitByAttempt(list),
+      })),
+    }));
 });
+
+// 选中项失效（首次加载 / 筛选后当前设备+用例已无证据）时，回落到第一台设备的第一个用例
+function ensureSelection() {
+  const g = deviceGroups.value;
+  const dev = g.find((d) => d.serial === selDevice.value);
+  const stillValid = dev && dev.cases.some((c) => c.caseId === selCase.value);
+  if (stillValid) return;
+  if (g.length && g[0].cases.length) {
+    selDevice.value = g[0].serial;
+    selCase.value = g[0].cases[0].caseId;
+  } else {
+    selDevice.value = "";
+    selCase.value = "";
+  }
+}
 
 const current = computed(() => items.value[Math.min(currentIndex.value, items.value.length - 1)]);
 
@@ -91,7 +172,12 @@ function onKey(e: KeyboardEvent) {
   else if (e.key === "ArrowRight") { step(1); e.preventDefault(); }
 }
 
-watch([selectedCase, onlyKey, typeFilter], () => pickFirst());
+watch([selDevice, selCase], () => pickFirst());
+// 筛选变化可能让当前选中的设备+用例没证据了，回落一下再重置游标
+watch([onlyKey, typeFilter], () => {
+  ensureSelection();
+  pickFirst();
+});
 watch(() => store.selectedRunId, () => loadEvidence());
 // 换 App：批次锚点已在 store.setActive 里重置；这里保证清空旧 App 证据
 watch(() => store.activeSlug, () => {
@@ -107,6 +193,12 @@ watch(current, async (c) => {
 
 onMounted(async () => {
   if (!store.runs.length) await store.loadRuns();
+  try {
+    const kvs = await api.readDeviceAliases();
+    aliasMap.value = Object.fromEntries(kvs.map((k) => [k.key, k.value]));
+  } catch {
+    /* 别名读不到无妨，退化为显示 serial */
+  }
   window.addEventListener("keydown", onKey);
   await loadEvidence();
 });
@@ -140,27 +232,43 @@ const selRun = computed(() => store.selectedRun());
     <div v-else-if="!rows.length" class="muted pad">这个批次还没有证据（evidence.csv 为空或未找到归档）。</div>
 
     <div v-else class="body">
-      <!-- 左：用例分组 + 证据列表 -->
+      <!-- 左：设备分组 → 用例 → attempt → 证据列表 -->
       <div class="side card">
         <div class="side-scroll">
-          <template v-for="c in cases" :key="c">
-            <div class="case-hd" :class="{ on: c === selectedCase }" @click="selectedCase = c">
-              {{ c }}
+          <template v-for="dev in deviceGroups" :key="dev.serial">
+            <div class="device-hd" @click="toggleDevice(dev.serial)">
+              <span class="dev-caret">{{ collapsedDevices.has(dev.serial) ? "▸" : "▾" }}</span>
+              <span class="dev-name">{{ deviceLabel(dev.serial) }}</span>
+              <span class="dev-count muted">{{ dev.cases.length }} 例</span>
             </div>
-            <template v-if="c === selectedCase">
-              <template v-for="[attempt, group] in attemptGroups" :key="attempt">
-                <div class="attempt-hd muted">attempt {{ attempt }} · {{ group.length }} 项</div>
+            <template v-if="!collapsedDevices.has(dev.serial)">
+              <template v-for="cs in dev.cases" :key="dev.serial + '/' + cs.caseId">
                 <div
-                  v-for="r in group"
-                  :key="items.indexOf(r)"
-                  class="evi-item"
-                  :class="{ on: items.indexOf(r) === currentIndex }"
-                  @click="currentIndex = items.indexOf(r)"
+                  class="case-hd"
+                  :class="{ on: isExpanded(dev.serial, cs.caseId) }"
+                  @click="toggleCase(dev.serial, cs.caseId)"
                 >
-                  <span class="step">{{ r.step || "(无步骤)" }}</span>
-                  <span v-if="r.is_key" class="pill pill-accent">★</span>
-                  <span class="etype muted">{{ r.is_image ? "img" : "txt" }}</span>
+                  <span class="case-name">{{ cs.caseId }}</span>
+                  <button class="expand-btn" @click.stop="toggleCase(dev.serial, cs.caseId)">
+                    {{ isExpanded(dev.serial, cs.caseId) ? "∨" : "∧" }}
+                  </button>
                 </div>
+                <template v-if="isExpanded(dev.serial, cs.caseId)">
+                  <template v-for="[attempt, group] in cs.attempts" :key="attempt">
+                    <div class="attempt-hd muted">attempt {{ attempt }} · {{ group.length }} 项</div>
+                    <div
+                      v-for="r in group"
+                      :key="items.indexOf(r)"
+                      class="evi-item"
+                      :class="{ on: items.indexOf(r) === currentIndex }"
+                      @click="currentIndex = items.indexOf(r)"
+                    >
+                      <span class="step">{{ r.step || "(无步骤)" }}</span>
+                      <span v-if="r.is_key" class="pill pill-accent">★</span>
+                      <span class="etype muted">{{ r.is_image ? "img" : "txt" }}</span>
+                    </div>
+                  </template>
+                </template>
               </template>
             </template>
           </template>
@@ -199,6 +307,7 @@ const selRun = computed(() => store.selectedRun());
             >
             <span class="pill pill-accent" v-if="current.is_key">★ 关键</span>
             <span class="etype muted">{{ current.etype }}</span>
+            <span class="muted device" v-if="serialOf(current)">📱 {{ deviceLabel(serialOf(current)) }}</span>
             <span class="muted attempt" v-if="attemptOf(current)">attempt {{ attemptOf(current) }}</span>
             <span class="muted time">{{ current.collected_at }}</span>
           </div>
@@ -235,10 +344,20 @@ const selRun = computed(() => store.selectedRun());
 
 .side { width: 210px; flex-shrink: 0; display: flex; flex-direction: column; padding: 8px; }
 .side-scroll { flex: 1; overflow: auto; }
-.case-hd { font-size: 12px; font-weight: 500; color: var(--text-secondary); padding: 6px 8px; cursor: pointer; border-radius: var(--radius); margin-top: 4px; }
+/* 最外层：设备 */
+.device-hd { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 600; padding: 6px 8px; cursor: pointer; border-radius: var(--radius); color: var(--text-primary); margin-top: 6px; }
+.device-hd:hover { background: var(--surface-1); }
+.device-hd .dev-caret { font-size: 10px; flex-shrink: 0; color: var(--text-secondary); width: 12px; text-align: center; }
+.device-hd .dev-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.device-hd .dev-count { font-size: 10.5px; flex-shrink: 0; }
+/* 二层：用例（缩进挂在设备下） */
+.case-hd { display: flex; align-items: center; gap: 6px; font-size: 12px; font-weight: 500; color: var(--text-secondary); padding: 5px 8px 5px 22px; cursor: pointer; border-radius: var(--radius); }
 .case-hd.on { color: var(--text-accent); }
-.attempt-hd { font-size: 10.5px; padding: 6px 8px 2px 16px; letter-spacing: 0.02em; }
-.evi-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px 5px 16px; font-size: 12px; border-radius: var(--radius); cursor: pointer; color: var(--text-secondary); }
+.case-hd .case-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.expand-btn { flex-shrink: 0; width: 18px; height: 18px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 11px; line-height: 1; border-radius: 4px; color: inherit; background: transparent; border: none; }
+.expand-btn:hover { background: var(--surface-1); }
+.attempt-hd { font-size: 10.5px; padding: 6px 8px 2px 34px; letter-spacing: 0.02em; }
+.evi-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px 5px 34px; font-size: 12px; border-radius: var(--radius); cursor: pointer; color: var(--text-secondary); }
 .evi-item:hover { background: var(--surface-1); }
 .evi-item.on { background: var(--bg-accent); color: var(--text-accent); }
 .evi-item .step { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -261,6 +380,7 @@ const selRun = computed(() => store.selectedRun());
 .meta-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .step-name { font-weight: 500; font-size: 13px; }
 .etype { font-size: 11px; }
+.device { font-size: 11px; }
 .attempt { font-size: 11px; }
 .time { font-size: 11px; margin-left: auto; }
 .assertion { font-size: 12px; color: var(--text-secondary); line-height: 1.6; }

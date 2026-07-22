@@ -3,6 +3,10 @@ config/service_account.json
 config/oauth_client.json
 config/oauth_token*
 config/active.json
+# 本机/业务态：桌面壳资源库文本资源（含 App 专属 URL/文案）、本机设备别名映射（真实序列号）
+# —— 都是具体业务/本机数据，不属于「框架 + 最小示例」，代码缺文件时兜底空
+config/text_resources.json
+config/device_aliases.json
 evidence/*/
 !evidence/.gitkeep
 .dumpcache/
@@ -21,10 +25,14 @@ apps/*/target.json
 # ledger 是本机执行产物（cases 可重新汇编、团队真值是 Google Sheet）——多人各自跑会冲突，不入库
 apps/*/ledger/*
 !apps/*/ledger/.gitkeep
-# 完整业务用例集/暂缓用例/业务固化脚本是重业务内容，只留最小示例（CUT-CORE-01 + flow_cut_save），其余不入库
-apps/*/cases/regression.yaml
-apps/*/cases/_parked_regression.yaml
-apps/*/flows/flow_cut_edge_wav40000.sh
+# 完整业务用例集/固化脚本是重业务内容，只留最小示例，其余（含新增业务用例/脚本）一律不入库。
+# 改用白名单：忽略 cases/flows 全部，仅放行示例（CUT-CORE-01 + _TEMPLATE + flow_cut_save）。
+# 之前用逐文件黑名单，跟不上后续新增的业务用例，会漏网入库。
+apps/*/cases/*
+!apps/*/cases/CUT-CORE-01.yaml
+!apps/*/cases/_TEMPLATE.yaml
+apps/*/flows/*
+!apps/*/flows/flow_cut_save.sh
 
 # ── 桌面壳构建产物 ──
 desktop/node_modules/

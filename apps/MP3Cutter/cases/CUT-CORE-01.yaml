@@ -1,7 +1,7 @@
 - id: CUT-CORE-01
   module: 音频裁剪
-  purpose: 核心路径
-  priority: P0
+  purpose: 核心路径+结果页校验
+  priority: P1
   goal: 裁剪一段音频并保存，在结果页将产物重命名为「cut+完成日期时间（精确到分钟）」
   precondition: >
     设备「选择音频」列表已有音频文件（真机现有多首 .mp3）；App 已启动进入首页，

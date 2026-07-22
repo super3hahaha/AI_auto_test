@@ -13,11 +13,12 @@ CFG = load_cfg()
 PKG = CFG["package"]
 SERIAL = CFG.get("serial", "")
 
-# 期望在设备 MediaStore 里的测试素材（gen_assets.sh 生成的 + 用户提供的真实 ogg）
+# 期望在设备 MediaStore 里的测试素材（均为本机自备的真实音频，见 assets/README.md）
 EXPECTED = [
-    "test_a_30s.mp3", "test_a_30s.aac", "test_a_30s.flac", "test_a_30s.wav",
-    "test_b_10s.mp3", "test_b_10s.aac", "test_b_10s.flac", "test_b_10s.wav",
-    "real_tagged.ogg",
+    "mp3-sample-track.mp3", "mp3-sample-track.aac",
+    "flac-sample-track.flac", "pcm_s16le-sample-track.wav",
+    "aac-sample-track.aac", "aac-sample-track.m4a",
+    "vorbis-sample-track.ogg", "edge_40000hz_mono.wav",
 ]
 
 
@@ -61,7 +62,7 @@ def main():
     if missing:
         print(f"  ✗ 缺: {missing}")
         print("  补：bash seeds/push_media.sh <serial>")
-        print("     （生成的用 seeds/gen_assets.sh 重建；真实 real_tagged.ogg 需放回 assets/，见 assets/README.md）")
+        print("     （本机缺文件见 assets/README.md，均为自备真实音频，无法自动生成）")
         ok = False
 
     # 4) 看板

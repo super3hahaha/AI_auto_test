@@ -10,7 +10,7 @@
     db_name         —— debuggable 时 run-as ls databases/ 列出的候选（非 debug 留空，见 gotchas.md）
 
 跟包名无关的字段（evidence_root/date/scope/oauth_account/sheet_id/doc_id/image_folder_id/
-board_title/report_title/tiktok_url/ig_url）保持原样不动；target.json 不存在则以
+board_title/report_title）保持原样不动；target.json 不存在则以
 target.example.json 为底子。
 
 `app_slug`（证据目录简称，见 adbkit.py 的 APP 取值）本脚本不探测也不覆盖——aapt 读到的

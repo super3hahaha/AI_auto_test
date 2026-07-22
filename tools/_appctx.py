@@ -1,6 +1,6 @@
 """多 App 上下文解析——所有框架工具从这里取「当前 App 工作区」的路径。
 
-布局（见 docs/desktop-app-prd.md「多 App 架构」）：
+布局（见 docs/decisions.md #27）：
   apps/<slug>/{target.json, flows/, cases/, ledger/}   ← 每个被测 App 一套独立工作区
   config/           账号级凭证 + active.json + target.example.json + ad_rules.json（共享）
   evidence/<slug>/…  证据物料（路径内已按 app_slug 分，仍在仓库根、共享）
@@ -52,3 +52,20 @@ def load_cfg():
         if p.exists():
             return json.loads(p.read_text())
     sys.exit(f"找不到配置：{TARGET_CFG}（或复制 config/target.example.json 到该 App 工作区）。")
+
+
+TEXT_RESOURCES_FILE = GLOBAL_CONFIG / "text_resources.json"  # 桌面壳「资源库」文本资源登记，跨 App 共享
+
+
+def get_text_resource(key, default=None):
+    """按 key 取桌面壳资源库里登记的文本资源 value；key 不存在时返回 default。"""
+    if not TEXT_RESOURCES_FILE.exists():
+        return default
+    try:
+        items = json.loads(TEXT_RESOURCES_FILE.read_text())
+    except Exception:
+        return default
+    for item in items:
+        if item.get("key") == key:
+            return item.get("value")
+    return default

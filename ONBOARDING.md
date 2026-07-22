@@ -36,14 +36,11 @@ cp config/target.example.json config/target.json
 这几类文件**故意不进 git**（版权/体积/多人协作冲突原因，详见 [docs/decisions.md](docs/decisions.md) #13），fresh clone 后需要自己生成一遍：
 
 ```bash
-# 3.1 从 apps/<slug>/cases/*.yaml 汇编出本机账本（apps/<slug>/ledger/ 是空的，只有 .gitkeep）
+# 从 apps/<slug>/cases/*.yaml 汇编出本机账本（apps/<slug>/ledger/ 是空的，只有 .gitkeep）
 python3 tools/compile_cases.py
-
-# 3.2 生成测试音频素材（合成正弦波，可重复生成）
-bash seeds/gen_assets.sh
 ```
 
-如果你要跑内置的 MP3 Cutter 示例用例 `CUT-CORE-01`，还需要手动补一个真实音频文件（内容不重要，文件名要含"mp3-sample-track"）放进 `assets/`，具体要求看 [assets/README.md](assets/README.md)。如果你是接入自己的 App，跳过这个。
+如果你要跑内置的 MP3 Cutter 示例用例（`CUT-CORE-01` 等），还需要手动放几个真实音频文件进 `assets/`（内容不重要，文件名要按 `<acodec>-sample-track.<ext>` 规则命名，比如 `mp3-sample-track.mp3`），具体清单和要求看 [assets/README.md](assets/README.md)。如果你是接入自己的 App，跳过这个。
 
 ## 4. 自检
 

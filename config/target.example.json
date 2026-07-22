@@ -30,7 +30,7 @@
     "_tools": "以上 app_name/app_slug/app_version/main_activity/build/db_name 换包时可用 tools/init_target.py <包名> 自动探测（默认只打印，--write 才落盘；app_name/app_version 建议人工核对后再写，见 docs/gotchas.md）",
     "evidence_root": "证据根目录，相对项目根",
     "date": "留空=用今天(YYYYMMDD)；复现历史某轮时可固定",
-    "run_id": "本轮执行批次 ID（格式 YYYYMMDD-HHMM），由 new_run.py 开一轮时自动生成并回填，无需手填。证据目录按它归档（evidence/<app>/<ver>/<run_id>/...），同日多轮不撞、桌面壳可按批次查证据。留空时 adbkit 退回用纯日期段（兼容旧机器）。见 docs/desktop-app-prd.md「★ 证据数据模型」",
+    "run_id": "本轮执行批次 ID（格式 YYYYMMDD-HHMM），由 new_run.py 开一轮时自动生成并回填，无需手填。证据目录按它归档（evidence/<app>/<ver>/<run_id>/...），同日多轮不撞、桌面壳可按批次查证据。留空时 adbkit 退回用纯日期段（兼容旧机器）。见 docs/decisions.md #31",
     "scope": "本轮回归范围（决定 board.csv 与看板/报告显示哪些用例）。留空=全量；填一组优先级如 'P0' 或 'P0,P1'；或填一组用例ID如 'CUT-CORE-01,CUT-EDGE-01'。优先级与ID不能混写。全量真值 queue.csv 不受影响，执行/状态照旧",
     "oauth_account": "OAuth 账号标签，用于多账号 token 共存、切换免重授权。留空=用 config/oauth_token.json；填 <acct>=用 config/oauth_token.<acct>.json（如 'inshot' → oauth_token.inshot.json）。new_run 建表 + doc_report 建Doc/传图都读这个 token，切账号只改这里、不用重新授权（前提该账号的 token 文件已授权存在）",
     "sheet_id": "Google Sheet 的 ID（URL 中 /d/ 和 /edit 之间那段）；sheets_sync 用",

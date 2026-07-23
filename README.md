@@ -1,20 +1,55 @@
 # AI 自动化测试（最小复刻）
 
-AI 当测试工程师、用 ADB 驱动安卓模拟器的自动化测试框架。**Claude Code 当执行大脑**，
-本地 CSV 当账本，Google Sheets 当云端看板。
+AI 当测试工程师、用 ADB 驱动安卓设备的自动化测试框架。核心流程是三步：
+
+**对话生成用例（Claude Code + skill）→ 固化成回归脚本（Claude Code + skill）→ 桌面壳执行（Tauri 壳）**
+
+生成/固化阶段靠 Claude Code 对着真机探路、把步骤锚在真实控件上；探通、稳定之后固化成纯选择器脚本，交给桌面壳批量、多设备、无 AI 逐屏推理地跑，跑完自动收尾（判定 → 登记问题 → 同步 Sheets → 刷新 Doc）。本地 CSV 当账本，Google Sheets/Docs 当云端看板。
+
+## 核心工作流程
+
+```
+① 对话生成用例                  ② 固化成回归脚本                 ③ 桌面壳执行
+──────────────────           ──────────────────────         ────────────────────────
+一句话测试目标                  路径探通、UI 稳定后              打开桌面壳（desktop/）
+  → skill adb-testcase-gen       → skill flow-freeze              → 选 App/设备/用例（场景库）
+  → Claude Code 用 adbkit           → Claude Code 把探索过程          → 一键批量执行（执行台）
+    真机探路 + 采证                    固化成 apps/<slug>/flows/          → 自动收尾：判定
+  → apps/<slug>/cases/<id>.yaml       flow_*.sh（纯选择器脚本）           →登记问题→同步Sheets
+                                                                       →刷新 Doc
+                                                                    → 查证据/看板/执行记录
+```
+
+- **① 生成**：对话里说测试目标（"帮我生成用例"之类），或直接调 skill `adb-testcase-gen`；产出 `apps/<slug>/cases/<id>.yaml`，见 `.claude/skills/adb-testcase-gen/`。
+- **② 固化**：同一条路径在对话里探通、判定标准定下来之后，调 skill `flow-freeze`；产出 `apps/<slug>/flows/flow_*.sh`，见 `.claude/skills/flow-freeze/`。未固化的用例桌面壳里是锁住的（灰显"走主循环"），只能靠 Claude Code 对话逐屏探。
+- **③ 执行**：日常回归不用再手跑脚本或走对话循环——打开桌面壳，勾选已固化用例 + 目标设备，点"执行选中"。失败可开「脚本自愈」（`auto_repair.py`：交 claude 诊断改脚本重跑，≤3 次）。跑完的收尾链路（`judge_result.py` 落终态 → `issue_register.py` 自动登记问题 → `sheets_sync.py` 同步看板 → `doc_report.py` 刷新图文报告）由桌面壳自动串起来调用，不需要手敲命令。
 
 ## 组成
 
+**生成/固化侧（对话 + Claude Code）**
+
 - `tools/adbkit.py` —— 手和眼：ADB 封装。感知 `ui/find/waitfor/focus`；操作 `tapid/taptext/tapdesc`（选择器点击，坐标现算跨分辨率，`--from` 复用 dump、`--timeout` 等待重试）+ `tap/text/key/swipe`；清障 `dismiss`(单弹窗) / `sweep`(通用广告&权限&系统弹窗清障，规则库驱动，见下)；证据 `shot/logscan`(按PID过滤)/`output-check`(查MediaStore)/`alarm/db/sp`；`--serial` 多设备。
 - `config/ad_rules.json` —— 通用广告/弹窗**清障规则库**（跨 App 通用、随仓库版本管理）。每条规则 = `作用页(scope) + 命中选择器(match) → tap_matched`。`adbkit.py sweep` 读它：认当前前台页 → dump 一次 → 命中就点，幂等且尽力而为（没广告不算失败，始终 exit0；连续 `--patience` 轮无命中即收工）。广告关闭类靠 scope 卡在对应 SDK 全屏页才动手（不误伤正常界面），权限/系统弹窗类作用页为任意页面。加新规则先 `adbkit.py focus` 看目标页的组件串定 scope。调用时机由执行大脑掌握（进广告位后 / 步骤之间兜底）。
-- `tools/compile_cases.py` —— 把 `apps/<slug>/cases/*.yaml` 汇编进 `queue.csv`（幂等，保留运行时状态）。
 - `tools/init_target.py <包名>` —— 换被测 App 时，只给包名自动探测 `serial`/`app_version`/`main_activity`/`build`(debuggable 判定)/`db_name` 并生成/更新 `config/target.json`（默认只打印不落盘，`--write` 才写回；`app_name`/`app_version` 要人工核对再确认，见 `docs/gotchas.md`）。
-- `apps/<slug>/flows/flow_cut_save.sh` —— 示例：把一条用例编译成纯选择器的可执行流程，按 serial 参数化，可多设备并行。
-- `tools/sheets_sync.py` —— 把账本推到 Google Sheets。
-- `tools/doc_report.py` —— 把账本 + 证据截图渲染成一份 **Google Doc 图文报告**（指标概览 / 执行清单 + 状态追踪 / 结构覆盖 / 问题清单 / 内嵌截图 / 变更时间线）。用 OAuth（你本人授权），Doc 与截图都归你所有。
 - `apps/<slug>/cases/*.yaml` —— 用例定义；由 skill `adb-testcase-gen` 从一句话目标生成。`_TEMPLATE.yaml` 是通用字段模板；`CUT-CORE-01.yaml` 是唯一保留的 **MP3 Cutter 示例**（跑通给你看完整流程用的，换被测 App 时替换/删除，见下）。仓库定位是通用框架，不带完整业务用例集——本机可以写自己的 `apps/<slug>/cases/*.yaml`，`.gitignore` 里已经排除了一份体量较大的示例回归集（`regression.yaml`），避免真实业务内容混进框架库。
+- `apps/<slug>/flows/flow_cut_save.sh` —— 示例：把一条用例编译成纯选择器的可执行流程，按 serial 参数化，可多设备并行，由 skill `flow-freeze` 固化产出。
+- `docs/RUNBOOK.md` —— 执行大脑（Claude Code）在对话里探路/固化时的行动协议（**新会话先读它**）。
+
+**执行侧（桌面壳，日常回归走这条）**
+
+- `desktop/` —— Tauri2 + Vue3 桌面壳，可视化执行入口：Runner（场景库选 App/用例/设备 → 执行台批量跑，支持脚本自愈）、Evidence（证据查看器）、Boards（看板视图）、Overview（总览指标）、Cleanup（历史文件清理）、Resources（测试资源/文本资源管理）、RunHistory（执行记录回看）。见 `docs/structure.md` desktop 一节。
+- `tools/compile_cases.py` —— 把 `apps/<slug>/cases/*.yaml` 汇编进 `queue.csv`（幂等，保留运行时状态）。
+- `tools/run_flow.py` —— 固化脚本统一执行入口（自动计时 + attempt 隔离），桌面壳「执行选中」内部调用，不需要手敲。
+- `tools/auto_repair.py` —— 脚本自愈：`run_flow` 失败后交 claude 诊断、只改导航/健壮性、重跑（≤3 次），对应桌面壳「脚本自愈」开关。
+- `tools/judge_result.py` —— 把执行台一格终态（pass/healed/fail/app_defect/needs_human）确定性映射进账本（`通过`/`失败`/`需复核`），桌面壳收尾自动调。
+- `tools/case_issue.py` —— 结构化写一条问题到 `issues.csv`（转义 + upsert + ID 格式校验）。
+- `tools/issue_register.py` —— 收尾阶段对失败/需复核用例读证据、调 headless claude 写问题描述 + 查重，调 `case_issue.py` 落库；前缀由终态确定性映射（`decisions.md` #35），桌面壳收尾自动调。
+- `tools/sheets_sync.py` —— 把账本推到 Google Sheets，桌面壳收尾自动调。
+- `tools/doc_report.py` —— 把账本 + 证据截图渲染成一份 **Google Doc 图文报告**（指标概览 / 执行清单 + 状态追踪 / 结构覆盖 / 问题清单 / 内嵌截图 / 变更时间线），桌面壳收尾自动调。用 OAuth（你本人授权），Doc 与截图都归你所有。
 - `apps/<slug>/ledger/*.csv` —— 账本（运行时真值）。`queue.csv` 是**全量真值**（所有用例 + 运行时状态）；`board.csv` 是按 `config/target.json` 的 `scope` 从 queue 投影出的**本轮清单**（看板/报告只显示本轮范围，见「本轮回归范围」一节），其余 CSV 对应看板各 tab。**本机执行产物，不进 git**（多人协作会冲突，团队共享真值是 Sheet），fresh clone 先跑 `python3 tools/compile_cases.py` 从 `apps/<slug>/cases/*.yaml` 重新汇编（会一并生成 board.csv）。
-- `docs/RUNBOOK.md` —— 执行大脑的行动协议（**新会话先读它**）。
+
+**参考文档**
+
 - `docs/structure.md` / `docs/gotchas.md` / `docs/decisions.md` —— 结构、已知坑、架构决策。
 
 > ⚠️ Google Sheet 是**只读展示视图**（从 YAML 渲染）。要增删/改用例请在对话里说，由 Claude 改 `apps/<slug>/cases/*.yaml`；**别在表里手改**，会被下次同步覆盖。详见 `docs/decisions.md`。
@@ -35,10 +70,10 @@ AI 当测试工程师、用 ADB 驱动安卓模拟器的自动化测试框架。
 
 | 机制 | 怎么跑 | 特点 | 何时用 |
 |---|---|---|---|
-| **① 固化脚本** | `run_flow.py <ID> apps/<slug>/flows/xxx.sh` | 纯选择器、无 AI 逐屏推理，快、可多设备并行；自动计时 + 登记 | 已探通并固化过脚本、UI 没变 |
-| **② 主循环逐屏** | 用 `adbkit.py` 一屏屏 `ui→tap→shot→logscan` 探路 + 采证 | 慢但健壮，能应对没跑过 / UI 变了；也是固化脚本的来源 | `固化脚本` 列为空，或脚本跑挂要回退重探 |
+| **① 固化脚本** | 桌面壳「执行台」勾选 → 一键执行（内部调 `run_flow.py`，不需要手敲） | 纯选择器、无 AI 逐屏推理，快、可多设备并行；自动计时 + 登记 + 收尾链路自动跑 | 已探通并固化过脚本、UI 没变——**日常回归走这条** |
+| **② 主循环逐屏** | 对话里让 Claude Code 用 `adbkit.py` 一屏屏 `ui→tap→shot→logscan` 探路 + 采证 | 慢但健壮，能应对没跑过 / UI 变了；也是固化脚本的来源 | `固化脚本` 列为空（桌面壳里锁住显示"走主循环"），或脚本跑挂要回退重探 |
 
-> **硬规则**：跑固化脚本一律走 `run_flow.py`，绝不裸 `bash apps/<slug>/flows/xxx.sh`（否则 `log.csv`/`queue.csv` 不留痕）。无论哪种机制，通过/失败判定都要人工看 `output-check`/`logscan` 后补一行登记。
+> **硬规则**：固化脚本一律经 `run_flow.py` 跑（桌面壳「执行选中」已经这样做），绝不裸 `bash apps/<slug>/flows/xxx.sh`（否则 `log.csv`/`queue.csv` 不留痕）。①机制的通过/失败判定由固化脚本自身 exit 码确定性给出（不豁免已知缺陷，见 `decisions.md` #34），桌面壳「判定」按钮据此确定性映射，不再现场人工/AI 复判；②机制判定仍要人工看 `output-check`/`logscan` 后补一行登记。
 
 与「执行机制」正交的是**范围口径**（一次跑多少）：跑单条 / 跑本轮全部（从 board 范围内挑待执行，一条条到没有待执行为止——"待执行"以 `queue.csv` 实时状态为准）/ 重跑某条。「本轮」由 `scope` 框定，见下方「本轮回归范围」。
 
@@ -49,24 +84,30 @@ AI 当测试工程师、用 ADB 驱动安卓模拟器的自动化测试框架。
 cp config/target.example.json config/target.json
 #   编辑：package / db_name / （多设备时）serial / sheet_id / （可选）scope 本轮范围
 
-# 2. 连上模拟器，确认可用（App 需 debuggable 才能导 DB/SP）
+# 2. 连上模拟器/真机，确认可用（App 需 debuggable 才能导 DB/SP）
 adb devices
 python3 tools/adbkit.py devices
-
-# 3. 冒烟试一下手和眼
-python3 tools/adbkit.py launch
-python3 tools/adbkit.py --case SMOKE-01 ui  step1     # 打印控件树 + 存 XML
-python3 tools/adbkit.py --case SMOKE-01 shot step1
-
-# 4. 提供用例 → 写进 apps/<slug>/cases/*.yaml → 汇编进本机账本
-python3 tools/compile_cases.py
-
-# 5. 让 Claude Code 按 docs/RUNBOOK.md 跑主循环
-# 6. 同步云端看板（配好凭证后）
-python3 tools/sheets_sync.py
 ```
 
-> fresh clone（新机器/新协作者）注意：`apps/<slug>/ledger/`、`assets/`（除 README）、`config/target.json` 等凭证文件都不进 git，是每人本机自备/生成的。本机自备真实音频素材（见 `assets/README.md`）→ `bash seeds/push_media.sh <serial>` 推到设备 → `python3 tools/preflight.py` 自检就位。
+```
+# 3. 在对话里说测试目标（比如"帮我生成裁剪音频的用例"），触发 skill adb-testcase-gen
+#    Claude Code 会自己用 adbkit 探真机、把步骤/预期锚在真实控件上
+#    → 产出 apps/<slug>/cases/<id>.yaml
+
+# 4. 路径探通、判定标准定下来后，对话里说"固化这条用例"，触发 skill flow-freeze
+#    → 产出 apps/<slug>/flows/flow_*.sh
+```
+
+```bash
+# 5. 打开桌面壳执行（日常回归都走这里，不用再手敲 run_flow/sheets_sync/doc_report）
+cd desktop
+npm install          # 首次
+npm run tauri dev    # 开发模式；打包好的话直接开 .app / .exe
+#   首屏选/建活跃 App → 场景库勾用例+设备 → 执行台「执行选中」
+#   跑完自动收尾：判定 → 登记问题 → 同步 Google Sheets → 刷新 Google Doc（凭证配置见下）
+```
+
+> fresh clone（新机器/新协作者）注意：`apps/<slug>/ledger/`、`assets/`（除 README）、`config/target.json` 等凭证文件都不进 git，是每人本机自备/生成的。本机自备真实音频素材（见 `assets/README.md`）→ `bash seeds/push_media.sh <serial>` 推到设备 → `python3 tools/preflight.py` 自检就位。首次上手更详细的步骤看 `ONBOARDING.md`。
 
 ## 用例 ID 命名规则
 

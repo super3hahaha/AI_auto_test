@@ -46,7 +46,7 @@ async function onConfigured() {
 <template>
   <div class="app" v-if="ready">
     <aside class="nav">
-      <div class="brand">AI+ADB<br /><span class="muted">测试台</span></div>
+      <div class="brand">AI自动化<br /><span class="muted">测试台</span></div>
       <nav>
         <button
           v-for="n in nav"

@@ -28,7 +28,7 @@ CFG = load_cfg()                    # apps/<slug>/target.json（per-app）
 SA = ROOT / "config/service_account.json"     # 账号级凭证：共享
 
 sys.path.insert(0, str(ROOT / "tools"))
-from compile_cases import project_board_from_queue  # 复用 scope→board 投影
+from compile_cases import project_board_from_queue, build_summary  # 复用 scope→board 投影 + 摘要计数
 
 # CSV 文件名 → Sheet 里的 tab 名
 TAB_NAME = {
@@ -67,7 +67,7 @@ def _rgb(hex_):
 STYLE = {
     "board": {
         "freeze_cols": 3, "checkbox_col": 0,
-        "wide": {4: 190, 5: 360, 6: 150, 12: 260, 13: 200, 19: 260},
+        "wide": {4: 190, 5: 360, 6: 150, 12: 260, 13: 200},
         "cond": [
             (7, "CONTAINS", "P0", RED, True), (7, "CONTAINS", "P1", AMBER, False),
             (7, "CONTAINS", "P2", GRAY, False), (7, "CONTAINS", "P3", GRAY, False),
@@ -257,9 +257,12 @@ def main():
     gc = gspread.authorize(creds)
     sh = gc.open_by_key(sheet_id)
 
-    # 推送前重新投影：确保云端「测试队列」拿到最新的本轮 board（含实时状态）
-    _, scope_desc, board_ids = project_board_from_queue()
-    print(f"[sync] 本轮范围 {scope_desc} → board.csv 已刷新")
+    # 推送前重新投影：确保云端「测试队列」拿到最新的本轮 board（含实时状态）；同时重算
+    # summary.csv——只有 compile_cases.py 自己的 main() 会调 build_summary，桌面壳收尾链路
+    # 从不单独跑它，摘要 tab 会一直停在上次手动 compile 时的旧计数，同一个坑见 doc_report.py。
+    board_rows, scope_desc, board_ids = project_board_from_queue()
+    build_summary(board_rows, scope_desc)
+    print(f"[sync] 本轮范围 {scope_desc} → board.csv 已刷新，summary.csv 已同步重算")
 
     pushed = {}  # stem -> (sheet_id, ncols, nrows)
     for stem, tab in TAB_NAME.items():

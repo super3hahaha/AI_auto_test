@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, reactive, computed, onMounted, onUnmounted, watch } from "vue";
-import { api, fileSrc, type EvidenceRow, type RunRow } from "../api";
+import { api, fileSrc, type EvidenceRow } from "../api";
 import { store } from "../store";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
@@ -21,20 +21,12 @@ function toggleCase(serial: string, c: string) {
   }
 }
 const currentIndex = ref(0); // 用下标而非 path 作选中标识——evidence.csv 同路径可重复出现（重跑追加行，decisions #23），path 不唯一会导致方向键卡住
-const onlyKey = ref(false);
+const onlyFail = ref(false);
 const typeFilter = ref<"all" | "image" | "text">("all");
 const textCache = ref<Record<string, string>>({});
 
-// 批次按看板(sheet_id)分组
-const grouped = computed(() => {
-  const m = new Map<string, { title: string; runs: RunRow[] }>();
-  for (const r of store.runs) {
-    const g = m.get(r.sheet_id) || { title: r.title || r.sheet_id || "(无标题)", runs: [] };
-    g.runs.push(r);
-    m.set(r.sheet_id, g);
-  }
-  return [...m.values()];
-});
+// 按 run_id（YYYYMMDD-HHMM，可直接字符串比较）倒序，最新的批次排最前
+const sortedRuns = computed(() => [...store.runs].sort((a, b) => b.run_id.localeCompare(a.run_id)));
 
 async function loadEvidence() {
   if (!store.selectedRunId) return;
@@ -53,7 +45,7 @@ async function loadEvidence() {
 }
 
 function pass(r: EvidenceRow) {
-  if (onlyKey.value && !r.is_key) return false;
+  if (onlyFail.value && r.result !== "失败") return false;
   if (typeFilter.value === "image" && !r.is_image) return false;
   if (typeFilter.value === "text" && r.is_image) return false;
   return true;
@@ -174,7 +166,7 @@ function onKey(e: KeyboardEvent) {
 
 watch([selDevice, selCase], () => pickFirst());
 // 筛选变化可能让当前选中的设备+用例没证据了，回落一下再重置游标
-watch([onlyKey, typeFilter], () => {
+watch([onlyFail, typeFilter], () => {
   ensureSelection();
   pickFirst();
 });
@@ -214,11 +206,9 @@ const selRun = computed(() => store.selectedRun());
       <div class="sel">
         <label class="muted">执行批次</label>
         <select v-model="store.selectedRunId">
-          <optgroup v-for="g in grouped" :key="g.title" :label="g.title">
-            <option v-for="r in g.runs" :key="r.run_id" :value="r.run_id">
-              {{ r.run_id }}{{ r.is_current ? "（当前）" : "" }} · {{ r.date }}
-            </option>
-          </optgroup>
+          <option v-for="r in sortedRuns" :key="r.run_id" :value="r.run_id">
+            {{ r.run_id }}{{ r.is_current ? "（当前）" : "" }} · {{ r.date }}
+          </option>
         </select>
       </div>
       <div class="links" v-if="selRun">
@@ -279,7 +269,7 @@ const selRun = computed(() => store.selectedRun());
             <button :class="{ on: typeFilter === 'image' }" @click="typeFilter = 'image'">截图</button>
             <button :class="{ on: typeFilter === 'text' }" @click="typeFilter = 'text'">文本</button>
           </div>
-          <label class="chk"><input type="checkbox" v-model="onlyKey" />只看关键</label>
+          <label class="chk"><input type="checkbox" v-model="onlyFail" />只看失败</label>
         </div>
       </div>
 

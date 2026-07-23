@@ -31,6 +31,7 @@ function viewEvidence(r: RunRow) {
           <td class="small">{{ r.title }}</td>
           <td class="right">
             <a v-if="r.url" @click="openUrl(r.url)">Sheet ↗</a>
+            <a v-if="r.doc_url" @click="openUrl(r.doc_url)">Doc ↗</a>
             <button @click="viewEvidence(r)">查看证据</button>
           </td>
         </tr>

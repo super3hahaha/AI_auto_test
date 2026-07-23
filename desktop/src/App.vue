@@ -5,16 +5,19 @@ import Setup from "./views/Setup.vue";
 import Overview from "./views/Overview.vue";
 import Devices from "./views/Devices.vue";
 import Runner from "./views/Runner.vue";
+import Resources from "./views/Resources.vue";
 import Evidence from "./views/Evidence.vue";
 import Boards from "./views/Boards.vue";
+import Cleanup from "./views/Cleanup.vue";
 
-type View = "overview" | "devices" | "runner" | "evidence" | "boards" | "setup";
-const active = ref<View>("evidence");
+type View = "overview" | "devices" | "runner" | "resources" | "evidence" | "boards" | "cleanup" | "setup";
+const active = ref<View>("runner");
 const ready = ref(false);
 
 const nav: { key: View; label: string }[] = [
   { key: "overview", label: "概览" },
   { key: "devices", label: "设备" },
+  { key: "resources", label: "资源库" },
   { key: "runner", label: "执行台" },
   { key: "evidence", label: "证据" },
   { key: "boards", label: "看板" },
@@ -27,8 +30,6 @@ onMounted(async () => {
   } else {
     await store.loadApps();
     await store.loadRuns();
-    // 还没注册任何被测 App → 引导去执行台上传 APK
-    if (!store.apps.length) active.value = "runner";
   }
   ready.value = true;
 });
@@ -36,25 +37,16 @@ onMounted(async () => {
 async function onConfigured() {
   await store.loadApps();
   await store.loadRuns();
-  active.value = store.apps.length ? "evidence" : "runner";
+  active.value = "runner";
 }
 
-async function onSwitchApp(e: Event) {
-  const slug = (e.target as HTMLSelectElement).value;
-  await store.setActive(slug);
-}
+
 </script>
 
 <template>
   <div class="app" v-if="ready">
     <aside class="nav">
       <div class="brand">AI+ADB<br /><span class="muted">测试台</span></div>
-      <div class="appsel" v-if="store.cfg?.configured && store.apps.length">
-        <label class="muted">当前 App</label>
-        <select :value="store.activeSlug" @change="onSwitchApp">
-          <option v-for="a in store.apps" :key="a.slug" :value="a.slug">{{ a.slug }}</option>
-        </select>
-      </div>
       <nav>
         <button
           v-for="n in nav"
@@ -68,6 +60,14 @@ async function onSwitchApp(e: Event) {
         </button>
       </nav>
       <div class="nav-foot">
+        <button
+          class="navitem"
+          :class="{ on: active === 'cleanup' }"
+          :disabled="!store.cfg?.configured"
+          @click="active = 'cleanup'"
+        >
+          清理
+        </button>
         <button class="navitem" :class="{ on: active === 'setup' }" @click="active = 'setup'">
           设置
         </button>
@@ -82,8 +82,10 @@ async function onSwitchApp(e: Event) {
         <Overview v-if="active === 'overview'" />
         <Devices v-else-if="active === 'devices'" />
         <Runner v-else-if="active === 'runner'" />
+        <Resources v-else-if="active === 'resources'" />
         <Evidence v-else-if="active === 'evidence'" />
         <Boards v-else-if="active === 'boards'" @view-evidence="active = 'evidence'" />
+        <Cleanup v-else-if="active === 'cleanup'" />
       </keep-alive>
     </main>
   </div>
@@ -95,7 +97,7 @@ async function onSwitchApp(e: Event) {
   height: 100vh;
 }
 .nav {
-  width: 132px;
+  width: 108px;
   flex-shrink: 0;
   background: var(--surface-1);
   border-right: 0.5px solid var(--border);
@@ -112,20 +114,6 @@ async function onSwitchApp(e: Event) {
 .brand .muted {
   font-size: 12px;
   font-weight: 400;
-}
-.appsel {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-  padding: 0 8px 14px;
-}
-.appsel label {
-  font-size: 11px;
-}
-.appsel select {
-  width: 100%;
-  font-size: 12px;
-  padding: 4px 6px;
 }
 nav {
   display: flex;
@@ -150,6 +138,9 @@ nav {
 }
 .nav-foot {
   margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
 .content {
   flex: 1;

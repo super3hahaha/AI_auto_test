@@ -1,16 +1,21 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onActivated, watch } from "vue";
-import { api, type FlowRow, type DeviceRow, type ApkInfo, type ResourceFile, type TextResource } from "../api";
+import { ref, reactive, computed, onMounted, onActivated, watch } from "vue";
+import { confirm, message } from "@tauri-apps/plugin-dialog";
+import { api, type FlowRow, type DeviceRow, type ApkInfo, type ApkVersionInfo } from "../api";
 import { store } from "../store";
 import { runStore } from "../runStore";
 import RunMonitor from "./RunMonitor.vue";
+import RunHistory from "./RunHistory.vue";
 
 // keep-alive 精确保活本组件（App.vue <keep-alive include="Runner">），切走 tab 不销毁选择状态。
 // 运行状态本身放模块级 runStore（跨组件/跨子 tab 共享、独立于组件生命周期），本组件只管选择 UI + 触发编排。
 defineOptions({ name: "Runner" });
 
-// 子 tab：场景库（选择）/ 执行台（实时监控）/ 资源库（文件 + 文本资源登记）
-const subTab = ref<"library" | "monitor" | "resources">("library");
+// 子 tab：场景库（选择）/ 执行台（实时监控）/ 执行记录（保存的历史快照）——资源库已提升为侧栏一级入口（views/Resources.vue）
+const subTab = ref<"library" | "monitor" | "history">("library");
+// 切到「执行记录」子 tab 时刷新列表（Runner 被 keep-alive 保活，子 tab 用 v-show 不会触发子组件生命周期）
+const historyRef = ref<InstanceType<typeof RunHistory> | null>(null);
+watch(subTab, (v) => { if (v === "history") historyRef.value?.reload(); });
 
 // ── 中栏：当前 App 的用例/固化脚本 ──
 const flows = ref<FlowRow[]>([]);
@@ -26,12 +31,79 @@ const confirmNewBoard = ref(false);
 const frozen = computed(() => flows.value.filter((f) => f.has_flow));
 const nonFrozen = computed(() => flows.value.filter((f) => !f.has_flow));
 
-// 优先级配色：P0 最紧急(danger) > P1(warning) > P2/P3(muted)
+// 优先级配色：P0(danger) > P1(warning) > P2(accent，浅蓝区分于 P3) > P3(muted)
 function priorityPill(p: string) {
   if (p === "P0") return "pill-danger";
   if (p === "P1") return "pill-warning";
+  if (p === "P2") return "pill-accent";
   return "pill-muted";
 }
+
+// 全选/取消全选：只对固化用例生效（非固化用例本来就锁着不可勾）
+function selectAllCases() {
+  pickedCases.value = frozen.value.map((f) => f.case_id);
+}
+function clearAllCases() {
+  pickedCases.value = [];
+}
+
+// 区间选择：先勾选两个（不必相邻的）用例作为起止点，再点这个按钮，
+// 把它们在列表中之间的所有用例一并选中（含端点），已勾选的其它用例不受影响。
+function selectRange() {
+  const idxs = pickedCases.value
+    .map((id) => frozen.value.findIndex((f) => f.case_id === id))
+    .filter((i) => i >= 0);
+  if (idxs.length < 2) {
+    err.value = "区间选择需先勾选至少两个用例作为起止点";
+    return;
+  }
+  const lo = Math.min(...idxs);
+  const hi = Math.max(...idxs);
+  const ids = frozen.value.slice(lo, hi + 1).map((f) => f.case_id);
+  const set = new Set(pickedCases.value);
+  ids.forEach((id) => set.add(id));
+  pickedCases.value = Array.from(set);
+}
+
+// 用例条目悬停提示：steps/expected 编号列出，供快速预览用例内容而不必打开 yaml。
+// 用自绘浮层而非原生 title（原生 tooltip 是系统灰底，跟应用配色不搭）；悬停满 2 秒才弹出，避免扫视列表时框到处闪。
+const HOVER_DELAY = 2000;
+const HIDE_GRACE = 150; // 离开条目到落到浮层上之间留的缓冲，否则鼠标一移到浮层上就先被 mouseleave 关掉了
+const hoverTip = ref<{ x: number; y: number; f: FlowRow } | null>(null);
+let hoverTimer: ReturnType<typeof setTimeout> | undefined;
+let hideTimer: ReturnType<typeof setTimeout> | undefined;
+let pendingPos = { x: 0, y: 0 };
+function showTip(e: MouseEvent, f: FlowRow) {
+  clearTimeout(hideTimer);
+  if (!f.steps.length && !f.expected.length) return;
+  clearTimeout(hoverTimer);
+  pendingPos = { x: e.clientX, y: e.clientY };
+  hoverTimer = setTimeout(() => {
+    // 弹出后位置定住不再跟手，方便把鼠标移进浮层里滚动
+    hoverTip.value = { x: pendingPos.x, y: pendingPos.y, f };
+  }, HOVER_DELAY);
+}
+function moveTip(e: MouseEvent) {
+  pendingPos = { x: e.clientX, y: e.clientY };
+}
+function hideTip() {
+  clearTimeout(hoverTimer);
+  hideTimer = setTimeout(() => { hoverTip.value = null; }, HIDE_GRACE);
+}
+function cancelHide() {
+  clearTimeout(hideTimer);
+}
+const tipStyle = computed(() => {
+  if (!hoverTip.value) return {};
+  const pad = 18;
+  const maxW = 620;
+  const maxH = 520;
+  let left = hoverTip.value.x + pad;
+  let top = hoverTip.value.y + pad;
+  if (left + maxW > window.innerWidth) left = Math.max(8, hoverTip.value.x - maxW - pad);
+  if (top + maxH > window.innerHeight) top = Math.max(8, window.innerHeight - maxH - 8);
+  return { left: `${left}px`, top: `${top}px` };
+});
 
 async function loadFlows() {
   if (!store.activeSlug) { flows.value = []; return; }
@@ -64,7 +136,11 @@ async function loadAll() {
 
 // 「▶ 执行选中」→ 校验 → 跳到执行台 tab → 交给 runStore 串行编排（for 设备 × for 用例）
 function runSelected() {
-  if (runStore.running) return;
+  // 收尾阶段（sync_sheets/doc_report）跑完前禁止开新一轮：它们跑完会把当前 doc_id 写回
+  // target.json，若这时用户已经手动/自动开了新一轮（尤其「新建看板」会先建一份新 Doc、
+  // 也回写 target.json），旧一轮收尾晚完成的那次写入会把新 Doc 的 doc_id 覆盖回旧的——
+  // 线上明明刷新成功，desktop 却把指针指回了上一轮的 Doc。见 docs/gotchas.md 对应条目。
+  if (runStore.running || runStore.syncing || runStore.docGenerating) return;
   if (!store.activeSlug) { err.value = "请先在左栏选一个 App"; return; }
   const cases = frozen.value.filter((f) => pickedCases.value.includes(f.case_id));
   if (!cases.length) { err.value = "中栏请至少勾选一个固化用例"; return; }
@@ -80,14 +156,21 @@ function launch(newBoard: boolean) {
     .filter((f) => pickedCases.value.includes(f.case_id))
     .map((f) => ({ case_id: f.case_id, script: f.script, module: f.module }));
   subTab.value = "monitor"; // 立即跳到执行台看实时过程
+  // 选了某个留存版本 → 执行前先在每台设备上强制重装这个版本（不管设备当前是不是已经是它）
+  const slug = store.activeSlug;
+  const ver = selectedVersion[slug];
+  const apkPath = ver ? appVersions[slug]?.find((v) => v.version === ver)?.path : undefined;
+  const pkg = store.activeApp()?.package;
   runStore
     .start({
-      slug: store.activeSlug,
+      slug,
       cases,
       serials: [...pickedSerials.value],
       brain: brainMode.value,
       newBoard,
-      title: `${store.activeSlug} · ${cases.length} 用例 × ${pickedSerials.value.length} 设备`,
+      title: `${slug} · ${cases.length} 用例 × ${pickedSerials.value.length} 设备${ver ? ` · ${ver}` : ""}`,
+      apkPath: apkPath && pkg ? apkPath : undefined,
+      package: apkPath && pkg ? pkg : undefined,
     })
     .then(() => loadFlows()); // 跑完刷新用例列表拿最新 last_result
 }
@@ -117,7 +200,12 @@ async function chooseApk() {
     if (!p) return;
     apkPath.value = p;
     apkInfo.value = await api.probeApk(p);
-    slugEdit.value = apkInfo.value.suggested_slug;
+    // 同包名之前注册过就沿用那次的 slug（可能有多条，取最近更新的一条），
+    // 而不是每次都从 APK label 重新拆一个新 slug 出来
+    const prior = store.apps
+      .filter((a) => a.package === apkInfo.value!.package)
+      .sort((a, b) => b.updated_at - a.updated_at)[0];
+    slugEdit.value = prior ? prior.slug : apkInfo.value.suggested_slug;
   } catch (e: any) {
     uploadErr.value = String(e);
     apkInfo.value = null;
@@ -129,22 +217,25 @@ async function doUpload() {
   const slug = slugEdit.value.trim();
   if (!apkInfo.value || !apkPath.value) { uploadErr.value = "先选一个 APK"; return; }
   if (!slug) { uploadErr.value = "slug 不能为空"; return; }
-  if (!uploadSerials.value.length) { uploadErr.value = "至少选一台设备装机"; return; }
   uploading.value = true;
   uploadStatus.value = "";
   uploadLog.value = [];
   try {
-    // 1) 逐台装机
+    // 1) 装到勾选的设备（可选；不勾就跳过，直接注册——前提是这个包已经装在某台在线设备上）
     for (const serial of uploadSerials.value) {
       uploadLog.value.push(`$ adb -s ${serial} install -r ${apkPath.value}`);
       const code = await api.installApk(apkPath.value, apkInfo.value.package, serial, (l) => uploadLog.value.push(l));
       if (code !== 0) { uploadStatus.value = `✖ 装机失败（${serial}，exit ${code}）`; uploading.value = false; return; }
     }
-    // 2) 用第一台已装设备注册（init_target.py + 补 app_slug + 建工作区）
-    const primary = uploadSerials.value[0];
-    uploadLog.value.push(`$ AITEST_APP=${slug} python3 tools/init_target.py ${apkInfo.value.package} --serial ${primary} --write`);
+    // 2) 注册（init_target.py + 补 app_slug + 建工作区）：勾了设备用第一台探测；没勾就留空，
+    // 只有一台在线设备时后端会自动选中它，多台在线又没勾选会报错提示用 --serial 指定。
+    const primary = uploadSerials.value[0] || "";
+    uploadLog.value.push(`$ AITEST_APP=${slug} python3 tools/init_target.py ${apkInfo.value.package}${primary ? ` --serial ${primary}` : ""} --write`);
     const code = await api.registerApp(slug, apkInfo.value.package, primary, (l) => uploadLog.value.push(l));
     if (code !== 0) { uploadStatus.value = `✖ 注册失败（exit ${code}）`; uploading.value = false; return; }
+    // 留存这个版本的 apk 文件，供以后同 slug 下多版本切换执行时直接装机用
+    await api.saveApkVersion(slug, apkPath.value, apkInfo.value.version || "unknown");
+    delete appVersions[slug]; // 清缓存，下次展开重新拉取（带上刚存的这个版本）
     uploadStatus.value = `✔ 已注册并选中 ${slug}`;
     await store.loadApps();
     await store.setActive(slug);
@@ -156,128 +247,77 @@ async function doUpload() {
   }
 }
 
-// ── 左栏底部：测试资源（assets/，所有 App 共用；固化脚本用相对路径 assets/<文件名> 引用）──
-const resourceFiles = ref<ResourceFile[]>([]);
-const resErr = ref("");
-const uploadingRes = ref(false);
-
-async function loadResources() {
-  try {
-    resourceFiles.value = await api.listResourceFiles();
-  } catch (e: any) {
-    resErr.value = String(e);
-  }
-}
-
-function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
-}
-
-async function uploadResource() {
-  resErr.value = "";
-  try {
-    const p = await api.pickResourceFile();
-    if (!p) return;
-    uploadingRes.value = true;
-    await api.uploadResourceFile(p);
-    await loadResources();
-  } catch (e: any) {
-    resErr.value = String(e);
-  } finally {
-    uploadingRes.value = false;
-  }
-}
-
-async function removeResource(name: string) {
-  resErr.value = "";
-  try {
-    await api.deleteResourceFile(name);
-    await loadResources();
-  } catch (e: any) {
-    resErr.value = String(e);
-  }
-}
-
-// ── 资源库右栏：文本资源（config/text_resources.json，key-value，固化脚本按 key 取值）──
-const textResources = ref<TextResource[]>([]);
-const textErr = ref("");
-const newKey = ref("");
-const newValue = ref("");
-const savingText = ref(false);
-
-async function loadTextResources() {
-  try {
-    textResources.value = await api.listTextResources();
-  } catch (e: any) {
-    textErr.value = String(e);
-  }
-}
-
-async function addTextResource() {
-  textErr.value = "";
-  const key = newKey.value.trim();
-  if (!key) { textErr.value = "key 不能为空"; return; }
-  savingText.value = true;
-  try {
-    await api.upsertTextResource(key, newValue.value);
-    newKey.value = "";
-    newValue.value = "";
-    await loadTextResources();
-  } catch (e: any) {
-    textErr.value = String(e);
-  } finally {
-    savingText.value = false;
-  }
-}
-
-async function editTextResource(item: TextResource, value: string) {
-  textErr.value = "";
-  try {
-    await api.upsertTextResource(item.key, value);
-    await loadTextResources();
-  } catch (e: any) {
-    textErr.value = String(e);
-  }
-}
-
-async function removeTextResource(key: string) {
-  textErr.value = "";
-  try {
-    await api.deleteTextResource(key);
-    await loadTextResources();
-  } catch (e: any) {
-    textErr.value = String(e);
-  }
-}
-
 function selectApp(slug: string) {
   if (slug === store.activeSlug) return;
   store.setActive(slug).then(loadAll);
 }
 
+// ── App 库折叠树：同 slug 下留存的多版本 APK（apps/<slug>/apks/*.apk）──
+// 懒加载：第一次展开某个 App 才去查它的版本列表，查过就缓存，不用一次性把所有 App 的版本都拉一遍。
+const expandedApps = reactive(new Set<string>());
+const appVersions = reactive<Record<string, ApkVersionInfo[]>>({});
+// slug -> 用户手动点选的版本。不点选就一直是 undefined——展示用 a.app_version（上次上传注册时探测到的版本）、
+// 执行时也不强制重装，都走老逻辑。只有显式点了某个版本行，这两处才会跟着切换到点选的那个版本。
+const selectedVersion = reactive<Record<string, string>>({});
+
+async function toggleAppExpand(slug: string) {
+  if (expandedApps.has(slug)) { expandedApps.delete(slug); return; }
+  expandedApps.add(slug);
+  if (!appVersions[slug]) {
+    try {
+      const versions = await api.listApkVersions(slug);
+      appVersions[slug] = versions; // 仅供选择列表用；不自动预选，选不选是用户的事
+    } catch (e: any) {
+      err.value = String(e);
+    }
+  }
+}
+
+function pickVersion(slug: string, version: string) {
+  selectedVersion[slug] = version;
+  if (slug !== store.activeSlug) selectApp(slug);
+}
+
+function fmtSize(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+async function removeApp(slug: string) {
+  const ok = await confirm(`会移出 App 库（用例/固化脚本/执行账本一起挪走），不是硬删除，挪进 apps/.trash/ 回收站，手滑了可以手动挪回来。`, {
+    title: `确认删除 App「${slug}」的注册？`,
+    kind: "warning",
+  });
+  if (!ok) return;
+  try {
+    const trashPath = await store.deleteApp(slug);
+    await message(`已挪进回收站：\n${trashPath}\n\n手滑误删的话，把这个目录挪到 apps/ 下并改名回「${slug}」即可恢复。`, {
+      title: "已删除",
+    });
+    await loadAll();
+  } catch (e: any) {
+    err.value = String(e);
+  }
+}
+
 watch(() => store.activeSlug, () => { pickedCases.value = []; loadAll(); });
-onMounted(() => { loadAll(); loadResources(); loadTextResources(); });
+onMounted(() => { loadAll(); });
 // keep-alive 保活后切回本 tab 时刷新设备/用例列表；正在执行则不动，避免打断在跑的任务与日志。
-onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTextResources(); } });
+onActivated(() => { if (!runStore.running) loadAll(); });
 </script>
 
 <template>
   <div class="runner">
     <div class="subtabs">
       <button class="stab" :class="{ on: subTab === 'library' }" @click="subTab = 'library'">场景库</button>
-      <button class="stab" :class="{ on: subTab === 'resources' }" @click="subTab = 'resources'">资源库</button>
       <button class="stab" :class="{ on: subTab === 'monitor' }" @click="subTab = 'monitor'">
         执行台<span v-if="runStore.running" class="live-dot" title="正在执行" />
       </button>
+      <button class="stab" :class="{ on: subTab === 'history' }" @click="subTab = 'history'">执行记录</button>
     </div>
 
     <!-- ══════ 场景库：选择 App / 用例 / 设备 / 看板 + 执行 ══════ -->
     <div v-show="subTab === 'library'" class="library">
-    <p class="muted sub">
-      只跑固化脚本，一律经 <span class="mono">run_flow.py</span>（自动登记账本）。判定与关键证据升级仍在 Claude Code 做。
-    </p>
     <div v-if="err" class="err">{{ err }}</div>
 
     <div class="cols">
@@ -292,18 +332,36 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
             <div v-if="!store.apps.length" class="muted empty-hint">
               还没有被测 App。点「上传 APK」注册第一个。
             </div>
-            <div
-              v-for="a in store.apps"
-              :key="a.slug"
-              class="app-item"
-              :class="{ on: a.slug === store.activeSlug }"
-              @click="selectApp(a.slug)"
-            >
-              <div class="app-name">
-                {{ a.slug }}
-                <span v-if="a.slug === store.activeSlug" class="dot">●</span>
+            <div v-for="a in store.apps" :key="a.slug" class="app-group">
+              <div
+                class="app-item"
+                :class="{ on: a.slug === store.activeSlug }"
+                @click="selectApp(a.slug)"
+              >
+                <span class="app-caret" @click.stop="toggleAppExpand(a.slug)">{{ expandedApps.has(a.slug) ? "▾" : "▸" }}</span>
+                <div class="app-main">
+                  <div class="app-name">
+                    {{ a.slug }}
+                    <span v-if="a.slug === store.activeSlug" class="dot">●</span>
+                    <button class="app-del" title="删除此 App" @click.stop="removeApp(a.slug)">✕</button>
+                  </div>
+                  <div class="app-sub muted">{{ selectedVersion[a.slug] || a.app_version || "—" }} · {{ a.package }}</div>
+                </div>
               </div>
-              <div class="app-sub muted">{{ a.app_version || "—" }} · {{ a.package }}</div>
+              <div v-if="expandedApps.has(a.slug)" class="app-version-list">
+                <div v-if="!appVersions[a.slug]?.length" class="muted app-version-empty">还没有留存的 APK 版本</div>
+                <div
+                  v-for="v in appVersions[a.slug]"
+                  :key="v.version"
+                  class="app-version-item"
+                  :class="{ on: selectedVersion[a.slug] === v.version }"
+                  @click="pickVersion(a.slug, v.version)"
+                  :title="`执行时先在设备上强制重装此版本`"
+                >
+                  <span class="mono">{{ v.version }}</span>
+                  <span class="muted app-version-size">{{ fmtSize(v.size) }}</span>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -313,11 +371,23 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
       <div class="col case-col card">
         <div class="col-hd">
           <span>用例（{{ store.activeSlug || "未选 App" }}）</span>
-          <button class="sm" @click="loadFlows">刷新</button>
+          <div class="case-toolbar">
+            <button class="sm" @click="selectAllCases">全选</button>
+            <button class="sm" @click="selectRange">区间选择</button>
+            <button class="sm" @click="clearAllCases">取消全选</button>
+            <button class="sm" @click="loadFlows">刷新</button>
+          </div>
         </div>
         <div class="col-body">
           <template v-if="frozen.length">
-            <label v-for="f in frozen" :key="f.case_id" class="case-item">
+            <label
+              v-for="f in frozen"
+              :key="f.case_id"
+              class="case-item"
+              @mouseenter="showTip($event, f)"
+              @mousemove="moveTip"
+              @mouseleave="hideTip"
+            >
               <input type="checkbox" :value="f.case_id" v-model="pickedCases" />
               <span class="case-id mono">{{ f.case_id }}</span>
               <span class="case-mod muted">{{ f.module }}</span>
@@ -329,7 +399,14 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
 
           <template v-if="nonFrozen.length">
             <div class="divider muted">非固化用例（锁，走主循环）</div>
-            <div v-for="f in nonFrozen" :key="f.case_id" class="case-item locked">
+            <div
+              v-for="f in nonFrozen"
+              :key="f.case_id"
+              class="case-item locked"
+              @mouseenter="showTip($event, f)"
+              @mousemove="moveTip"
+              @mouseleave="hideTip"
+            >
               <input type="checkbox" disabled />
               <span class="case-id mono">{{ f.case_id }}</span>
               <span class="case-mod muted">{{ f.module }}</span>
@@ -338,6 +415,18 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
               <span class="pill pill-muted sm">Claude Code</span>
             </div>
           </template>
+        </div>
+      </div>
+
+      <!-- 用例悬停浮层：steps/expected 编号列表，定位在弹出那一刻的鼠标位置附近 -->
+      <div v-if="hoverTip" class="case-tip" :style="tipStyle" @mouseenter="cancelHide" @mouseleave="hideTip">
+        <div v-if="hoverTip.f.steps.length" class="tip-sec">
+          <div class="tip-hd">步骤</div>
+          <ol><li v-for="(s, i) in hoverTip.f.steps" :key="i">{{ s }}</li></ol>
+        </div>
+        <div v-if="hoverTip.f.expected.length" class="tip-sec">
+          <div class="tip-hd">预期</div>
+          <ol><li v-for="(s, i) in hoverTip.f.expected" :key="i">{{ s }}</li></ol>
         </div>
       </div>
 
@@ -373,8 +462,12 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
               <span class="muted brain-sub">失败时 Claude 接管：诊断→只改导航/健壮性→重跑（至多 3 次）。判为 App 缺陷则停。</span>
             </span>
           </label>
-          <button class="primary run-btn" :disabled="runStore.running" @click="runSelected">
-            {{ runStore.running ? "执行中…" : "▶ 执行选中" }}
+          <button
+            class="primary run-btn"
+            :disabled="runStore.running || runStore.syncing || runStore.docGenerating"
+            @click="runSelected"
+          >
+            {{ runStore.running ? "执行中…" : (runStore.syncing || runStore.docGenerating) ? "收尾中…（同步/刷新Doc）" : "▶ 执行选中" }}
           </button>
         </div>
       </div>
@@ -382,69 +475,14 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
 
     </div><!-- /场景库 -->
 
-    <!-- ══════ 资源库：文件资源 + 文本资源（key-value），所有 App 共用 ══════ -->
-    <div v-show="subTab === 'resources'" class="resources">
-      <p class="muted sub">
-        文件资源存到 <span class="mono">assets/</span>，固化脚本用文件名引用；文本资源存到
-        <span class="mono">config/text_resources.json</span>，固化脚本用 key 取值（<span class="mono">tools/_appctx.py</span> 的
-        <span class="mono">get_text_resource(key)</span>）。
-      </p>
-      <div class="res-cols">
-        <!-- ── 左：文件资源 ── -->
-        <div class="col card resbox">
-          <div class="col-hd">
-            <span>文件</span>
-            <div class="hd-actions">
-              <button class="sm" @click="loadResources">刷新</button>
-              <button class="primary sm" :disabled="uploadingRes" @click="uploadResource">+ 上传文件</button>
-            </div>
-          </div>
-          <div class="col-body">
-            <div v-if="resErr" class="err">{{ resErr }}</div>
-            <div v-if="!resourceFiles.length" class="muted empty-hint">
-              还没有素材文件。上传后存到项目 <span class="mono">assets/</span> 目录，固化脚本按文件名引用。
-            </div>
-            <div v-for="f in resourceFiles" :key="f.name" class="res-item">
-              <span class="mono res-name" :title="f.name">{{ f.name }}</span>
-              <span class="muted res-size">{{ formatSize(f.size) }}</span>
-              <button class="sm danger" title="删除" @click="removeResource(f.name)">✕</button>
-            </div>
-          </div>
-        </div>
-
-        <!-- ── 右：文本资源（key-value）── -->
-        <div class="col card textbox">
-          <div class="col-hd">
-            <span>文本</span>
-            <button class="sm" @click="loadTextResources">刷新</button>
-          </div>
-          <div class="col-body">
-            <div v-if="textErr" class="err">{{ textErr }}</div>
-            <div class="kv-new">
-              <input v-model="newKey" class="kv-key mono" placeholder="key" @keyup.enter="addTextResource" />
-              <input v-model="newValue" class="kv-val mono" placeholder="value" @keyup.enter="addTextResource" />
-              <button class="primary sm" :disabled="savingText" @click="addTextResource">+ 新建</button>
-            </div>
-            <div v-if="!textResources.length" class="muted empty-hint">
-              还没有文本资源。新建后固化脚本可按 key 取值。
-            </div>
-            <div v-for="t in textResources" :key="t.key" class="kv-item">
-              <span class="mono kv-key-label" :title="t.key">{{ t.key }}</span>
-              <input
-                class="kv-val-input mono"
-                :value="t.value"
-                @change="editTextResource(t, ($event.target as HTMLInputElement).value)"
-              />
-              <button class="sm danger" title="删除" @click="removeTextResource(t.key)">✕</button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div><!-- /资源库 -->
-
     <!-- ══════ 执行台：实时监控（矩阵 + 进度 + 过程 + 中止）══════ -->
     <div v-show="subTab === 'monitor'" class="monitor-wrap">
       <RunMonitor />
+    </div>
+
+    <!-- ══════ 执行记录：完整跑完（未中止）的历史执行台快照，按 run 记录切换回看 ══════ -->
+    <div v-show="subTab === 'history'" class="monitor-wrap">
+      <RunHistory ref="historyRef" />
     </div>
 
     <!-- 新建看板二次确认 -->
@@ -466,7 +504,7 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
     <!-- 上传 APK 模态 -->
     <div v-if="uploadOpen" class="overlay">
       <div class="dialog card upload">
-        <div class="dtitle">上传 APK = 注册被测 App + 装机</div>
+        <div class="dtitle">上传 APK = 注册被测 App（装机可选）</div>
         <div class="up-row">
           <button @click="chooseApk">选择 APK…</button>
           <span class="mono small path">{{ apkPath || "（未选）" }}</span>
@@ -482,7 +520,7 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
             <input v-model="slugEdit" class="slug-input mono" />
           </div>
           <div class="up-dev">
-            <div class="muted small">装到哪些设备（第一台用于注册探测）</div>
+            <div class="muted small">装到哪些设备（可不选；不选则跳过装机直接注册，仅当该包已装在某台在线设备上时可行——只有一台在线会自动用它探测，多台在线且不选会报错）</div>
             <div v-if="!devices.length" class="muted small">无在线设备。</div>
             <label v-for="d in devices" :key="d.serial" class="dev-item">
               <input type="checkbox" :value="d.serial" v-model="uploadSerials" :disabled="d.state !== 'device'" />
@@ -499,7 +537,7 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
         <div class="dactions">
           <button @click="uploadOpen = false">关闭</button>
           <button class="primary" :disabled="uploading || !apkInfo" @click="doUpload">
-            {{ uploading ? "处理中…" : "装机并注册" }}
+            {{ uploading ? "处理中…" : (uploadSerials.length ? "装机并注册" : "仅注册") }}
           </button>
         </div>
       </div>
@@ -510,7 +548,6 @@ onActivated(() => { if (!runStore.running) { loadAll(); loadResources(); loadTex
 <style scoped>
 .runner { display: flex; flex-direction: column; height: 100%; }
 h2 { margin: 0; font-weight: 500; }
-.sub { margin: 4px 0 10px; }
 
 /* 子 tab */
 .subtabs { display: flex; gap: 4px; margin-bottom: 12px; border-bottom: 0.5px solid var(--border); }
@@ -520,18 +557,6 @@ h2 { margin: 0; font-weight: 500; }
 .live-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--text-accent); margin-left: 6px; vertical-align: middle; animation: livepulse 1.2s infinite; }
 @keyframes livepulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
 .library { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.resources { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.res-cols { display: flex; gap: 12px; flex: 1; min-height: 0; }
-.res-cols .col { flex: 1; min-width: 0; min-height: 0; }
-.textbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.kv-new { display: flex; gap: 6px; padding: 8px; border-bottom: 0.5px solid var(--border); }
-.kv-key { width: 110px; flex-shrink: 0; padding: 5px 8px; font-size: 12px; }
-.kv-val { flex: 1; min-width: 0; padding: 5px 8px; font-size: 12px; }
-.kv-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px; font-size: 12px; border-radius: var(--radius); }
-.kv-item:hover { background: var(--surface-1); }
-.kv-key-label { width: 110px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.kv-val-input { flex: 1; min-width: 0; padding: 4px 6px; font-size: 12px; background: transparent; border: 0.5px solid transparent; }
-.kv-val-input:hover, .kv-val-input:focus { border-color: var(--border); background: var(--surface-2); }
 .monitor-wrap { flex: 1; min-height: 0; display: flex; }
 .monitor-wrap :deep(.monitor) { flex: 1; min-width: 0; }
 .err { color: var(--text-danger); background: var(--bg-danger); padding: 8px 12px; border-radius: var(--radius); margin: 6px 0; font-size: 13px; }
@@ -540,13 +565,6 @@ h2 { margin: 0; font-weight: 500; }
 .col { display: flex; flex-direction: column; min-height: 0; }
 .app-col { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .applist { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.resbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.res-item { display: flex; align-items: center; gap: 6px; padding: 5px 8px; font-size: 12px; border-radius: var(--radius); }
-.res-item:hover { background: var(--surface-1); }
-.res-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.res-size { flex-shrink: 0; font-size: 11px; }
-button.danger { color: var(--text-danger); background: transparent; border: none; cursor: pointer; padding: 2px 4px; }
-button.danger:hover { background: var(--bg-danger); border-radius: var(--radius); }
 .case-col { flex: 1; min-width: 0; }
 .dev-col { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .col-hd { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 0.5px solid var(--border); font-size: 13px; font-weight: 500; }
@@ -554,21 +572,54 @@ button.danger:hover { background: var(--bg-danger); border-radius: var(--radius)
 .col-body { flex: 1; overflow: auto; padding: 6px; min-height: 0; }
 .empty-hint { padding: 14px 10px; font-size: 12px; line-height: 1.5; }
 
-.app-item { padding: 8px 10px; border-radius: var(--radius); cursor: pointer; margin-bottom: 2px; }
+.app-group { margin-bottom: 2px; }
+.app-item { padding: 8px 10px; border-radius: var(--radius); cursor: pointer; display: flex; align-items: flex-start; gap: 6px; }
 .app-item:hover { background: var(--surface-1); }
 .app-item.on { background: var(--bg-accent); }
+.app-caret { flex-shrink: 0; width: 12px; font-size: 10px; line-height: 20px; cursor: pointer; color: var(--text-muted); }
+.app-main { flex: 1; min-width: 0; }
 .app-name { font-size: 13px; font-weight: 500; display: flex; align-items: center; gap: 6px; }
 .app-item.on .app-name { color: var(--text-accent); }
 .dot { color: var(--text-accent); font-size: 9px; }
+.app-del {
+  margin-left: auto; padding: 0 6px; font-size: 12px; line-height: 18px;
+  color: var(--text-muted); background: transparent; border: none; border-radius: 4px; cursor: pointer;
+}
+.app-del:hover { color: var(--text-danger, #d33); background: var(--surface-2, rgba(0,0,0,0.06)); }
 .app-sub { font-size: 11px; margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.app-version-list { padding: 2px 4px 4px 28px; }
+.app-version-empty { padding: 4px 6px; font-size: 11px; }
+.app-version-item {
+  display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: var(--radius);
+  cursor: pointer; font-size: 12px;
+}
+.app-version-item:hover { background: var(--surface-1); }
+.app-version-item.on { background: var(--bg-accent); color: var(--text-accent); }
+.app-version-size { margin-left: auto; font-size: 11px; }
 
 .case-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius); font-size: 13px; cursor: pointer; }
 .case-item:hover { background: var(--surface-1); }
 .case-item.locked { opacity: 0.6; cursor: default; }
+
+.case-toolbar { display: flex; gap: 6px; }
 .case-id { flex-shrink: 0; }
 .case-mod { flex-shrink: 0; font-size: 12px; max-width: 25%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .case-purpose { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .divider { font-size: 11px; padding: 10px 8px 4px; border-top: 0.5px solid var(--border); margin-top: 6px; }
+
+.case-tip {
+  position: fixed; z-index: 50; pointer-events: auto;
+  width: 620px; max-width: 90vw; max-height: 520px; overflow: auto;
+  background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
+  padding: 12px 14px; font-size: 12px; line-height: 1.6; color: var(--text-primary);
+}
+.tip-sec + .tip-sec { margin-top: 10px; }
+.tip-hd { font-size: 11px; font-weight: 600; color: var(--text-accent); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
+.case-tip ol { margin: 0; padding-left: 18px; }
+.case-tip li { margin-bottom: 4px; }
+.case-tip li:last-child { margin-bottom: 0; }
 
 .devbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .dev-item { display: flex; align-items: center; gap: 8px; padding: 5px 8px; font-size: 12px; cursor: pointer; }

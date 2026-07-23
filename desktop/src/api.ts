@@ -2,6 +2,7 @@
 // 多 App：读/执行类命令都带 appSlug（tauri 自动把 camelCase 映射到 Rust 的 snake_case）。
 import { invoke, Channel, convertFileSrc } from "@tauri-apps/api/core";
 import { open, save } from "@tauri-apps/plugin-dialog";
+import type { RunRecord, RunRecordMeta } from "./runStore";
 
 export interface AppConfig {
   project_root: string;
@@ -15,12 +16,19 @@ export interface AppInfo {
   app_version: string;
   sheet_id: string;
   serial: string;
+  updated_at: number;
 }
 export interface ApkInfo {
   package: string;
   version: string;
   label: string;
   suggested_slug: string;
+}
+export interface ApkVersionInfo {
+  version: string;
+  path: string;
+  size: number;
+  imported_at: number;
 }
 export interface RunRow {
   run_id: string;
@@ -57,6 +65,8 @@ export interface FlowRow {
   last_status: string;
   start_time: string;
   end_time: string;
+  steps: string[];
+  expected: string[];
 }
 export interface DeviceRow {
   serial: string;
@@ -70,6 +80,13 @@ export interface KV {
   key: string;
   value: string;
 }
+export interface StructureRow {
+  module: string;
+  purpose: string;
+  count: string;
+  cases: string;
+  priority: string;
+}
 export interface ResourceFile {
   name: string;
   size: number;
@@ -77,6 +94,31 @@ export interface ResourceFile {
 export interface TextResource {
   key: string;
   value: string;
+}
+export interface CleanupItem {
+  rel_path: string;
+  name: string;
+  size: number;
+  modified: number; // unix 秒，0=未知
+  tag: string; // "" | "当前批次" | "可重装"
+  protected: boolean;
+}
+export interface CleanupCategory {
+  key: string; // evidence / apks / records / cache / build
+  title: string;
+  hint: string;
+  location: string;
+  total_size: number;
+  items: CleanupItem[];
+}
+export interface CleanupReport {
+  project_size: number;
+  categories: CleanupCategory[];
+}
+export interface CleanupResult {
+  removed: number;
+  freed: number;
+  errors: string[];
 }
 export interface ClaudeCliStatus {
   installed: boolean;
@@ -98,6 +140,8 @@ export const api = {
 
   // App 注册表 / 活跃 App
   listApps: () => invoke<AppInfo[]>("list_apps"),
+  // 返回值是回收站里的目标路径（apps/.trash/<slug>__<ts>/），手滑误删可以照这个路径挪回来
+  deleteApp: (slug: string) => invoke<string>("delete_app", { slug }),
   getActiveApp: () => invoke<string>("get_active_app"),
   setActiveApp: (slug: string) => invoke<void>("set_active_app", { slug }),
 
@@ -113,7 +157,10 @@ export const api = {
   readDeviceAliases: () => invoke<KV[]>("read_device_aliases"),
   setTargetSerial: (slug: string, serial: string) =>
     invoke<void>("set_target_serial", { appSlug: slug, serial }),
+  setTargetScope: (slug: string, scope: string) =>
+    invoke<void>("set_target_scope", { appSlug: slug, scope }),
   readSummary: (slug: string) => invoke<KV[]>("read_summary", { appSlug: slug }),
+  readStructure: (slug: string) => invoke<StructureRow[]>("read_structure", { appSlug: slug }),
 
   // 设备别名登记（config/device_aliases.json）的增删改 + 导入导出
   upsertDeviceAlias: (serial: string, alias: string) =>
@@ -167,6 +214,41 @@ export const api = {
     ch.onmessage = onLine;
     return invoke<number>("sync_sheets", { appSlug: slug, onEvent: ch });
   },
+  // 落账本（judge_result）：跑完一格 run_flow/run_flow_repair 后必须调——不调的话这条用例的
+  // queue.csv「当前状态」永远停在「待执行」（run_flow.py 只写 log.csv/时间戳，不写状态列），
+  // 账本/Doc/Sheet 会把它当成没跑过。纯确定性映射，不调 claude：pass/healed→通过，
+  // fail→失败（固化脚本自己已按 exit 码判过，不豁免已知缺陷），app_defect/needs_human→需复核。
+  judgeResult(
+    slug: string,
+    caseId: string,
+    serial: string,
+    status: "pass" | "healed" | "fail" | "app_defect" | "needs_human",
+    onLine: (line: string) => void
+  ) {
+    const ch = new Channel<string>();
+    ch.onmessage = onLine;
+    return invoke<number>("judge_result", { appSlug: slug, caseId, serial, status, onEvent: ch });
+  },
+  // 自动登记问题清单（issue_register）：收尾时对失败/需复核的用例逐条调——headless claude 读证据
+  // 把一条结构化问题写进 issues.csv（前缀由终态确定性映射：fail/app_defect→BUG-、needs_human→RISK-，
+  // claude 只写描述字段+查重，见 decisions.md #35）。必须排在 syncSheets/docReport 之前（要读 issues.csv）。
+  registerIssue(
+    slug: string,
+    caseId: string,
+    serial: string,
+    status: "fail" | "app_defect" | "needs_human",
+    onLine: (line: string) => void
+  ) {
+    const ch = new Channel<string>();
+    ch.onmessage = onLine;
+    return invoke<number>("register_issue", { appSlug: slug, caseId, serial, status, onEvent: ch });
+  },
+  // 刷新 Google Doc 图文报告（doc_report）：执行台收尾时紧跟 syncSheets 之后自动调
+  docReport(slug: string, onLine: (line: string) => void) {
+    const ch = new Channel<string>();
+    ch.onmessage = onLine;
+    return invoke<number>("doc_report", { appSlug: slug, onEvent: ch });
+  },
 
   // 上传 APK：本地解析 → 装机 → 注册
   pickApk: () =>
@@ -182,6 +264,24 @@ export const api = {
     ch.onmessage = onLine;
     return invoke<number>("register_app", { appSlug: slug, package: pkg, serial, onEvent: ch });
   },
+
+  // 同 slug 下留存的多版本 APK：留存（上传时复制一份）+ 列出（执行前选版本装机用）
+  listApkVersions: (slug: string) => invoke<ApkVersionInfo[]>("list_apk_versions", { slug }),
+  saveApkVersion: (slug: string, srcPath: string, version: string) =>
+    invoke<string>("save_apk_version", { slug, srcPath, version }),
+
+  // 执行记录：完整跑完（未中止）的一轮执行台快照持久化（apps/<slug>/ledger/run_records/）
+  saveRunRecord: (slug: string, record: RunRecord) =>
+    invoke<void>("save_run_record", { appSlug: slug, record }),
+  listRunRecords: (slug: string) => invoke<RunRecordMeta[]>("list_run_records", { appSlug: slug }),
+  readRunRecord: (slug: string, id: string) =>
+    invoke<RunRecord>("read_run_record", { appSlug: slug, id }),
+  deleteRunRecord: (slug: string, id: string) =>
+    invoke<void>("delete_run_record", { appSlug: slug, id }),
+
+  // 清理：扫描历史文件（跨 App，不带 slug）+ 把选中项移进系统废纸篓
+  scanCleanup: () => invoke<CleanupReport>("scan_cleanup"),
+  moveToTrash: (relPaths: string[]) => invoke<CleanupResult>("move_to_trash", { relPaths }),
 };
 
 // 本地文件 → webview 可加载的 asset URL（证据图片用）

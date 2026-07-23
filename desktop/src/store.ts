@@ -51,6 +51,14 @@ export const store = reactive({
     return this.apps.find((a) => a.slug === this.activeSlug);
   },
 
+  // 删除一个 App 注册：挪进 apps/.trash/（不硬删），返回回收站目标路径；删完重扫列表，loadApps 会顺带清理失效的 activeSlug
+  async deleteApp(slug: string): Promise<string> {
+    const trashPath = await api.deleteApp(slug);
+    await this.loadApps();
+    await this.loadRuns();
+    return trashPath;
+  },
+
   async loadRuns() {
     if (!this.activeSlug) {
       this.runs = [];

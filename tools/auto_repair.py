@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""auto_repair —— 「大脑 Claude」固化脚本自愈闭环。
+"""auto_repair —— 「Claude」固化脚本自愈闭环。
 
 固化脚本天生脆(硬编码控件文案/坐标/等待、App 会弹新广告/改文案/加引导)。这个工具在
-执行台勾选「🧠 大脑 Claude」时替代 run_flow.py 被调用:跑固化脚本,若异常退出就把失败上下文
+执行台勾选「Claude」时替代 run_flow.py 被调用:跑固化脚本,若异常退出就把失败上下文
 (脚本 + 本次日志 + 本 attempt 证据)喂给本机 claude CLI,让它诊断根因并二选一处置,循环至多 3 次。
 
 【最关键的边界——不可洗绿】失败分两类,处置完全不同:
@@ -201,7 +201,7 @@ def main():
     python = sys.executable or "python3"
     claude_bin = find_claude()
     if not claude_bin:
-        print("[auto_repair] ⚠️ 本机找不到 claude CLI,大脑不可用——退回普通执行(跑一次不自愈)。")
+        print("[auto_repair] ⚠️ 本机找不到 claude CLI,Claude 不可用——退回普通执行(跑一次不自愈)。")
         code, _ = run_flow_once(python, a.case, a.script, serial)
         sys.exit(code)
 
@@ -214,15 +214,15 @@ def main():
 
         if code == 0:
             if attempt > 1:
-                append_log(a.case, "大脑自愈", "执行中", "已完成/需复核",
-                           f"大脑Claude自愈成功(第{attempt}次通过),前序已 patch 固化脚本的导航/健壮性;"
+                append_log(a.case, "Claude自愈", "执行中", "已完成/需复核",
+                           f"Claude自愈成功(第{attempt}次通过),前序已 patch 固化脚本的导航/健壮性;"
                            f"通过判定仍需人工跑 output-check/logscan 确认")
             print(f"\n[auto_repair] ✅ 第 {attempt} 次执行通过(exit 0)。")
             sys.exit(0)
 
-        # —— 异常退出:大脑接管诊断 ——
+        # —— 异常退出:Claude 接管诊断 ——
         print(f"\n[auto_repair] ✖ 第 {attempt} 次异常退出(exit={code})。"
-              f"🧠 大脑 Claude 接管诊断中(可能 1-2 分钟,请稍候)…")
+              f"Claude 接管诊断中(可能 1-2 分钟,请稍候)…")
         base, attempt_dir = newest_attempt_dir(cfg, a.case, serial)
         prompt = build_user_prompt(a.case, serial, attempt, a.script, out, base, attempt_dir)
 
@@ -231,42 +231,42 @@ def main():
         shutil.copyfile(script_abs, script_abs.with_suffix(script_abs.suffix + ".bak"))
 
         verdict, diag = run_claude(claude_bin, python, prompt, a.script)
-        print("\n[auto_repair] ── 大脑诊断 ──")
+        print("\n[auto_repair] ── Claude诊断 ──")
         print(diag or "(无输出)")
         print("[auto_repair] ──────────────")
 
         if verdict == "APP_DEFECT":
-            note = f"疑似App缺陷(大脑Claude诊断,未改任何文件):{diag_oneline(diag)};正式判定/登记issues请回 Claude Code"
-            append_log(a.case, "大脑接管", "执行中", "需人工介入", note)
+            note = f"疑似App缺陷(Claude诊断,未改任何文件):{diag_oneline(diag)};正式判定/登记issues请回 Claude Code"
+            append_log(a.case, "Claude接管", "执行中", "需人工介入", note)
             print(f"\n[auto_repair] 🛑 判定为被测 App 缺陷——已停,不重试、不改脚本。已记 log.csv「需人工介入」。")
             sys.exit(2)
 
         if verdict == "SCRIPT_FIX":
             after = script_abs.read_text(encoding="utf-8")
             if before == after:
-                note = f"大脑判脚本脆但未产生实际改动,无法自愈:{diag_oneline(diag)}"
-                append_log(a.case, "大脑接管", "执行中", "需人工介入", note)
+                note = f"Claude判脚本脆但未产生实际改动,无法自愈:{diag_oneline(diag)}"
+                append_log(a.case, "Claude接管", "执行中", "需人工介入", note)
                 print("\n[auto_repair] ⚠️ 判为脚本脆却没改动脚本——停,记「需人工介入」。")
                 sys.exit(3)
             diff = "".join(difflib.unified_diff(
                 before.splitlines(keepends=True), after.splitlines(keepends=True),
                 fromfile=a.script + " (before)", tofile=a.script + " (after)"))
-            print("\n[auto_repair] 📝 大脑改动固化脚本(导航/健壮性):")
+            print("\n[auto_repair] 📝 Claude改动固化脚本(导航/健壮性):")
             print(diff)
             print(f"[auto_repair] (原版本已备份到 {a.script}.bak)")
-            append_log(a.case, "大脑自愈", "执行中", "执行中",
-                       f"第{attempt}次失败后大脑patch固化脚本(导航/健壮性):{diag_oneline(diag)}")
+            append_log(a.case, "Claude自愈", "执行中", "执行中",
+                       f"第{attempt}次失败后Claude patch固化脚本(导航/健壮性):{diag_oneline(diag)}")
             continue  # 回到循环重跑
 
         # verdict is None / UNKNOWN
-        note = f"大脑无法判定失败根因(保守不改脚本):{diag_oneline(diag)}"
-        append_log(a.case, "大脑接管", "执行中", "需人工介入", note)
-        print("\n[auto_repair] ❓ 大脑无法判定——保守停,记「需人工介入」。")
+        note = f"Claude无法判定失败根因(保守不改脚本):{diag_oneline(diag)}"
+        append_log(a.case, "Claude接管", "执行中", "需人工介入", note)
+        print("\n[auto_repair] ❓ Claude无法判定——保守停,记「需人工介入」。")
         sys.exit(4)
 
     # —— 三次仍未通过 ——
-    append_log(a.case, "大脑接管", "执行中", "需人工介入",
-               f"大脑自愈 {MAX_ATTEMPTS} 次仍未通过,需人工介入")
+    append_log(a.case, "Claude接管", "执行中", "需人工介入",
+               f"Claude自愈 {MAX_ATTEMPTS} 次仍未通过,需人工介入")
     print(f"\n[auto_repair] 🛑 自愈 {MAX_ATTEMPTS} 次仍未通过——停,记「需人工介入」,请人工排查。")
     sys.exit(5)
 

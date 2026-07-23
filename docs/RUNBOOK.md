@@ -82,7 +82,7 @@
    > **挂号时定下本次执行的 attempt 值**（一次执行取一次当前时刻 `HHMMSS`，如 `140122`）。adbkit 采证会把它拼进证据路径 `.../<case>/<serial>/<attempt>/...`，让**同一台设备上同一 case 的每次重跑各留一份画面、不覆盖**（`<serial>` 只区分不同设备，区分不了同机重跑，靠 attempt——数据模型见 `docs/decisions.md` #31）。
    > **怎么传（主循环逐屏模式）**：Claude Code 每条 Bash 调用是独立 shell、`export` 不跨调用留存，所以**本条用例本次执行的每条 adbkit 采证命令都要就地带上同一个 `ADBKIT_ATTEMPT=<值>` 前缀**，例如 `ADBKIT_ATTEMPT=140122 python3 tools/adbkit.py --case CUT-CORE-01 shot 03-editor "…"`。整条用例这一趟全用**同一个**值；**重跑同一条 = 重新挂号 = 换一个新值**（别在一趟中途改，否则同一次的截图会散进多个 attempt 目录）。
    > **固化脚本模式（`run_flow.py`）无需操心**：它在同一个 bash 进程里注入一次 env，脚本内所有 adbkit 自动继承同一个 attempt。未带 `ADBKIT_ATTEMPT` 时 adbkit 退回不加 attempt 段（legacy 结构，同机重跑会覆盖）。
-3. **判断走脚本还是主循环**：看该行 `固化脚本` 列——非空（如 `apps/<slug>/flows/flow_cut_save.sh`）就直接跑这个脚本（无 AI 逐屏推理，快）；为空就走下面 4-5 步主循环。这一列由 `apps/<slug>/cases/*.yaml` 里的 `frozen_script` 字段编译而来，别手改 queue 里的这一格，改就去改 YAML 再 `compile_cases.py`。脚本跑挂了（选择器找不到）说明 UI 变了，回退主循环重探，然后把新脚本路径更新回 YAML（见 `flow-freeze.md`）。
+3. **判断走脚本还是主循环**：看该行 `固化脚本` 列——非空（如 `apps/<slug>/flows/flow_cut_save.sh`）就直接跑这个脚本（无 AI 逐屏推理，快）；为空就走下面 4-5 步主循环。这一列由 `apps/<slug>/cases/*.yaml` 里的 `frozen_script` 字段编译而来，别手改 queue 里的这一格，改就去改 YAML 再 `compile_cases.py`。脚本跑挂了（选择器找不到）说明 UI 变了，回退主循环重探，然后把新脚本路径更新回 YAML（见 skill `flow-freeze`）。
    > **硬规则：跑固化脚本一律用 `python3 tools/run_flow.py <用例ID> <脚本路径> [serial]`，永远不要直接 `bash apps/<slug>/flows/xxx.sh`**——包括"顺手冒烟检查"这类看起来不算正式执行的场合。直接 `bash` 跑完全裸跑，不会往 `log.csv`/`queue.csv` 写任何东西，事后极难想起来补登记（2026-07-02 踩过：图省事直接 `bash` 跑了一次冒烟，跑完当成"检查过了"就往下走，账本和看板上完全没留痕，用户事后追问才发现）。`run_flow.py` 自动计时、自动写开始/完成时间戳到 `log.csv`、回填 `queue.csv`，判定仍需人工看 `output-check`/`logscan` 后补一行"判定确认"（见下方结果分档）。**`run_flow` 跑完会列出本轮该用例已自动登记的证据清单（脚本跑时 adbkit 采的每张截图/output-check/logscan 都在），据此判定并把关键的 `case_result --evi` 升级为「关键，供报告用」。**
 4. **造前置态**（如需）：写 `seeds/<用例>.sql` → `adbkit seed`。构造精确初始状态，别靠手点一路走过去。
 5. **驱动 + 采集**（`固化脚本` 为空时才走这步）：**每到一个界面 `ui <step>` dump 一次**（既为决策也为存证）→ **用 `tapid`/`taptext`/`tapdesc --from <刚才的 ui xml>` 按选择器点击**（坐标由工具从 bounds 现算，天然跨分辨率；`--from` 复用同一份 dump，同屏多次点击不重复 dump——dump ≈ 2s 是最贵动作，tap ≈ 0.04s）。**不要手敲坐标、不要把坐标写进用例**；没有 id/text/desc 才用裸 `tap X Y` 兜底。界面变化后再 dump 下一屏。`text`/`key`/`swipe` 补充操作；关键节点 `shot`、`logscan`（非 debug 包无 `db`/`sp`）。**`shot`/`output-check`/`logscan` 采证时会自动往 `apps/<slug>/ledger/evidence.csv` 追加一行（默认「过程留痕，仅本地」，按文件路径幂等、不漏不重复），不用再手动追加**——关键性留到第 6 步判定时升级。
@@ -105,7 +105,7 @@
 
 主循环是"AI 逐屏感知+决策"，健壮但慢，**第二遍不会自动变快**（慢的大头是每屏 AI 决策+首遍探路，不是 dump）。当一条路径已稳定通过、控件选择器都确认了，就把它落成流程脚本（纯选择器 `tapid/taptext/waitfor`、无硬坐标、按 `--serial` 参数化），之后回归直接跑脚本——无 AI 推理、无探路，快很多、可多台并行。**固化的是操作路径，不是判定；脚本脆，App UI 一改就断，断了回主循环重探再更新脚本。**
 
-> **路径约定（硬规则）**：所有固化脚本统一放 **`apps/<slug>/flows/` 目录**，命名 `flow_<模块>.sh`。回归要跑哪条流程去 `apps/<slug>/flows/` 找；新固化的脚本也写到 `apps/<slug>/flows/`，**别写进 `tools/`**（`tools/` 是跨 App 通用框架工具，`apps/<slug>/flows/` 是绑定当前 App 的回归资产）。详见 `docs/flow-freeze.md`，范例 `apps/<slug>/flows/flow_cut_save.sh` / `flow_multi.sh`。
+> **路径约定（硬规则）**：所有固化脚本统一放 **`apps/<slug>/flows/` 目录**，命名 `flow_<模块>.sh`。回归要跑哪条流程去 `apps/<slug>/flows/` 找；新固化的脚本也写到 `apps/<slug>/flows/`，**别写进 `tools/`**（`tools/` 是跨 App 通用框架工具，`apps/<slug>/flows/` 是绑定当前 App 的回归资产）。详见 skill `flow-freeze`（`.claude/skills/flow-freeze/SKILL.md`），范例 `apps/<slug>/flows/flow_cut_save.sh` / `flow_multi.sh`。
 
 ## 结果分档（执行结果列）
 
@@ -120,6 +120,8 @@
 ## 问题 ID 前缀
 
 `BUG-<用例>`（确认缺陷）、`RISK-<用例>`（待确认）、`GAP-<用例>`（覆盖缺口）、`BLOCK-<用例>`（环境阻塞）。
+
+> **上面这张分档表是「主循环」逐屏探路时的完整词汇**（5 档结果 → 4 种前缀）。**桌面执行台跑固化脚本**这条链路走不出全部 5 档——`judge_result.py` 的确定性映射只产出 `通过 / 失败 / 需复核`（`阻塞 / 覆盖缺口` 是主循环探路才判得出的结论，固化脚本要么 exit 0 要么 exit≠0）。所以桌面端**自动登记**（`issue_register.py`，见 `decisions.md` #35）的问题前缀也只有两种，由终态确定性映射、claude 不参与裁决前缀：`失败(fail/app_defect)→BUG-`、`需复核(needs_human)→RISK-`；claude 只读证据写标题/预期/实际/复现/严重级别 + 查历史重复。若在桌面跑出来的问题清单里从没见到 `BLOCK-`/`GAP-`，是正常的，不是漏了。
 
 ## 判定要读多源（不要只看截图）
 

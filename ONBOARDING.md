@@ -69,7 +69,7 @@ bash apps/<slug>/flows/flow_cut_save.sh <serial>
 1. 删掉/替换示例文件：`apps/<slug>/cases/CUT-CORE-01.yaml`、`apps/<slug>/flows/flow_cut_save.sh`（`apps/<slug>/cases/_TEMPLATE.yaml` 留着，是通用字段模板）。
 2. `config/target.json` 里的 `package`/`db_name`/`serial` 换成你的 App。
 3. 用一句话描述测试目标，触发 skill `adb-testcase-gen`（对话里说"帮我生成用例"之类），它会自己用 adbkit 探真机、把步骤/预期锚在真实控件上，写出 `apps/<slug>/cases/<id>.yaml`。
-4. 路径探稳定、要反复回归的核心流程，按 [docs/flow-freeze.md](docs/flow-freeze.md) 固化成 `apps/<slug>/flows/flow_*.sh`。
+4. 路径探稳定、要反复回归的核心流程，用 skill `flow-freeze`（[.claude/skills/flow-freeze/SKILL.md](.claude/skills/flow-freeze/SKILL.md)）固化成 `apps/<slug>/flows/flow_*.sh`。
 5. 让 Claude Code 按 [docs/RUNBOOK.md](docs/RUNBOOK.md) 的协议接管执行——新会话冷启动时它会自己先读这份文档。
 
 ## 多人协作：Git 提交流程
@@ -116,7 +116,7 @@ gh pr create --base main --fill
 - [docs/structure.md](docs/structure.md) —— 目录结构、数据流向
 - [docs/decisions.md](docs/decisions.md) —— 非显然的架构选择和原因（"为什么这么设计"）
 - [docs/gotchas.md](docs/gotchas.md) —— 踩过的坑
-- [docs/flow-freeze.md](docs/flow-freeze.md) —— 什么时候该把探索路径固化成脚本
+- [.claude/skills/flow-freeze/SKILL.md](.claude/skills/flow-freeze/SKILL.md) —— 什么时候该把探索路径固化成脚本、失败判定标准
 - [docs/todo.md](docs/todo.md) —— 已知待办/未完成的事
 
 ## 云端看板

@@ -122,6 +122,11 @@ fn app_root(root: &Path, slug: &str) -> PathBuf {
 fn app_ledger(root: &Path, slug: &str) -> PathBuf {
     app_root(root, slug).join("ledger")
 }
+// 执行记录快照目录：apps/<slug>/ledger/run_records/<id>.json。落在 ledger 下 → 随
+// `apps/*/ledger/*` 一起天然 gitignore（本机执行产物，不入库，见 .gitignore）。
+fn run_records_dir(root: &Path, slug: &str) -> PathBuf {
+    app_ledger(root, slug).join("run_records")
+}
 
 // 被测 App 配置 apps/<slug>/target.json（缺则退回共享模板 config/target.example.json）
 fn read_target(root: &Path, slug: &str) -> Value {
@@ -155,6 +160,8 @@ pub struct AppInfo {
     pub app_version: String,
     pub sheet_id: String,
     pub serial: String,
+    // target.json 的文件修改时间（unix 秒），仅用于同包名多条历史记录时取"最近使用的一条"
+    pub updated_at: i64,
 }
 
 #[tauri::command]
@@ -181,6 +188,12 @@ pub fn list_apps(app: AppHandle) -> Result<Vec<AppInfo>, String> {
                 .and_then(|t| serde_json::from_str(&t).ok())
                 .unwrap_or(Value::Null);
             let s = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let updated_at = fs::metadata(&tj)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
             out.push(AppInfo {
                 app_name: {
                     let n = s("app_name");
@@ -191,11 +204,49 @@ pub fn list_apps(app: AppHandle) -> Result<Vec<AppInfo>, String> {
                 sheet_id: s("sheet_id"),
                 serial: s("serial"),
                 slug,
+                updated_at,
             });
         }
     }
     out.sort_by(|a, b| a.slug.to_lowercase().cmp(&b.slug.to_lowercase()));
     Ok(out)
+}
+
+/// 删除一个被测 App 的注册：不做硬删除，整个 apps/<slug>/ 目录挪进 apps/.trash/<slug>__<ts>/，
+/// 手滑误删还能从回收站里挪回来。.trash 以 . 开头，list_apps 扫描时天然跳过，不会冒出来当成一个 App。
+#[tauri::command]
+pub fn delete_app(app: AppHandle, slug: String) -> Result<String, String> {
+    let root = root_of(&app)?;
+    let apps_dir = root.join("apps");
+    let p = app_root(&root, &slug);
+    // 防止 slug 里带 ../ 逃出 apps/ 目录
+    if !p.starts_with(&apps_dir) || !p.exists() {
+        return Err("非法 App 或目录不存在".into());
+    }
+    let trash_dir = apps_dir.join(".trash");
+    fs::create_dir_all(&trash_dir).map_err(|e| e.to_string())?;
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_secs();
+    let mut dest = trash_dir.join(format!("{slug}__{ts}"));
+    // 同一秒内删两次同名 slug 的极端情况，加个序号避免 rename 覆盖
+    let mut n = 1;
+    while dest.exists() {
+        dest = trash_dir.join(format!("{slug}__{ts}_{n}"));
+        n += 1;
+    }
+    fs::rename(&p, &dest).map_err(|e| e.to_string())?;
+    // 若删的是当前活跃 App，清掉 active.json，避免其他工具还指向已删目录
+    let af = active_file(&root);
+    if let Ok(txt) = fs::read_to_string(&af) {
+        if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+            if v.get("active").and_then(|x| x.as_str()) == Some(slug.as_str()) {
+                let _ = fs::remove_file(&af);
+            }
+        }
+    }
+    Ok(dest.to_string_lossy().to_string())
 }
 
 fn active_file(root: &Path) -> PathBuf {
@@ -446,6 +497,48 @@ pub struct FlowRow {
     pub last_status: String,
     pub start_time: String,
     pub end_time: String,
+    pub steps: Vec<String>,    // 用例 YAML 的 steps 列表，供列表悬停展示
+    pub expected: Vec<String>, // 用例 YAML 的 expected 列表，供列表悬停展示
+}
+
+// 从用例 YAML 里抠 steps:/expected: 两个列表块，不引入 serde_yaml 依赖——
+// 格式固定为 "    - 一行内容"（4 空格+"- "起始新项），超长换行续接为 "      续行"（6 空格+无 "- "）。
+fn parse_case_yaml_lists(text: &str) -> (Vec<String>, Vec<String>) {
+    let mut steps = vec![];
+    let mut expected = vec![];
+    let mut mode = 0u8; // 0=其他字段, 1=steps, 2=expected
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        if indent <= 2 {
+            mode = if trimmed == "steps:" { 1 } else if trimmed == "expected:" { 2 } else { 0 };
+            continue;
+        }
+        let list = match mode {
+            1 => &mut steps,
+            2 => &mut expected,
+            _ => continue,
+        };
+        if indent >= 4 && trimmed.starts_with("- ") {
+            list.push(trimmed[2..].trim_end().to_string());
+        } else if indent >= 6 {
+            if let Some(last) = list.last_mut() {
+                last.push_str(trimmed.trim_end());
+            }
+        }
+    }
+    (steps, expected)
+}
+
+fn read_case_steps_expected(root: &Path, slug: &str, case_id: &str) -> (Vec<String>, Vec<String>) {
+    let p = app_root(root, slug).join("cases").join(format!("{}.yaml", case_id));
+    match fs::read_to_string(&p) {
+        Ok(text) => parse_case_yaml_lists(&text),
+        Err(_) => (vec![], vec![]),
+    }
 }
 
 #[tauri::command]
@@ -461,8 +554,10 @@ pub fn list_flows(app: AppHandle, app_slug: String) -> Result<Vec<FlowRow>, Stri
             continue;
         }
         let script = get(r, &header, "固化脚本").to_string();
+        let case_id = get(r, &header, "用例ID").to_string();
+        let (steps, expected) = read_case_steps_expected(&root, &app_slug, &case_id);
         out.push(FlowRow {
-            case_id: get(r, &header, "用例ID").to_string(),
+            case_id,
             module: get(r, &header, "模块").to_string(),
             purpose: get(r, &header, "测试目的").to_string(),
             priority: get(r, &header, "优先级").to_string(),
@@ -472,6 +567,8 @@ pub fn list_flows(app: AppHandle, app_slug: String) -> Result<Vec<FlowRow>, Stri
             last_status: get(r, &header, "当前状态").to_string(),
             start_time: get(r, &header, "开始时间").to_string(),
             end_time: get(r, &header, "结束时间").to_string(),
+            steps,
+            expected,
         });
     }
     Ok(out)
@@ -794,6 +891,21 @@ pub fn set_target_serial(app: AppHandle, app_slug: String, serial: String) -> Re
     Ok(())
 }
 
+/// 设本轮范围：写回 apps/<slug>/target.json 的 scope（逗号拼接的用例ID）。
+/// 开新一轮前用本次勾选的用例同步它，让 new_run.py 内部重建的 board/summary 看板范围
+/// 跟桌面壳里实际要跑的用例保持一致，而不是退回 target.json 里旧的/空的 scope。
+#[tauri::command]
+pub fn set_target_scope(app: AppHandle, app_slug: String, scope: String) -> Result<(), String> {
+    let root = root_of(&app)?;
+    let p = app_root(&root, &app_slug).join("target.json");
+    let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+    v["scope"] = Value::String(scope);
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 概览 summary.csv
 // ---------------------------------------------------------------------------
@@ -817,6 +929,131 @@ pub fn read_summary(app: AppHandle, app_slug: String) -> Result<Vec<KV>, String>
         if !k.is_empty() {
             out.push(KV { key: k, value: v });
         }
+    }
+    Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+// 执行记录（run_records/<id>.json）：执行台「完整跑完（未中止）」的一轮快照，
+// 前端在收尾后组装整份 JSON（{ meta, cells, events }）传进来落地。中止的轮次
+// 前端根本不会调 save，所以这里不需要额外判定 —— 存进来的都是完整轮次。
+// meta 里带够列表用的摘要（标题/时间/通过失败计数），list 只回 meta 保持轻量。
+// ---------------------------------------------------------------------------
+fn safe_record_id(id: &str) -> Result<(), String> {
+    if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains("..") {
+        return Err("非法记录 id".into());
+    }
+    Ok(())
+}
+
+/// 保存一条执行记录快照（整份 JSON 由前端 runStore 组装）。
+#[tauri::command]
+pub fn save_run_record(app: AppHandle, app_slug: String, record: Value) -> Result<(), String> {
+    let root = root_of(&app)?;
+    let id = record
+        .get("meta")
+        .and_then(|m| m.get("id"))
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    safe_record_id(&id)?;
+    let dir = run_records_dir(&root, &app_slug);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let p = dir.join(format!("{id}.json"));
+    fs::write(&p, serde_json::to_string(&record).map_err(|e| e.to_string())?)
+        .map_err(|e| e.to_string())
+}
+
+/// 列出某 App 的执行记录（只回每条的 meta，按 startedAt 倒序，最新在前）。
+#[tauri::command]
+pub fn list_run_records(app: AppHandle, app_slug: String) -> Result<Vec<Value>, String> {
+    let root = root_of(&app)?;
+    let dir = run_records_dir(&root, &app_slug);
+    let mut out: Vec<Value> = vec![];
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                continue;
+            }
+            if let Ok(txt) = fs::read_to_string(&path) {
+                if let Ok(v) = serde_json::from_str::<Value>(&txt) {
+                    if let Some(meta) = v.get("meta") {
+                        out.push(meta.clone());
+                    }
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| {
+        let sa = a.get("startedAt").and_then(|x| x.as_i64()).unwrap_or(0);
+        let sb = b.get("startedAt").and_then(|x| x.as_i64()).unwrap_or(0);
+        sb.cmp(&sa)
+    });
+    Ok(out)
+}
+
+/// 读一条完整执行记录（含 cells/events），供执行记录页渲染。
+#[tauri::command]
+pub fn read_run_record(app: AppHandle, app_slug: String, id: String) -> Result<Value, String> {
+    let root = root_of(&app)?;
+    safe_record_id(&id)?;
+    let p = run_records_dir(&root, &app_slug).join(format!("{id}.json"));
+    let txt = fs::read_to_string(&p).map_err(|e| format!("读不到执行记录 {id}：{e}"))?;
+    serde_json::from_str(&txt).map_err(|e| e.to_string())
+}
+
+/// 删除一条执行记录（只删本机这份快照，不动证据/账本）。
+#[tauri::command]
+pub fn delete_run_record(app: AppHandle, app_slug: String, id: String) -> Result<(), String> {
+    let root = root_of(&app)?;
+    safe_record_id(&id)?;
+    let p = run_records_dir(&root, &app_slug).join(format!("{id}.json"));
+    fs::remove_file(&p).map_err(|e| e.to_string())
+}
+
+// 概览「结构视图」——读 ledger/structure.csv（compile_cases 按模块聚合出的导航图，
+// 与线上 Sheet 的结构视图同源）。列固定：层级,模块,测试目的,用例数量,覆盖用例,优先级,阅读重点。
+// 其中「测试目的」与「阅读重点」内容恒等（见 compile_cases.build_structure），前端只展示前者。
+#[derive(Serialize)]
+pub struct StructureRow {
+    pub module: String,
+    pub purpose: String,
+    pub count: String,
+    pub cases: String,
+    pub priority: String,
+}
+
+#[tauri::command]
+pub fn read_structure(app: AppHandle, app_slug: String) -> Result<Vec<StructureRow>, String> {
+    let root = root_of(&app)?;
+    let (header, rows) = read_csv(&app_ledger(&root, &app_slug).join("structure.csv"))?;
+    if header.is_empty() {
+        return Ok(vec![]);
+    }
+    // 按表头名取列，容忍列序变化
+    let idx = |name: &str| header.iter().position(|h| h == name);
+    let (i_mod, i_pur, i_cnt, i_case, i_prio) = (
+        idx("模块"),
+        idx("测试目的"),
+        idx("用例数量"),
+        idx("覆盖用例"),
+        idx("优先级"),
+    );
+    let cell = |r: &Vec<String>, i: Option<usize>| i.and_then(|i| r.get(i)).cloned().unwrap_or_default();
+    let mut out = vec![];
+    for r in &rows {
+        let module = cell(r, i_mod);
+        if module.is_empty() {
+            continue;
+        }
+        out.push(StructureRow {
+            module,
+            purpose: cell(r, i_pur),
+            count: cell(r, i_cnt),
+            cases: cell(r, i_case),
+            priority: cell(r, i_prio),
+        });
     }
     Ok(out)
 }
@@ -996,7 +1233,7 @@ pub async fn run_flow(
     .map_err(|e| e.to_string())?
 }
 
-/// 「大脑 Claude」自愈执行 —— 替代 run_flow：spawn auto_repair.py（跑固化脚本，失败则 claude 诊断+
+/// 「Claude」自愈执行 —— 替代 run_flow：spawn auto_repair.py（跑固化脚本，失败则 claude 诊断+
 /// 只改导航/健壮性重跑，至多 3 次；判定 App 缺陷则停并记「需人工介入」）。与 run_flow 一个模子。
 #[tauri::command]
 pub async fn run_flow_repair(
@@ -1043,6 +1280,78 @@ pub async fn sync_sheets(app: AppHandle, app_slug: String, on_event: Channel<Str
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let cmd = python_cmd(&root, &cfg.python, &["tools/sheets_sync.py".to_string()], Some(&app_slug));
+        stream_child(cmd, on_event, false)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 把执行台这一格的终态落进账本（judge_result.py）—— 跑完 run_flow/run_flow_repair 后，
+/// 执行台自动对这一格调一次；纯确定性映射，不调 claude：pass/healed→通过，fail→失败
+/// （固化脚本自己已按 exit 码判过了，不豁免已知缺陷），app_defect/needs_human→需复核。
+/// track=true：随整个 run 一起被「中止任务」杀掉。
+#[tauri::command]
+pub async fn judge_result(
+    app: AppHandle,
+    app_slug: String,
+    case_id: String,
+    serial: String,
+    status: String,
+    on_event: Channel<String>,
+) -> Result<i32, String> {
+    let root = root_of(&app)?;
+    let cfg = load_app_config(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut args = vec!["tools/judge_result.py".to_string(), case_id];
+        if !serial.is_empty() {
+            args.push(serial);
+        }
+        args.push("--status".to_string());
+        args.push(status);
+        let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        stream_child(cmd, on_event, true)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 自动登记问题清单（issue_register.py）—— 执行台收尾时，对失败/需复核的用例逐条调一次，让
+/// headless claude 读证据把一条结构化问题写进 issues.csv（前缀由终态确定性映射，claude 只写描述
+/// 字段+查重，见 decisions.md #35）。必须排在 sync_sheets/doc_report 之前（那两个要读 issues.csv）。
+/// track=false：收尾阶段跑，不进「中止」进程组（执行已结束，不需被 abort_run 杀）。
+#[tauri::command]
+pub async fn register_issue(
+    app: AppHandle,
+    app_slug: String,
+    case_id: String,
+    serial: String,
+    status: String,
+    on_event: Channel<String>,
+) -> Result<i32, String> {
+    let root = root_of(&app)?;
+    let cfg = load_app_config(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut args = vec!["tools/issue_register.py".to_string(), case_id];
+        if !serial.is_empty() {
+            args.push(serial);
+        }
+        args.push("--status".to_string());
+        args.push(status);
+        let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        stream_child(cmd, on_event, false)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 刷新 Google Doc 图文报告（doc_report.py）—— 执行台收尾时紧跟 sync_sheets 之后自动调一次，
+/// 让线上报告始终反映本轮最新判定结果。track=false：收尾阶段跑，不进「中止」进程组。
+#[tauri::command]
+pub async fn doc_report(app: AppHandle, app_slug: String, on_event: Channel<String>) -> Result<i32, String> {
+    let root = root_of(&app)?;
+    let cfg = load_app_config(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let cmd = python_cmd(&root, &cfg.python, &["tools/doc_report.py".to_string()], Some(&app_slug));
         stream_child(cmd, on_event, false)
     })
     .await
@@ -1133,7 +1442,78 @@ pub fn probe_apk(apk_path: String) -> Result<ApkInfo, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Claude CLI 状态（「大脑 Claude」自愈功能依赖本机已装 + 已登录的 claude CLI）
+// 同 slug 下的多版本 APK 留存：apps/<slug>/apks/<version>.apk（不入 git，见 .gitignore）
+// 没有单独索引文件，直接扫目录——跟 list_apps 扫 apps/*/target.json 是同一套思路。
+// ---------------------------------------------------------------------------
+#[derive(Serialize)]
+pub struct ApkVersionInfo {
+    pub version: String,
+    pub path: String,     // 绝对路径，前端直接传给 install_apk 用
+    pub size: u64,
+    pub imported_at: i64, // 文件 mtime（unix 秒），排序用
+}
+
+fn apks_dir(root: &Path, slug: &str) -> PathBuf {
+    app_root(root, slug).join("apks")
+}
+
+// 版本号进文件名前的过滤：只留字母数字/点/横杠/下划线，避免奇怪字符（空格、斜杠等）搞坏路径
+fn sanitize_version(version: &str) -> String {
+    let s: String = version
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if s.is_empty() { "unknown".to_string() } else { s }
+}
+
+#[tauri::command]
+pub fn list_apk_versions(app: AppHandle, slug: String) -> Result<Vec<ApkVersionInfo>, String> {
+    let root = root_of(&app)?;
+    let dir = apks_dir(&root, &slug);
+    let mut out = vec![];
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("apk") {
+                continue;
+            }
+            let version = path.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            let meta = match fs::metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            let imported_at = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            out.push(ApkVersionInfo {
+                version,
+                path: path.to_string_lossy().to_string(),
+                size: meta.len(),
+                imported_at,
+            });
+        }
+    }
+    out.sort_by(|a, b| b.imported_at.cmp(&a.imported_at)); // 最新的在前
+    Ok(out)
+}
+
+/// 把上传流程里选中的本地 APK 文件复制留存到 apps/<slug>/apks/<version>.apk，
+/// 同版本重复上传直接覆盖（fs::copy 语义）。不做 git 跟踪（.gitignore 已排除 apps/*/apks/）。
+#[tauri::command]
+pub fn save_apk_version(app: AppHandle, slug: String, src_path: String, version: String) -> Result<String, String> {
+    let root = root_of(&app)?;
+    let dir = apks_dir(&root, &slug);
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let dest = dir.join(format!("{}.apk", sanitize_version(&version)));
+    fs::copy(&src_path, &dest).map_err(|e| format!("复制 APK 失败：{e}"))?;
+    Ok(dest.to_string_lossy().to_string())
+}
+
+// ---------------------------------------------------------------------------
+// Claude CLI 状态（「Claude」自愈功能依赖本机已装 + 已登录的 claude CLI）
 // 登录判定只查凭据是否存在（macOS keychain 元数据 / 其他平台凭据文件），不读密钥值
 // → 不触发 keychain 授权弹框。账号明细 best-effort 读 ~/.claude.json 的 oauthAccount，
 // 解析不出也不影响「已登录」结论（前端退回「账号信息无法解析」提示）。
@@ -1353,4 +1733,358 @@ pub async fn register_app(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// 「清理」：把随使用堆积的历史文件结构化列出（名称/大小/时间/是否受保护），用户勾选后
+// 移进系统废纸篓（trash crate；macOS 走 Finder Trash，可享 30 天自动清除，误删可捞回）。
+// 五类：证据物料 / APK 版本留存 / 执行记录·归档 / 缓存·回收站 / 开发构建缓存。
+// 删除粒度是「一轮证据 / 一个 APK / 一份快照」这种可独立取舍的单元，不整目录一把梭。
+// ---------------------------------------------------------------------------
+#[derive(Serialize)]
+pub struct CleanupItem {
+    pub rel_path: String, // 相对仓库根，既是列表 id 也是删除入参
+    pub name: String,     // 展示名
+    pub size: u64,
+    pub modified: i64,    // 目录/文件自身 mtime（unix 秒），0=未知
+    pub tag: String,      // "" | "当前批次" | "可重装"
+    pub protected: bool,  // 受保护（当前批次证据等）：默认不勾选，删前额外提醒
+}
+
+#[derive(Serialize)]
+pub struct CleanupCategory {
+    pub key: String,   // evidence / apks / records / cache / build
+    pub title: String,
+    pub hint: String,
+    pub location: String,
+    pub total_size: u64,
+    pub items: Vec<CleanupItem>,
+}
+
+#[derive(Serialize)]
+pub struct CleanupReport {
+    pub project_size: u64, // 整个仓库占用（best-effort 递归求和）
+    pub categories: Vec<CleanupCategory>,
+}
+
+// 递归求目录/文件大小。跳过符号链接（node_modules 里常见，避免重复计数/成环）。
+fn dir_size(p: &Path) -> u64 {
+    let md = match fs::symlink_metadata(p) {
+        Ok(m) => m,
+        Err(_) => return 0,
+    };
+    if md.file_type().is_symlink() {
+        return 0;
+    }
+    if md.is_file() {
+        return md.len();
+    }
+    if md.is_dir() {
+        let mut total = 0u64;
+        if let Ok(entries) = fs::read_dir(p) {
+            for e in entries.flatten() {
+                total += dir_size(&e.path());
+            }
+        }
+        return total;
+    }
+    0
+}
+
+fn mtime_secs(p: &Path) -> i64 {
+    fs::metadata(p)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn list_subdirs(p: &Path) -> Vec<PathBuf> {
+    let mut out = vec![];
+    if let Ok(entries) = fs::read_dir(p) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.is_dir() {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+fn fname(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+// 每个被测 App 的活跃 slug 列表（扫 apps/*/target.json，跳过 . 开头）
+fn app_slugs(root: &Path) -> Vec<String> {
+    let mut out = vec![];
+    if let Ok(entries) = fs::read_dir(root.join("apps")) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let slug = fname(&path);
+            if slug.starts_with('.') || !path.join("target.json").exists() {
+                continue;
+            }
+            out.push(slug);
+        }
+    }
+    out.sort();
+    out
+}
+
+#[tauri::command]
+pub fn scan_cleanup(app: AppHandle) -> Result<CleanupReport, String> {
+    let root = root_of(&app)?;
+    let slugs = app_slugs(&root);
+    let mut categories = vec![];
+
+    // ── 1. 证据物料 evidence/<slug>/<ver>/<run_id> ──
+    // 删除单元 = 一轮证据目录（run_id）。当前批次标「当前批次」+ protected，默认不勾。
+    {
+        let mut items = vec![];
+        let ev = root.join("evidence");
+        for slug_dir in list_subdirs(&ev) {
+            let slug = fname(&slug_dir);
+            let cur = {
+                let runs = load_runs(&root, &slug).unwrap_or_default();
+                current_run_id(&root, &slug, &runs)
+            };
+            for ver_dir in list_subdirs(&slug_dir) {
+                let ver = fname(&ver_dir);
+                for run_dir in list_subdirs(&ver_dir) {
+                    let run_id = fname(&run_dir);
+                    let is_cur = !cur.is_empty() && run_id == cur;
+                    let rel = run_dir.strip_prefix(&root).unwrap_or(&run_dir).to_string_lossy().to_string();
+                    items.push(CleanupItem {
+                        name: format!("{slug} / {ver} / {run_id}"),
+                        size: dir_size(&run_dir),
+                        modified: mtime_secs(&run_dir),
+                        tag: if is_cur { "当前批次".into() } else { String::new() },
+                        protected: is_cur,
+                        rel_path: rel,
+                    });
+                }
+            }
+        }
+        items.sort_by(|a, b| b.modified.cmp(&a.modified));
+        let total = items.iter().map(|i| i.size).sum();
+        categories.push(CleanupCategory {
+            key: "evidence".into(),
+            title: "证据物料".into(),
+            hint: "截图 / ui dump / 日志，按轮次堆积。删除粒度为一轮".into(),
+            location: "evidence/".into(),
+            total_size: total,
+            items,
+        });
+    }
+
+    // ── 2. APK 版本留存 apps/<slug>/apks/*.apk ──
+    {
+        let mut items = vec![];
+        for slug in &slugs {
+            let dir = apks_dir(&root, slug);
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for e in entries.flatten() {
+                    let path = e.path();
+                    if path.extension().and_then(|x| x.to_str()) != Some("apk") {
+                        continue;
+                    }
+                    let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().to_string();
+                    items.push(CleanupItem {
+                        name: format!("{slug} / {}", fname(&path)),
+                        size: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                        modified: mtime_secs(&path),
+                        tag: String::new(),
+                        protected: false,
+                        rel_path: rel,
+                    });
+                }
+            }
+        }
+        items.sort_by(|a, b| b.modified.cmp(&a.modified));
+        let total = items.iter().map(|i| i.size).sum();
+        categories.push(CleanupCategory {
+            key: "apks".into(),
+            title: "APK 版本留存".into(),
+            hint: "多版本安装包，执行前选版本重装。删旧版即可".into(),
+            location: "apps/*/apks/".into(),
+            total_size: total,
+            items,
+        });
+    }
+
+    // ── 3. 执行记录 run_records/*.json + 归档 archive/<run_id>/ ──
+    {
+        let mut items = vec![];
+        for slug in &slugs {
+            let ledger = app_ledger(&root, slug);
+            // 执行记录快照
+            if let Ok(entries) = fs::read_dir(ledger.join("run_records")) {
+                for e in entries.flatten() {
+                    let path = e.path();
+                    if path.extension().and_then(|x| x.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let rel = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy().to_string();
+                    items.push(CleanupItem {
+                        name: format!("{slug} / 执行记录 / {}", fname(&path)),
+                        size: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+                        modified: mtime_secs(&path),
+                        tag: String::new(),
+                        protected: false,
+                        rel_path: rel,
+                    });
+                }
+            }
+            // 账本归档
+            for arch in list_subdirs(&ledger.join("archive")) {
+                let rel = arch.strip_prefix(&root).unwrap_or(&arch).to_string_lossy().to_string();
+                items.push(CleanupItem {
+                    name: format!("{slug} / 归档 / {}", fname(&arch)),
+                    size: dir_size(&arch),
+                    modified: mtime_secs(&arch),
+                    tag: String::new(),
+                    protected: false,
+                    rel_path: rel,
+                });
+            }
+        }
+        items.sort_by(|a, b| b.modified.cmp(&a.modified));
+        let total = items.iter().map(|i| i.size).sum();
+        categories.push(CleanupCategory {
+            key: "records".into(),
+            title: "执行记录 / 归档".into(),
+            hint: "每轮执行台快照与账本归档，纯本机产物".into(),
+            location: "apps/*/ledger/{run_records,archive}/".into(),
+            total_size: total,
+            items,
+        });
+    }
+
+    // ── 4. 缓存 .dumpcache/ + 回收站 apps/.trash/* ──
+    {
+        let mut items = vec![];
+        let dc = root.join(".dumpcache");
+        if dc.exists() {
+            items.push(CleanupItem {
+                name: ".dumpcache（UI dump 临时缓存）".into(),
+                size: dir_size(&dc),
+                modified: mtime_secs(&dc),
+                tag: String::new(),
+                protected: false,
+                rel_path: ".dumpcache".into(),
+            });
+        }
+        for tr in list_subdirs(&root.join("apps/.trash")) {
+            let rel = tr.strip_prefix(&root).unwrap_or(&tr).to_string_lossy().to_string();
+            items.push(CleanupItem {
+                name: format!("回收站 / {}", fname(&tr)),
+                size: dir_size(&tr),
+                modified: mtime_secs(&tr),
+                tag: String::new(),
+                protected: false,
+                rel_path: rel,
+            });
+        }
+        items.sort_by(|a, b| b.modified.cmp(&a.modified));
+        let total = items.iter().map(|i| i.size).sum();
+        categories.push(CleanupCategory {
+            key: "cache".into(),
+            title: "缓存 / 回收站".into(),
+            hint: "临时探针缓存与软删 App，可随时清".into(),
+            location: ".dumpcache/、apps/.trash/".into(),
+            total_size: total,
+            items,
+        });
+    }
+
+    // ── 5. 开发构建缓存（node_modules / target）——大头但可重装，默认不勾 ──
+    {
+        let mut items = vec![];
+        for (rel, name) in [
+            ("desktop/node_modules", "desktop / node_modules（npm 依赖）"),
+            ("desktop/src-tauri/target", "desktop / src-tauri / target（Rust 编译产物）"),
+        ] {
+            let p = root.join(rel);
+            if p.exists() {
+                items.push(CleanupItem {
+                    name: name.into(),
+                    size: dir_size(&p),
+                    modified: mtime_secs(&p),
+                    tag: "可重装".into(),
+                    protected: false,
+                    rel_path: rel.into(),
+                });
+            }
+        }
+        let total = items.iter().map(|i| i.size).sum();
+        categories.push(CleanupCategory {
+            key: "build".into(),
+            title: "开发构建缓存".into(),
+            hint: "非测试数据，删后下次开发/打包自动重建（需重新下载/编译）".into(),
+            location: "desktop/node_modules、src-tauri/target".into(),
+            total_size: total,
+            items,
+        });
+    }
+
+    Ok(CleanupReport {
+        project_size: dir_size(&root),
+        categories,
+    })
+}
+
+/// 把选中的历史文件移进系统废纸篓（不是硬删除）。逐条校验：不含 ..、canonicalize 后仍在仓库根内、
+/// 首段属于允许清理的目录（evidence/apps/.dumpcache/desktop）。返回移除数量、释放字节、逐条错误。
+#[derive(Serialize)]
+pub struct CleanupResult {
+    pub removed: usize,
+    pub freed: u64,
+    pub errors: Vec<String>,
+}
+
+#[tauri::command]
+pub fn move_to_trash(app: AppHandle, rel_paths: Vec<String>) -> Result<CleanupResult, String> {
+    let root = root_of(&app)?;
+    let canon_root = fs::canonicalize(&root).map_err(|e| e.to_string())?;
+    let allowed_first = ["evidence", "apps", ".dumpcache", "desktop"];
+    let mut removed = 0usize;
+    let mut freed = 0u64;
+    let mut errors = vec![];
+
+    for rel in &rel_paths {
+        let first = rel.split(['/', '\\']).next().unwrap_or("");
+        if rel.contains("..") || !allowed_first.contains(&first) {
+            errors.push(format!("{rel}：非法路径，跳过"));
+            continue;
+        }
+        let abs = root.join(rel);
+        let canon = match fs::canonicalize(&abs) {
+            Ok(c) => c,
+            Err(e) => {
+                errors.push(format!("{rel}：{e}"));
+                continue;
+            }
+        };
+        if !canon.starts_with(&canon_root) || canon == canon_root {
+            errors.push(format!("{rel}：越界或指向仓库根，跳过"));
+            continue;
+        }
+        let sz = dir_size(&canon);
+        match trash::delete(&canon) {
+            Ok(_) => {
+                removed += 1;
+                freed += sz;
+            }
+            Err(e) => errors.push(format!("{rel}：移入废纸篓失败 {e}")),
+        }
+    }
+
+    Ok(CleanupResult { removed, freed, errors })
 }

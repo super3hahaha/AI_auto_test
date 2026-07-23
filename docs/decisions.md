@@ -50,15 +50,15 @@
 - **决定**：不追求让主循环第二遍变快，而是**分工**——第一遍 AI 走主循环探路+多源判定（慢、健壮），稳定通过的路径固化成 `flows/flow_*.sh`（纯选择器、无硬坐标），回归跑脚本（快、脆）。
 - 原因：主循环慢的大头是 AI 逐屏决策+首遍试探，不是 dump（dump 两遍一样贵），所以"缓存/加速主循环"没意义；真正省时间是把决策从回归路径上彻底拿掉 → 脚本化。
 - **代价与边界**：脚本 App UI 一改就断，是设计取舍不是缺陷——UI 变更的自愈本就是 AI 大脑的价值点，不该塞进死脚本。故只固化稳定的 happy path；发现型/边界/跨页判定仍走主循环。**固化本身也不自动发生**——只有用户明确要求才动手写脚本，跑通一次不代表就该固化。
-- 详见 `docs/flow-freeze.md`。
+- 详见 skill `flow-freeze`（`.claude/skills/flow-freeze/SKILL.md`）。
 
 ## 9. `.dumpcache` 复用 dump：同版本+同设备内不分"这次运行/以后运行"
 
 - **背景**：dump ≈2s 是最贵动作（见 #8）。固化脚本里大量 `waitfor <元素>` 后紧跟一个 `tapid/taptext`——两条命令各自独立 dump，内容其实一样，纯浪费。同时主循环探路阶段本来就要 `ui <step>` dump，这份数据如果只用一次（当场决策）就扔了，以后这条路径固化成脚本还得重新探一遍选择器对应的坐标。
 - **决定**：给 `ui`/`waitfor` 加 `--cache <screen_id>`（成功后把当次 dump 存进 `.dumpcache/<app>/<version>/<serial>/<screen_id>.xml`），给 `tapid/taptext/tapdesc/find` 加 `--from-cache <screen_id>`（命中就直接读，不重新 dump；未命中就照常活 dump 并顺手写入该槽）。`ui <step>` **默认自动写缓存**（screen_id 取 `step` 名），不用主循环额外加参数。两个 flow 脚本里"waitfor 紧跟 tap"的位置都接上了这对参数。
 - **缓存 key 是 `app/version/serial`，天然限定了复用范围，不区分"同一次运行"还是"以后哪次运行"**：只要还是同一个 App 版本、同一台设备，`bounds` 就是稳的（分辨率/密度决定 `bounds`，见 #4 和跟用户确认过的结论）——今天主循环探路种下的缓存，明天固化脚本在同一版本同一设备上跑照样能读到，不用固化那天重新预热；换了版本或换了设备，目录本身就不一样，天然读不到，不存在"读到别的版本坐标"的风险。
-- **代价（残余风险，不是新增风险类别）**：同版本号内 App 偷偷调整了布局（没 bump 版本号的小改动/AB 实验/远程配置下发的布局变化），缓存的坐标可能跟当下实际布局对不上——接受这个概率，出问题时现象是"点击后校验不符"，走 `flow-freeze.md` 里已有的"脚本断了回主循环重探"路径处理。
-- 详见 `docs/flow-freeze.md` 里的缓存用法。
+- **代价（残余风险，不是新增风险类别）**：同版本号内 App 偷偷调整了布局（没 bump 版本号的小改动/AB 实验/远程配置下发的布局变化），缓存的坐标可能跟当下实际布局对不上——接受这个概率，出问题时现象是"点击后校验不符"，走 skill `flow-freeze` 里已有的"脚本断了回主循环重探"路径处理。
+- 详见 skill `flow-freeze` 里的缓存用法。
 
 ## 10. 开新一轮时本地账本也归档+重置，不再让新表继承全部历史
 
@@ -90,7 +90,7 @@
 
 - **背景（2026-07-02，用户明确要求）**：这个仓库是要给别人复用的通用 ADB 自动化测试框架，不是"MP3 Cutter 专用测试项目"。之前 `cases/regression.yaml`（220 行，完整 MP3 Cutter 回归用例集）已经写进了仓库，加上 `tools/new_run.py` 里硬编码的默认看板标题「MP3Cutter 模拟器回归测试执行看板」、`cases/_TEMPLATE.yaml` 示例里用真实用例 ID `CUT-CORE-01`/模块名"音频裁剪"，都是具体业务内容渗进了框架代码/文档，量偏多，且换个 App 复用时容易让人误以为这些是"框架要求"而不是"示例"。
 - **决定**：只保留 `cases/CUT-CORE-01.yaml` + `flows/flow_cut_save.sh` 这一组最小示例（用例定义→固化脚本→执行，跑通给人看完整链路），量控制住、不铺开。`cases/regression.yaml` 加进 `.gitignore`，不进库（本机继续留着自用）。`tools/new_run.py` 的默认标题、`cases/_TEMPLATE.yaml` 的示例 ID/模块名都换成通用占位（`AI+ADB 自动化测试执行看板` / `MODULE-CASE-01` / "示例模块"），`config/target.example.json` 补充 `board_title`/`report_title` 两个可选字段，让"换 App 时要改什么"一目了然，不用去翻代码找硬编码默认值。
-- **推论**：`docs/gotchas.md`/`docs/decisions.md`/`docs/flow-freeze.md` 里少量用 MP3 Cutter 具体命令/案例做说明性示例（如"实例：MP3Cutter 2.3.4H 与 2.3.5A..."）保留——这些是解释框架机制用的最小示例，不是业务用例集，量很小，不算违反本条。以后再往文档里加说明性例子时，同样把量控制在"够说明一个点"，别整段搬运具体业务细节。
+- **推论**：`docs/gotchas.md`/`docs/decisions.md`/`.claude/skills/flow-freeze/SKILL.md` 里少量用 MP3 Cutter 具体命令/案例做说明性示例（如"实例：MP3Cutter 2.3.4H 与 2.3.5A..."）保留——这些是解释框架机制用的最小示例，不是业务用例集，量很小，不算违反本条。以后再往文档里加说明性例子时，同样把量控制在"够说明一个点"，别整段搬运具体业务细节。
 - **踩坑（2026-07-02）**：给 `cases/regression.yaml` 里的 `CUT-EDGE-01`（业务用例，本就不进库）配了固化脚本 `flows/flow_cut_edge_wav40000.sh`，写完之后没意识到这条脚本同样是具体业务内容，直接 `git add` 提交推送上去了，违反了本条"只留一份最小示例"——用户发现后要求撤回。已修：`git rm --cached` 撤销跟踪（本地文件保留），`.gitignore` 里跟 `cases/regression.yaml` 同款加了一条 `flows/flow_cut_edge_wav40000.sh`。**教训**：`cases/regression.yaml` 里任何用例配的固化脚本，只要那条用例本身不进库，配套脚本也不进库——判断"要不要进 git"应该跟着它所属的用例走，而不是默认新写的脚本都跟 `flow_cut_save.sh` 一样是示例。
 
 ## 15. `output-check --expect` 命中后默认再做一层完整性检查（_size>0 + duration 非空）
@@ -230,3 +230,51 @@
 - **决定**：Runner.vue 的 `subTab` 由两个值扩到三个：`library`（场景库）/`monitor`（执行台）/`resources`（资源库，新增）。资源库内左右两栏：左「文件」= 原样搬迁的 assets/ 管理（上传/删除，逻辑不变）；右「文本」= 新的 key-value 登记，`config/text_resources.json`（数组 `[{key,value}]`，跨 App 共享，风格照抄 `device_aliases.json`），支持新建/改值(inline 输入框 change 事件)/删除。
 - **脚本取值路径**：Tauri 命令只服务桌面壳 UI（`list/upsert/delete_text_resource`）；固化脚本是 Python，不走 Tauri IPC，所以在 `tools/_appctx.py` 加了 `get_text_resource(key, default=None)`，直接读同一个 JSON 文件。两边共享同一份文件、不重复定义格式。
 - **为什么不用 HashMap 而用数组**：`device_aliases.json` 用 HashMap（`serial→alias`）没问题因为不关心顺序；文本资源在 UI 里要按登记顺序展示，且 Rust `HashMap` 序列化顺序不稳定，故存 `Vec<{key,value}>`，upsert 时线性查找 key 是否存在（量级小，几十条内不成问题）。
+
+## 33. 执行台跑完自动调 claude 判定用例结果（judge_result.py），并收尾自动刷新 Doc 报告（2026-07-22）
+
+- **背景**：desktop 执行台此前只跑 `run_flow.py`/`auto_repair.py` 登记时间戳，通过/失败判定要等回到 Claude Code 对话里人工跑 `case_result.py`，导致跑完一轮桌面端账本长期停在"全部待执行"，Doc 报告也从来没被桌面端触发过（只有 `sync_sheets`），实测出现过跑完 17 条真机用例、Doc 仍显示 0/17 的情况。
+- **决定**：新增 `tools/judge_result.py`，desktop 每格 `run_flow`/`auto_repair` 跑完后自动调一次；`finish()` 收尾从"只 syncSheets"改成 `syncSheets → docReport` 顺序，不加开关（用户拍板：反正每轮都要出 Doc 报告，没有"不生成"的场景）。
+- **只有 fail（脚本异常退出）才真的调 claude 读证据判定**：`--status pass|healed|fail`，pass/healed(exit 0) 直接落「通过」、不进 claude；只有 fail 才把证据+用例预期喂给 headless claude CLI（复用 `auto_repair.py` 的 `-p` 模式，只给 Read/Glob/Grep，不给 Bash/Edit）。**代价明确记录**：exit 0 不等于"功能对不对"——比如 CUT-CORE-01 一次真实跑中脚本 exit 0（没崩），但另存为对话框实际选的比特率是 320kbps 而不是用例要求的 128kbps，只有让 claude 读 ui dump 才抓得出来；只判 fail 意味着这类"脚本没崩但断言其实没做到"的偏差不再被这条链路兜住，只能靠人工抽查/下一轮回归发现。当前是速度优先的取舍，不是默认安全。
+- **判定结果的边界**：claude 判定给 PASS/FAIL/BLOCKED/GAP 才落 `case_result.py` 最终结论；证据不足/看不清/claude 调用失败超时/本机没装 claude CLI 一律判 `UNCERTAIN`，只在 log.csv 记「需人工介入」+ 诊断原文，不落最终结果——同 `auto_repair.py` 的"不可洗绿"边界，宁可保守也不能替人工把不确定的结论写死。
+- **不影响 Doc 生成机制本身**：无论 pass/healed 快速直落，还是 fail 走 claude 判定，最终都经同一个 `case_result.py` 写 `queue.csv`（当前状态=已完成 + 执行结果），`compile_cases.py`/`sheets_sync.py`/`doc_report.py` 的 board 投影逻辑完全不变；差别只在 pass/healed case 的「结论」备注是通用文案（"未经 claude 复核"），不是 claude 读证据后的诊断原文。
+- **追加（同日）：「失败判定」改成可关的开关，默认关**——实测发现失败用例排队走 claude 判定时，格子已显示终态 pass/fail 但整轮 `running` 还没结束（见 gotchas.md 那条 `judging` 字段），用户体验下来觉得等待不值，要求给这条判定加开关。Runner.vue 场景库「看板」卡片里加了「失败判定」复选框（默认不勾），传参 `judgeOnFail`。**pass/healed 直接判「通过」这条不受此开关影响**——它本来就不调 claude、几乎无成本，没必要关。
+- **追加（同日，紧接上一条，修的是同一处引入的真实 bug）：一开始的实现是"不勾选就整个不调 `judge_result.py`"，这是错的**——`run_flow.py` 只把「已完成/需复核」写进 `log.csv` 那一行的备注，从来不碰 `queue.csv` 的"当前状态"列（那列只有 `case_result.py` 会写）。整个不调 `judge_result.py`，意味着失败用例的 `queue.csv` 当前状态**永远停在"待执行"**，跟真的没跑过一模一样——实测复现：`CUT-CORE-01`/`DL-TT-01` 通过、`CUT-EDGE-02` 真实失败（复现 BUG-CUT-EDGE-03），因为没勾「失败判定」，Doc 却显示"本轮共执行 3 条用例，已完成 2，通过率 100%"，完全漏掉了失败的那条。**修法**：`judge_result.py` 加 `--no-claude` 参数，`--status fail --no-claude` 时跳过 claude、直接调 `case_result.py` 落「需复核」（不是不调）；desktop 侧改成不管 `judgeOnFail` 是否勾选，`pass`/`healed`/`fail` 三种状态**都必须**调 `judge_result.py`（Rust/TS 都加了 `noClaude` 参数透传）。**教训**：任何"跳过某个耗时步骤"的开关，如果那个步骤同时兼着"把执行结果写进真值账本"的职责，就不能整个跳过——必须拆成"跳过耗时的那部分（读证据判定）"和"必须做的那部分（把状态更新写进 queue.csv）"两件事，否则开关一关，账本就悄悄失真。
+- **追加（同日）：`sheets_sync.py`/`doc_report.py` 都补了重算 `summary.csv`，堵住"Doc 永远显示 0/0"的真根因**——只有 `compile_cases.py` 自己的 `main()` 会调 `build_summary()`，而 desktop 收尾链路（`run_flow`/`judge_result` → `sync_sheets` → `doc_report`）从没单独跑过 `compile_cases.py`，两份报告读的「执行结论/结果统计」数字全部来自 `summary.csv`，这份文件因此永远停在最近一次手动 `compile` 时的旧计数——不管账本里实际判了多少条，通过率/已完成一直是 0。修法：两个脚本各自的 `project_board_from_queue()` 调用后紧跟一次 `build_summary(board_rows, scope_desc)`，保证渲染前 `summary.csv` 一定是新鲜的。这是本条决策最初动机（"Doc 没更新"）真正的病根，前面记录的"判定没跑""doc_id 被并发覆盖"都是真实但次要的问题，都排查完之后剩下的最后一层才是这个。
+- **追加（同日）：claude 判定把"已知缺陷复现"误判成覆盖缺口（GAP）而不是失败（FAIL）**——CUT-EDGE-02 真实复现了历史缺陷 BUG-CUT-EDGE-03（MediaStore duration 与 ffprobe 实测真实时长差 3.4 秒，本机独立 pull+ffprobe 复核确认），固化脚本自己的 `FAILED=1`/`exit=1` 判定是对的，但 `judge_result.py` 首次判定给了 GAP，违反了 [[feedback-no-known-defect-exemption]] 那条"不因已知就放过"的硬规则——很可能是因为 case yaml 的「预期」列表里把"已知缺陷复现"这个现象也写成了一条"预期"（供作者自己核对用），被模型误读成"这个偏差本来就是预期内的，所以不算失败"。当时改了三处补丁（提示词加规则、把 `notes` 塞进提示词、放宽截断上限），但见下一条——这条误判最终是这套"让 claude 读证据五选一"的机制本身被砍掉解决的，不是靠打补丁。
+- **追加（同日，推翻上面一整套"claude 判定 fail"的设计，改成纯确定性映射）**：用户复盘后指出——固化脚本从 2026-07-22 起已经按 flow-freeze 的失败判定标准（见 #34）自己把 output-check/logscan/断言的结果绑进了 exit 码，`FAILED=1` 就是可信的"失败"判定，压根不需要再让 claude 读一遍证据重新判一次。这次"偷懒省事"反而是对的方向：让 claude 介入判断反倒引入了新的误判风险（上面那条 GAP/FAIL 误判就是实证），还要多等 1-2 分钟、多一个"要不要判"的开关。**最终方案**：`judge_result.py` 整个重写成纯确定性映射，删掉 `SYSTEM_PROMPT`/`run_claude`/`build_prompt`/`find_claude` 依赖，不再调 claude：
+  - `pass`/`healed`(exit 0) → 通过
+  - `fail`（非自愈模式下脚本异常退出）→ 失败（直接采信脚本自己的判定，不重新判）
+  - `app_defect`/`needs_human`（自愈模式 `auto_repair.py` 专属，exit 2/3/4/5）→ 需复核（大脑自愈都拿不准/判了疑似缺陷，这一层交人工/Claude Code，不在这里下最终结论）
+  desktop 侧同步简化：删掉「失败判定」复选框和 `judgeOnFail`/`noClaude` 整条传参链路，`runStore.ts` 里所有终态（不含 waiting/running/aborted）统一无条件调 `judge_result.py`——现在这个调用几乎瞬时（纯本地文件写入），不再需要开关来"跳过耗时判定"。`RunCell.judging` 字段改名 `recording`（更准确：这一步现在是"落库"而不是"判定"），UI 提示也从"判定中…"改成"落库中…"。
+  **教训**：给一个新引入的 AI 判断层加"用户觉得慢所以给个开关"这种缝缝补补，往往是信号——真正该问的是"这层判断到底有没有必要存在"。这次绕了一整圈（加开关→修开关的 bug→加长度限制→加规则）才发现最初就不该让 claude 判 fail，确定性代码（exit 码 + 脚本自身断言）本来就够用、还更可靠。以后再给执行链路加"AI 兜底判断"这类环节，先问一句：脚本自己能不能把这个判断标准化掉（就像 #34 那样），能的话优先选确定性方案。
+
+## 34. 固化脚本失败判定标准化：FAILED 标记 + exit 码绑定，不豁免已知缺陷（2026-07-22）
+
+- **背景**：CUT-EDGE-02 一轮真机执行被判「通过」，但日志里明确记录了 ffprobe 与 MediaStore 时长交叉核对不一致（`output-check ✗`）。调研发现旧脚本对这类"已知缺陷"（BUG-CUT-EDGE-03）用裸 `|| true` 吞掉了非0退出码——脚本内部 log 了"未通过"，但 exit 码仍是 0，而 `judge_result.py` 只在 exit!=0 时才触发 claude/人工复核（见 #33），等于这条失败被架空。进一步排查发现全部 14 个 `apps/MP3Cutter/flows/flow_*.sh` 都没有一处 `exit 1`，`--result 失败` 只写 evidence.csv 不影响 exit 码，output-check 失败要么走 if/else 只 log 文字、要么裸 `|| true`，处理方式不统一。
+- **决定（用户拍板：缺陷就是缺陷，失败就是失败，不做已知缺陷豁免）**：14 个固化脚本统一改造——① 脚本内维护全局 `FAILED=0`；② 每个校验点（output-check/logscan/结果断言/`validate_*` 函数）失败时置位 `FAILED=1`，同时照常记证据、不中断脚本，跑完收集完整证据；③ 脚本收尾 `[ "$FAILED" = "1" ] && exit 1 || exit 0`。已知缺陷（BUG-CUT-EDGE-03、CUT-EDGE-2.3.4F 的 0 字节缺陷）不再享受 `|| true` 豁免，复现即判失败，直到真正修复。
+- **效果**：`judge_result.py`「exit!=0 才复核」的门禁现在能真正兜住这类内部校验失败，不再出现"内部标了失败、外部 exit 0"的架空情况；`run_flow.py` 的收尾提示文案同步更新，exit!=0 时明确提示"内部校验判失败，应判失败而非通过"。标准与写法记入 skill `flow-freeze`「失败判定标准」章节，之后新固化脚本必须照此实现。
+
+## 35. 桌面执行台收尾自动登记问题清单（issue_register.py），补断链（2026-07-23）
+
+- **背景（断链）**：桌面执行台跑固化脚本，`judge_result.py` 只把用例终态写进 `queue.csv` 的「执行结果」（通过/失败/需复核），**没有任何环节往 `issues.csv` 写问题清单**。问题清单一直只靠 Claude Code 主循环人工登记，桌面端跑出来的失败因此从不进 Sheet「问题清单」tab / Doc 的失败详情——用户实际发现"桌面跑完没有 claude 登记问题清单"。
+- **决定**：收尾链路从 `syncSheets → docReport` 扩成 `registerIssues → syncSheets → docReport`（`registerIssues` 必须最先，后两个要读 `issues.csv`）。`runStore.publish()` 遍历本轮终态为 `fail/app_defect/needs_human` 的格子，**串行**（并发会撞车写同一 `issues.csv`）逐个调新 Tauri 命令 `register_issue` → `tools/issue_register.py`。中止的轮次不登记。
+- **和 #33 的边界（关键，不重蹈覆辙）**：#33/#34 定论是「是不是失败、算哪一档」已被固化脚本 exit 码确定性决定，不能再让 claude 推翻。所以 issue_register **不让 claude 裁决前缀**——前缀由终态确定性映射：`fail→BUG-`（非自愈模式采信脚本 exit≠0=缺陷，#34 不豁免；用户拍板即便是脚本脆导致的假阳也先记 BUG-、靠人工看证据后改）、`app_defect→BUG-`、`needs_human→RISK-`。claude 只干做不成确定性代码的活：读证据写「标题/预期/实际/复现/严重级别」+ Grep 历史 `issues.csv` 判是不是老缺陷（是则复用旧完整 ID）。这类语义写作/查重必须它来，不违反 #33。verdict 只有 `REGISTERED/UNCERTAIN` 两个（删掉了 `NOT_AN_ISSUE`——终态已确定性判了"是问题"，claude 无权翻案成"不是问题"）。
+- **两个新工具的职责拆分**：`tools/case_issue.py`（纯 CSV 写入器，`csv.writer` 转义 + 按问题ID upsert + ID 格式校验 `^(BUG|BLOCK|GAP|RISK)-...`，主循环人工登记也可复用，替代手写 CSV）；`tools/issue_register.py`（编排：定位证据/查重/组 prompt/调 headless claude/写 log）。**权限收紧**：issue_register 调 claude 时 `--allowedTools "Read" "Glob" "Grep" "Bash(python3 tools/case_issue.py:*)"`——不给 `Edit`（比 auto_repair 更紧，它不需要改任何文件，唯一落盘方式是那条白名单命令），杜绝 claude 手写/乱改 CSV。claude 声称 REGISTERED 但 `issues.csv` 无实际改动 → 判未落盘、记「需人工登记」（仿 auto_repair 的 diff 校验）。
+- **去重（按 attempt 证据目录）**：同一次执行（同一 `evidence/.../<attempt>` 目录）只登记一次——`log.csv` 里若已有该 attempt 的「问题登记 [终审]」行就跳过。自愈重试、用户手动重跑会生成新 attempt 目录，才会再次触发。`REGISTERED` 记 `[终审]`（`证据`列存 attempt 相对路径供去重扫描），`UNCERTAIN`/超时/claude 不可用/无改动记 `[未完成]`（不算终审，允许之后重试同一 attempt）。
+- **退化 / 边界**：本机没装/没登录 claude CLI → 全部落「需人工登记」、exit 4，不阻塞收尾（同 auto_repair 兜底）。这仍是一个会调 claude 的语义步骤，约 1-2 分钟/条，一轮失败多会拖慢收尾——但同 sheets_sync/doc_report 是 fire-and-forget，不阻塞 UI。判断质量上限=模型读证据写描述准不准，与 auto_repair 的 SCRIPT_FIX/APP_DEFECT 判断同量级，非新增风险类别。前缀映射只产 `BUG-/RISK-`（`阻塞/覆盖缺口` 是主循环探路专属，桌面固化脚本链路走不出来，见 RUNBOOK 分档表下的注）。
+- **执行台 UI**：`RunCell` 加 `issue: none/registering/registered/manual`，失败/需复核格在卡片上显徽标（登记问题中…/已登记问题/待人工登记）。
+
+## 36. output-check 比特率容差从 8kbps 放宽回 32kbps（推翻 #CUT-CORE-01 当日决定，2026-07-23）
+
+- **背景**：2026-07-22 把 `_ffprobe_cross_check` 改成读 ffprobe **stream 级**（`-select_streams a:0`）`bit_rate`（此前读 format 级会被封面图/ID3 元数据开销拉偏 ~20kbps，才留了 32kbps 容差），当时判断 stream 级已是"编码器精确值"，把 `--bitrate-tolerance-kbps` 默认值收紧到 8kbps。CUT-EDGE-02（M4A 裁剪转存 AAC）连续两轮真机复现 BUG-CUT-EDGE-02：ffprobe 实测 bit_rate≈288kbps，与「另存为」弹窗回显的目标值 266kbps 相差 22kbps，稳定复现、非偶发，超出 8kbps 容差判失败。
+- **决定（用户拍板）**：8kbps 过紧的判断错了——stream 级 bit_rate 虽然排除了容器/元数据开销，但 AAC 等编码器实际落盘比特率相对目标值本身就有正常范围内的波动（不是每种编码器都严格 CBR），不能当成产品缺陷。把 `--bitrate-tolerance-kbps` 默认值放宽回 32kbps，全格式统一（不单独给 AAC 开小灶），BUG-CUT-EDGE-02 相应改判「已关闭·非缺陷」。
+- **和 [[feedback-no-known-defect-exemption]] 的边界（不是打破那条规矩）**：那条规矩管的是"固化脚本判定不因'已知缺陷'搞豁免/跳过"——即已经判定为缺陷的复现不能因为"上次也这样"就悄悄放过。这次不是给已确认的缺陷开后门，而是回头发现判定标准（容差阈值）本身定错了，纠正标准之后这条现象根本不该落入"缺陷"范畴。标准改错了就该改标准，但改标准要显式决策+留痕（就是本条），不能靠默默调大参数不留记录。
+- **影响范围**：`tools/adbkit.py` 的 `--bitrate-tolerance-kbps` 默认值 8→32；`apps/MP3Cutter/cases/CUT-CORE-01.yaml` 同步改回 32kbps（其余 CUT-FMT-01/02、CUT-CORE-02、CUT-EDGE-02、regression 几条 yaml 里的文档本来就写着 32kbps，只是代码默认值之前是 8，两边曾经不一致——现在代码与文档口径统一）。
+
+## 37. issue_register.py 自动登记的问题，Doc 报告失败详情里从来没有配图——补 --key-evidence（2026-07-23）
+
+- **背景（#35 引入的新断链）**：#35 把"桌面跑完自动登记问题清单"这条链路接上了，但 `issue_register.py` 的 headless claude 只被允许调 `case_issue.py` 写 `issues.csv`（不许碰 `evidence.csv`），而 `doc_report.py` 的「失败用例详情」插图只认 `evidence.csv`「截图预览」列里标了"关键，供报告用"的行（见 `case_result.py` 的 `--evi` 机制，#12）。两条链路各自独立、谁都没把"这条问题该配哪张关键截图"这一步接上——真实复现：`MIX-CORE-02`/`MERGE-FMT-01` 两条失败都被 `issue_register.py` 完整登记进了 `issues.csv`（标题/预期/实际/复现步骤俱全），但 `05-rename-fail.png`/`06-order-fail.png` 两张截图仍停在 adbkit 自动登记时的默认值"过程留痕，仅本地"，Doc 里「失败用例详情」四节因此一张图都没有——不是 `doc_report.py` 的插图逻辑坏了（它是刻意"没人标关键就宁可不放，不瞎猜一张不相关的"，见其源码注释），是没人做过"标关键"这一步。
+- **决定**：给 `case_issue.py` 加可选参数 `--key-evidence <证据文件相对仓库根路径>`——登记完问题后，按 `(用例ID, 文件/链接)` 在 `evidence.csv` 找最后一个匹配行（同一路径可能因重跑积累多行，倒序取最新，跟 `case_result.py --evi` 的 upsert 逻辑一致），把该行"截图预览"就地改成"关键，供报告用"；找不到匹配行只打警告、不影响问题本身登记成功（宁可漏标关键，不能让标记失败连累问题登记）。`issue_register.py` 的 `SYSTEM_PROMPT`/`build_prompt` 同步要求 headless claude 挑一张"直接支撑失败结论"的截图（通常就是它写"实际结果"时引用的那张），登记问题时把相对路径带进 `--key-evidence`；挑不出来（比如证据只有文本日志）就不传，不许为了凑数瞎选一张不相关的（如首页截图）。
+- **为什么不复用 `case_result.py --evi`**：`case_result.py` 还会重写 `queue.csv`（当前状态/执行结果/证据链接/历史覆盖情况，后者要现查 adb）和 `log.csv`，这些字段 `judge_result.py` 在 `issue_register.py` 之前已经写过一次，重复调用等于多余的 adb 往返 + 有和已有记录冲突的风险；`case_issue.py` 已经是 `issue_register.py` 唯一被允许调用的落盘命令，加一个只改"截图预览"单列的选项比新开权限、换一个更重的工具更小、更安全。
+- **教训**：一条新自动化链路（#35）补上一个断链的同时，很容易在"证据里哪张图最能说明问题"这类描述性判断上留下新断链——这类判断经常散落在多个独立工具的边界上，加新链路时要顺着"这条数据最终要被谁读、读的时候要求它长什么样"倒推一遍，不能只看"我这步该写的字段是不是都写了"。

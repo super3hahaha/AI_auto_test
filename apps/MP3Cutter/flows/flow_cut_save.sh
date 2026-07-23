@@ -29,6 +29,9 @@ log(){ echo "[$S] $*"; }
 # 通用广告/弹窗清障：调 adbkit sweep（规则库 config/ad_rules.json 驱动），命中就点、没有就跳过，
 # 始终 exit0 不阻断流程；点掉了就在流程日志里记一行。参数按调用点的广告出现节奏各自传。
 sweep(){ local out; out=$($AK sweep "$@" 2>/dev/null || true); grep -q '点掉' <<< "$out" && log "清障 $(grep '点掉' <<< "$out" | tr '\n' ' ')" || true; }
+# 失败判定标准（2026-07-22 统一）：output-check/logscan/结果断言不达预期一律 FAILED=1（不豁免
+# 已知缺陷），脚本仍跑完收集证据，收尾按 FAILED 决定 exit 0/1，见 skill flow-freeze。
+FAILED=0
 
 adb -s "$S" push "$SRC" "$DEV_DST" >/dev/null
 # 文件名带空格，adb shell 会把整串命令再交给设备端 shell 解析一次，必须用单引号包住 URI，
@@ -140,7 +143,7 @@ $AK waitfor id bitrate_trigger --timeout 8 --cache saveas >/dev/null
 # 同一条纪律用在保存框：默认格式/比特率会直接决定产物，不能只截图配一句空话——读
 # format_text/tag_text/bitrate_text/tag_text1 的真实文本存证（tag_text="(原始)" 说明
 # 是沿用源文件参数，不是App写死的默认值），$FORMAT 留到 output-check 阶段跟 MediaStore
-# 的 mime_type 交叉核对（flow-freeze.md 写脚本的纪律 #7）。
+# 的 mime_type 交叉核对（skill flow-freeze 写脚本的纪律 #7）。
 SAVEAS_FIELDS=$($AK --case "$CASE" ui 04-saveas --field format_text --field tag_text --field bitrate_text --field tag_text1)
 FORMAT=$(field_of format_text "$SAVEAS_FIELDS")
 FORMAT_TAG=$(field_of tag_text "$SAVEAS_FIELDS")
@@ -148,6 +151,10 @@ BITRATE=$(field_of bitrate_text "$SAVEAS_FIELDS")
 BITRATE_TAG=$(field_of tag_text1 "$SAVEAS_FIELDS")
 $AK --case "$CASE" shot 04-saveas "弹出「另存为」对话框：格式=$FORMAT$FORMAT_TAG / 比特率=$BITRATE$BITRATE_TAG" --used-dump >/dev/null
 log "另存为：格式=$FORMAT$FORMAT_TAG，比特率=$BITRATE$BITRATE_TAG"
+# 比特率文案含单位（如"320kbps"），抠出数字部分供 output-check 交叉核对产物真实比特率
+# （MediaStore 没有比特率字段，得靠 --expect-bitrate-kbps 触发的 ffprobe 交叉核对）；
+# 格式固定 MP3(原始)，产物后缀恒为 mp3，一并断言，防止"格式没变但后缀不对"这类静默错位。
+BITRATE_KBPS=$(grep -oE '[0-9]+' <<< "$BITRATE" | head -1)
 
 $AK tapid btn_convert --timeout 8 >/dev/null
 # 点转换后 MP3 Cutter 常弹插屏广告，会盖住结果页让下面的 waitfor「音频已保存」超时误判失败。
@@ -161,20 +168,24 @@ if $AK waitfor text 音频已保存 --timeout 15 >/dev/null 2>&1; then
   INFO=$(field_of info "$($AK --case "$CASE" ui 05-result --field info)")
   $AK --case "$CASE" shot 05-result "显示「音频已保存」，裁剪产物已生成；结果页显示：$INFO" --used-dump >/dev/null
   log "结果: 音频已保存 ✓（结果页：$INFO）"
-  if OC=$($AK --case "$CASE" output-check --expect mp3-sample-track --expect-duration-ms "$EXPECT_MS" --expect-format "$FORMAT" 2>&1); then
-    log "MediaStore 校验通过：$(grep -E '完整性检查通过|时长对比|格式对比' <<< "$OC" | tr '\n' ' ')"
+  if OC=$($AK --case "$CASE" output-check --expect mp3-sample-track --expect-duration-ms "$EXPECT_MS" --expect-format "$FORMAT" \
+      ${BITRATE_KBPS:+--expect-bitrate-kbps "$BITRATE_KBPS"} --expect-suffix mp3 2>&1); then
+    log "MediaStore 校验通过：$(grep -E '完整性检查通过|时长对比|格式对比|真实比特率|文件后缀' <<< "$OC" | tr '\n' ' ')"
   else
     log "MediaStore 校验未通过：$(tail -1 <<< "$OC")"
+    FAILED=1
   fi
 
-  # 2026-07-20 新增：结果页对刚生成的音频重命名为 cut+完成日期时间(精确到分钟，如
-  # cut20260720_1802)，验证
+  # 2026-07-20 新增：结果页对刚生成的音频重命名为 cut+完成日期时间(精确到秒，如
+  # cut20260720_180245)，验证
   # 重命名链路本身（不只是改 UI 文案，MediaStore _data 路径也要跟着变，已实测确认）。
+  # 2026-07-23：原为精确到分钟，同分钟内连跑会撞名导致重命名误判失败，改成精确到秒
+  # （见 docs/gotchas.md 2026-07-23 条目）。
   # 点文件名旁的铅笔图标(id/iv_rename，实测点它会弹「重命名」对话框)：EditText(id=file_name)
   # 已预填原文件名且已获焦，光标不一定在末尾——先 MOVE_END 再连续退格清空（原名长度不定，
   # 退格次数给足 40 次兜底，清不干净也不会误删到对话框外）。button1(重命名)在文本未变化时是
   # disabled 的，只要新文件名和原名不同就会置为 enabled，天然满足。
-  NEWNAME="cut$(date +%Y%m%d_%H%M)"
+  NEWNAME="cut$(date +%Y%m%d_%H%M%S)"
   $AK tapid iv_rename --timeout 5 >/dev/null
   $AK waitfor id file_name --timeout 5 >/dev/null
   $AK key 123 >/dev/null   # KEYCODE_MOVE_END
@@ -184,17 +195,25 @@ if $AK waitfor text 音频已保存 --timeout 15 >/dev/null 2>&1; then
   if $AK waitfor text "$NEWNAME.mp3" --timeout 8 >/dev/null 2>&1; then
     $AK --case "$CASE" shot 06-renamed "结果页文件名已重命名为 $NEWNAME.mp3" >/dev/null
     log "重命名: 结果页文件名 ✓ $NEWNAME.mp3"
-    if OC2=$($AK --case "$CASE" output-check --expect "$NEWNAME" 2>&1); then
-      log "重命名 MediaStore 校验通过：$(grep -E '完整性检查通过' <<< "$OC2" | tr '\n' ' ')"
+    # --ffprobe：MediaStore 的 _size>0/duration 非空只能证明"不是空壳"，测不出"duration
+    # 字段本身就是错的"这类静默失真（BUG-CUT-EDGE-03 真机实测过，见 docs/gotchas.md）；
+    # 需宿主机装 ffmpeg，没装会打印警告并跳过，不影响 exit code。
+    if OC2=$($AK --case "$CASE" output-check --expect "$NEWNAME" --ffprobe 2>&1); then
+      log "重命名 MediaStore 校验通过：$(grep -E '完整性检查通过|ffprobe真实时长交叉核对' <<< "$OC2" | tr '\n' ' ')"
     else
       log "重命名 MediaStore 校验未通过：$(tail -1 <<< "$OC2")"
+      FAILED=1
     fi
   else
     $AK --case "$CASE" shot 06-rename-fail "未见重命名后的文件名 $NEWNAME.mp3，重命名疑似失败" --result 失败 >/dev/null
     log "重命名: 未见 '$NEWNAME.mp3'，已截图待查"
+    FAILED=1
   fi
 else
   $AK --case "$CASE" shot 05-fail "未见「音频已保存」，保存疑似失败" --result 失败 >/dev/null
   log "结果: 未见'音频已保存'，已截图待查"
+  FAILED=1
 fi
-log "DONE"
+log "DONE（FAILED=$FAILED）"
+[ "$FAILED" = "1" ] && exit 1
+exit 0

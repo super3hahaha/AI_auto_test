@@ -12,6 +12,8 @@ evidence/*/
 .dumpcache/
 __pycache__/
 *.pyc
+# 本机专用虚拟环境（Python 3.11，替代系统 3.9 消 EOL 警告，见 gotchas.md）——各协作者本机自建
+.venv/
 
 .DS_Store
 
@@ -33,6 +35,10 @@ apps/*/cases/*
 !apps/*/cases/_TEMPLATE.yaml
 apps/*/flows/*
 !apps/*/flows/flow_cut_save.sh
+# 桌面壳「删除 App」回收站（本机误删恢复用，不是业务内容）
+apps/.trash/
+# 留存的多版本 APK 本体（本机测试资产，体积大，不入库）
+apps/*/apks/
 
 # ── 桌面壳构建产物 ──
 desktop/node_modules/

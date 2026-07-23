@@ -199,7 +199,7 @@ def ledger_lock():
 ```bash
 # 终端 A                                          # 终端 B（同时）
 AITEST_APP=MP3Cutter python3 tools/run_flow.py CUT-CORE-01  <脚本> 9B051FFAZ002M1
-AITEST_APP=MP3Cutter python3 tools/run_flow.py CONV-FMT-01  <脚本> R5CN308X8LZ
+AITEST_APP=MP3Cutter python3 tools/run_flow.py CONV-CORE-01  <脚本> R5CN308X8LZ
 ```
 两台跑**同一** case（手动矩阵）要各留一份结果，得等 executions 表 + 流水 tab 的 serial 列（§5.2）；只上锁、
 数据层还没二维化时，两台会抢 queue 同一行（后写覆盖，只丢展示态、不丢证据——证据按 serial 目录仍各存各的）。

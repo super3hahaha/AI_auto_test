@@ -107,7 +107,12 @@ def main():
         note = f"固化脚本正常退出，耗时约{elapsed:.0f}秒"
         new_status = "已完成"
     else:
-        note = f"固化脚本异常退出(exit={result.returncode})，耗时约{elapsed:.0f}秒；需回主循环重探"
+        # 这行只记这次执行本身的时序事实（exit code + 耗时），不下结论——判定交给紧跟着调用的
+        # judge_result.py。它落库时会 upsert 同一行「完成执行」日志（保留这里的"耗时约Xs"，
+        # 换成它自己的判定结论），最终 log.csv 里这条用例只留一行，不会变成两行说法不一致的
+        # （2026-07-22 曾经在这里editorialize"按 flow-freeze 标准视为失败"，结果跟 judge_result.py
+        # 落库的那条意思重复、读起来像啰嗦，见 case_result.py 的 upsert 逻辑改成通用合并后已去掉）。
+        note = f"固化脚本异常退出(exit={result.returncode})，耗时约{elapsed:.0f}秒"
         new_status = "已完成/需复核"
 
     _append_log(end_ts, a.case, "完成执行", "执行中", new_status, evidence, note)
@@ -127,21 +132,24 @@ def main():
         mine = [r for r in csv.DictReader(open(ev, encoding="utf-8"))
                 if r.get("用例ID") == a.case and scope in (r.get("文件/链接") or "")]
 
-    # 判定提醒收敛：exit code 只说明「脚本跑没跑崩」，不等于「功能结果对不对」。但很多固化脚本
-    # 已在脚本内部把 output-check(产物核对)/logscan(崩溃扫描) 跑掉了（证据落在下面清单里），
-    # 此时还无脑提示「你得自己去跑 output-check/logscan」是误导。按本轮证据产物的文件名后缀判断
-    # 各自跑没跑（output-check→output-check.txt；logscan→*-crash-scan.txt，最稳），只对「确实还没跑」
-    # 的那几项提示自己补跑；两项都内联跑过就改成「依据已就绪，复核结果即可」。
+    # 判定提醒收敛：2026-07-22 起 exit code 与脚本内部 FAILED 标记绑定（见 skill flow-freeze
+    # 「失败判定标准」），exit!=0 已经意味着脚本自己判过至少一处 output-check/logscan/结果断言
+    # 未达预期——但 exit code 仍只覆盖"脚本自己校验到的那些点"，不是自由裁量的全部真相，最终
+    # 通过/失败仍建议人工抽查证据确认。按本轮证据产物的文件名后缀判断 output-check/logscan
+    # 各自跑没跑（未内联跑过的老脚本才需要提示自己补跑）。
     def _did(suffix):
         return any(suffix in (r.get("文件/链接") or "") for r in mine)
     todo = [name for name, done in (("output-check", _did("output-check.txt")),
                                     ("logscan", _did("-crash-scan.txt"))) if not done]
     if todo:
-        print(f"[run_flow] 注意：exit={result.returncode} 只表示脚本跑完没崩、不等于功能判定通过；"
-              f"还需自己跑 {' / '.join(todo)} 确认后再更新用例状态。")
+        print(f"[run_flow] 注意：本脚本未内联跑过 {' / '.join(todo)}，exit={result.returncode} 覆盖不到这部分，"
+              f"还需自己跑一遍确认后再更新用例状态。")
+    elif result.returncode == 0:
+        print("[run_flow] 判定依据已就绪：脚本已内联跑过 output-check + logscan 且 exit=0（内部校验均已通过，"
+              "见上方流程日志与下方证据清单），复核无异常即可更新用例状态，不必重复执行。")
     else:
-        print("[run_flow] 判定依据已就绪：脚本已内联跑过 output-check + logscan（结果见上方流程日志与下方证据清单），"
-              "复核无异常即可更新用例状态，不必重复执行。")
+        print(f"[run_flow] 判定依据已就绪但 exit={result.returncode}：脚本内部至少一处 output-check/logscan/"
+              "结果断言未达预期（详见上方流程日志），应判「失败」而非「通过」，不要因为脚本跑完了就默认放行。")
 
     if mine:
         print(f"\n[run_flow] 本轮已自动登记 {len(mine)} 条证据（默认「过程留痕」）——判定后把关键的用 case_result --evi 升级：")

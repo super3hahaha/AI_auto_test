@@ -24,4 +24,6 @@ tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 csv = "1"
+# 「清理」功能：把历史文件移进系统废纸篓（macOS Trash，可 30 天自动清除），而非硬删除
+trash = "5"
 

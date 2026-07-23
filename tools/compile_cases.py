@@ -16,7 +16,7 @@ BOARD = LEDGER / "board.csv"
 
 HEADER = ["完成","执行顺序","用例ID","模块","测试目的","一句话测试目标","测试分类","优先级",
           "当前状态","执行结果","用户/业务场景","纯模拟器执行范围","Seed Data/前置数据",
-          "历史覆盖情况","证据链接","关键截图","问题ID","开始时间","结束时间","备注","固化脚本"]
+          "历史覆盖情况","证据链接","关键截图","问题ID","开始时间","结束时间","固化脚本"]
 
 STRUCT_HEADER = ["层级","模块","测试目的","用例数量","覆盖用例","优先级","阅读重点"]
 STRUCT = LEDGER / "structure.csv"
@@ -276,13 +276,11 @@ def main():
             old.get("问题ID", ""),
             old.get("开始时间", ""),
             old.get("结束时间", ""),
-            c.get("notes", ""),
             c.get("frozen_script", ""),
         ])
 
     with open(QUEUE, "w", newline="", encoding="utf-8") as f:
         csv.writer(f).writerows(rows)
-    print(f"[compile] {len(cases)} 条用例 → {QUEUE}（全量真值，运行时状态已保留）")
 
     # 本轮投影：按 target.scope 从 queue 过滤出 board.csv（看板/报告的本轮视图）；
     # 结构/摘要按本轮 in-scope 子集算。全量真值 queue.csv 不受影响。
@@ -290,7 +288,9 @@ def main():
     scope_cases = [c for c in cases if c["id"] in id_set]
     nmod = build_structure(scope_cases)
     build_summary(board_rows, scope_desc)
-    print(f"[compile] 本轮范围 {scope_desc} → {BOARD}（board 看板视图）")
+    # 运行日志只要范围本身（如 CUT-CORE-01,DL-TT-01 / 全量），括号里的条数明细留在 summary.csv/
+    # 概览页里给人核对用，跟 doc_report.py:609 拆 scope_label 的做法一致。
+    print(f"[compile] 本轮范围 {scope_desc.split('（')[0]} → {BOARD}（board 看板视图）")
     print(f"[compile] {nmod} 个模块 → {STRUCT}（本轮结构视图）")
     print(f"[compile] 摘要计数已刷新 → {SUMMARY}")
 

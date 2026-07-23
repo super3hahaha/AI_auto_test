@@ -8,11 +8,12 @@
 不能留空或写目录——否则人工核查时无法定位到证据实体。找不到具体文件就写"证据文件缺失"，别拿证据目录充数。
 第 6 段"关键标记"写进 evidence.csv 的"截图预览"列，决定这行证据进不进 doc_report.py 的图文报告
 （见 decisions.md #12）：直接支撑通过/失败结论的写"关键，供报告用"；纯过程留痕/辅助信息写
-"过程留痕，仅本地"。省略这段会留空，doc_report.py 找不到任何关键行时会兜底退回目录里前 6 张
-截图（按文件名排序，不代表判定价值），所以每条证据都应该显式标注，别漏填。
+"过程留痕，仅本地"。省略这段会留空——doc_report.py 不再兜底瞎选一张（2026-07-22 起去掉了"按
+文件名排序退第一张"的兜底，容易选中跟结论无关的截图如 01-home.png），没有关键行「问题截图」
+就直接不出现，所以每条证据都应该显式标注，别漏填，否则报告里那条用例就没有配图。
 不含 compile/sync —— 收工后另跑 compile_cases.py + sheets_sync.py。
 """
-import csv, json, subprocess, sys, argparse, datetime, pathlib
+import csv, json, re, subprocess, sys, argparse, datetime, pathlib
 
 from _appctx import LEDGER, load_cfg as _load_cfg  # 多 App 路径解析
 Q = LEDGER / "queue.csv"
@@ -69,23 +70,31 @@ def main():
             r[ix["历史覆盖情况"]] = a.coverage if a.coverage is not None else detect_coverage()
     csv.writer(open(Q, "w", newline="", encoding="utf-8")).writerows(q)
 
-    # 判定纠正（old 已经是「已完成/xxx」，说明这次不是执行后首次判定，而是没有新执行、
-    # 单纯改判上一次的结论）——就地覆盖上一条"完成执行"日志，不再追加新行。否则 log.csv
-    # 里会同时留着"失败"和"通过"两条，容易被误读成跑了两次、或者不知道该信哪条。
-    # 2026-07-03 用户看云端「状态变更日志」发现这个重复才指出来的。
+    # run_flow.py/auto_repair.py 跑完这条用例，会先自己写一行「完成执行」日志（只是执行事实：
+    # exit code + 耗时，它自己不判定）；case_result.py 紧接着（或稍后改判时）再调一次，就地
+    # 覆盖同一行，不追加新行——不然一条用例的"完成执行"会在 log.csv 里留两行、内容还前后不一致
+    # （比如先"需复核"后改判"失败"），云端「状态变更日志」看着像跑了两次、也不知道该信哪条
+    # （2026-07-22 真实复现过，CUT-EDGE-02 就留了两条）。
+    # 不再按 `old` 状态判断"是不是纠正"——不管是"执行后首次落判定"还是"没有新执行、单纯改判
+    # 上一次结论"，都统一覆盖同一行「完成执行」，因为一条用例在一次真实执行里最多只该有一行
+    # 这个动作的记录。合并时把上一行备注里的"耗时约Xs"部分保留下来，不然覆盖会把 run_flow.py
+    # 记的执行耗时信息丢掉。
     log_rows = list(csv.reader(open(LOG, encoding="utf-8"))) if LOG.exists() else []
-    new_row = [now, a.case, "完成执行", old or "执行中", f"已完成/{a.result}", a.evidence, a.note]
-    if old.startswith("已完成/") and len(log_rows) > 1:
+    new_note = a.note
+    last_idx = None
+    if len(log_rows) > 1:
         lh = log_rows[0]
-        li_case = lh.index("用例ID"); li_action = lh.index("动作")
+        li_case = lh.index("用例ID"); li_action = lh.index("动作"); li_note = lh.index("备注")
         last_idx = next((i for i in range(len(log_rows) - 1, 0, -1)
                           if log_rows[i][li_case] == a.case and log_rows[i][li_action] == "完成执行"), None)
         if last_idx is not None:
-            log_rows[last_idx] = new_row
-            csv.writer(open(LOG, "w", newline="", encoding="utf-8")).writerows(log_rows)
-        else:
-            log_rows.append(new_row)
-            csv.writer(open(LOG, "w", newline="", encoding="utf-8")).writerows(log_rows)
+            m = re.search(r"耗时约\d+秒", log_rows[last_idx][li_note] or "")
+            if m and m.group(0) not in new_note:
+                new_note = f"{m.group(0)}；{new_note}"
+    new_row = [now, a.case, "完成执行", old or "执行中", f"已完成/{a.result}", a.evidence, new_note]
+    if last_idx is not None:
+        log_rows[last_idx] = new_row
+        csv.writer(open(LOG, "w", newline="", encoding="utf-8")).writerows(log_rows)
     else:
         with open(LOG, "a", newline="", encoding="utf-8") as f:
             csv.writer(f).writerow(new_row)

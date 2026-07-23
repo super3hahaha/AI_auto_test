@@ -227,6 +227,10 @@ def cmd_shot(args):
             missing = [v for v in want if not _present_any(nodes, v)]
             if not missing or timeout <= 0 or time.monotonic() - start >= timeout:
                 break
+            # 该出现的控件还没在屏，多半是被广告/权限/隐私同意弹窗挡住（2026-07-22 真机撞过
+            # CMP 同意弹窗晚出现，固定短窗 sweep 一过就不再清障，死等到 assert-timeout 才判失败，
+            # 见 gotchas.md DL-TT-01）——先插一轮轻量 sweep 试着点掉，清不掉就当正常慢加载继续等。
+            _sweep_loop(2, 0.4, 1, verbose=False)
             time.sleep(0.5)
         fails += [f"必须出现的控件未在屏：{v!r}" for v in missing]
         fails += [f"不该出现的标志仍在屏：{v!r}" for v in gone if _present_any(nodes, v)]
@@ -488,14 +492,19 @@ def _present_any(nodes, value, partial=True):
 
 
 def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cache=None,
-          timeout=0.0, interval=0.5):
+          timeout=0.0, interval=0.5, sweep_on_wait=True):
     """by ∈ {id,text,desc}。返回 (全部匹配, 第 index 个) 的中心坐标。
     - from_xml：从已有 dump 定位（省去重新 dump，同屏多次点击复用）。
     - from_cache：screen_id，命中 .dumpcache 则等价 from_xml（免 dump）；未命中则照常活 dump，
       并把这次结果顺手写进该缓存槽（下次/下一条命令再用就能命中）。
     - cache：screen_id，活 dump 时顺手把这次结果写进该缓存槽（不影响本次是否复用旧缓存）。
     - timeout>0：找不到时轮询等待（每 interval 秒重新 dump），治"界面还没加载完"这类瞬时失败。
-      from_xml/命中的 from_cache 是静态文件，不轮询。"""
+      from_xml/命中的 from_cache 是静态文件，不轮询。
+    - sweep_on_wait：等待轮询期间每轮先插一次轻量 sweep（见 _sweep_loop）——2026-07-22 真机
+      撞过 CMP 隐私同意弹窗渲染时机不固定，早前固定短窗 sweep 一过就不再清障，弹窗晚到时
+      死等到超时才判失败（DL-TT-01，见 docs/gotchas.md）。等不到目标多半就是被这类广告/权限/
+      同意弹窗挡住，先试着点掉比死等更快；sweep 本身幂等、没有可点的东西时是安全 no-op，
+      不会误伤本来就该慢慢加载的正常界面。传 False 关闭（比如故意要断言"弹窗一直在"的场景）。"""
     attr = {"id": "resource-id", "text": "text", "desc": "content-desc"}[by]
     if from_cache and not from_xml:
         cp = _cache_path(from_cache)
@@ -512,7 +521,10 @@ def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cac
         if from_xml or timeout <= 0:
             sys.exit(f"[find] 没找到 {by}={value!r}（partial={partial}）。界面可能已变，先跑 `ui` 重新观察。")
         if time.monotonic() - start >= timeout:
-            sys.exit(f"[find] 等待 {timeout}s 仍未出现 {by}={value!r}（超时）。界面可能已变，需重新观察或记失败。")
+            sys.exit(f"[find] 等待 {timeout}s 仍未出现 {by}={value!r}（超时，已尝试清障仍未出现）。"
+                     "界面可能已变，需重新观察或记失败。")
+        if sweep_on_wait:
+            _sweep_loop(2, 0.4, 1, verbose=False)
         time.sleep(interval)
     if index >= len(hits):
         sys.exit(f"[find] {by}={value!r} 只有 {len(hits)} 个匹配，index={index} 越界。")
@@ -595,76 +607,92 @@ def cmd_focus(args):
     print(_current_focus())
 
 
+def _sweep_one_round(nodes, focus, rules, only=None, dry_run=False):
+    """规则库里挑一条命中的就点掉，返回 (rule_id, by, value, cx, cy) 或 None（没命中不动手）。
+    单轮逐规则、逐 match 选择器按序试，第一个命中即点即返回——被 cmd_sweep 和内部等待重试
+    （_wait_with_sweep）共用，逻辑只写一处。"""
+    for rule in rules:
+        if only and rule.get("id") not in only:
+            continue
+        if not rule.get("enabled", True):
+            continue
+        scope = rule.get("scope", "")
+        if not (scope in _ANY_SCOPE or (scope and scope in focus)):
+            continue
+        for sel in rule.get("match", []):
+            by = sel.get("by", "id")
+            if by == "corner-tr":
+                # 右上角关闭 X（无 text/desc/id 的 Image/Button）——结构化定位，不靠盲点坐标。
+                # 放规则 match 列表最后，前面的 text/desc/id 选择器优先；都没命中才兜这一发。
+                c = _match_corner_tr(nodes)
+                if c:
+                    cx, cy = c
+                    if not dry_run:
+                        shell(f"input tap {cx} {cy}")
+                    return (rule.get("id"), by, f"@({cx},{cy})", cx, cy)
+                continue
+            if by == "outside-panel":
+                # 点弹窗外空白处关闭（setCanceledOnTouchOutside 类弹窗，如好评弹窗）。
+                # sel["of"] 给弹窗内容区的 id 列表（如 parentPanel/customPanel），
+                # 面板不在树里（弹窗还没渲染/已关）就不命中，不乱点。
+                c = _match_outside_panel(nodes, sel.get("of", []))
+                if c:
+                    cx, cy = c
+                    if not dry_run:
+                        shell(f"input tap {cx} {cy}")
+                    return (rule.get("id"), by, f"@({cx},{cy})", cx, cy)
+                continue
+            hits = _match_nodes(nodes, _ATTR[by], sel["value"], sel.get("partial", False))
+            if hits:
+                (cx, cy), v, _b = hits[0]
+                if not dry_run:
+                    shell(f"input tap {cx} {cy}")
+                return (rule.get("id"), by, v, cx, cy)
+    return None
+
+
+def _sweep_loop(rounds, interval, patience, rules=None, only=None, dry_run=False, verbose=True):
+    """通用弹窗清障轮询主体：每轮 dump 一次界面，规则库里找一条命中就点掉（点完界面会变，
+    下一轮重新 dump）；连续 patience 轮无命中即认为界面已清干净，提前收工。返回命中列表。
+    rules=None 时读默认规则库；被 cmd_sweep（CLI）和 _wait_with_sweep（内部等待重试）共用。"""
+    rules = rules if rules is not None else load_ad_rules()
+    only_set = set(only) if only else None
+    fired, quiet = [], 0
+    for rnd in range(1, rounds + 1):
+        focus = _current_focus()
+        try:
+            nodes = list(_dump_tree())
+        except SystemExit:
+            time.sleep(interval)  # dump 失败多为界面在动画/瞬时，歇一下再来
+            continue
+        hit = _sweep_one_round(nodes, focus, rules, only_set, dry_run)
+        if hit:
+            if verbose:
+                rid, by, v, cx, cy = hit
+                print(f"{'[命中]' if dry_run else '[点掉]'} 第{rnd}轮 {rid}: {by}={v} @ ({cx},{cy})")
+            fired.append(hit)
+            quiet = 0
+        else:
+            quiet += 1
+            if quiet >= patience:
+                break
+        if rnd < rounds:
+            time.sleep(interval)
+    return fired
+
+
 def cmd_sweep(args):
     """通用广告/弹窗清障器：按规则库(config/ad_rules.json)扫当前界面，命中就点掉。
     幂等、尽力而为——没广告是正常状态，不当失败(始终 exit0)。每轮只点一个(点完界面会变，
     下一轮重新 dump)；连续 --patience 轮无命中即认为界面已清干净，提前收工。
     广告关闭类规则靠 scope 卡在对应 SDK 全屏页才动手，不会误伤 App 正常界面；
-    权限/系统弹窗类作用页为任意页面。调用时机由执行大脑掌握（如进广告位后、每步之间兜底）。"""
+    权限/系统弹窗类作用页为任意页面。调用时机由执行大脑掌握（如进广告位后、每步之间兜底）；
+    另外 _find/cmd_shot 的等待重试内部也会自动插一轮（见 _wait_with_sweep），等不到目标时
+    先尝试清障，不必每条 flow 脚本各自在关键步骤前手动插 sweep。"""
     rules = load_ad_rules(args.rules)
     only = set(x for x in args.only.split(",") if x) if args.only else None
-    fired, quiet = [], 0
-    for rnd in range(1, args.rounds + 1):
-        focus = _current_focus()
-        try:
-            nodes = list(_dump_tree())
-        except SystemExit:
-            time.sleep(args.interval)  # dump 失败多为界面在动画/瞬时，歇一下再来
-            continue
-        hit = None
-        for rule in rules:
-            if only and rule.get("id") not in only:
-                continue
-            if not rule.get("enabled", True):
-                continue
-            scope = rule.get("scope", "")
-            if not (scope in _ANY_SCOPE or (scope and scope in focus)):
-                continue
-            for sel in rule.get("match", []):
-                by = sel.get("by", "id")
-                if by == "corner-tr":
-                    # 右上角关闭 X（无 text/desc/id 的 Image/Button）——结构化定位，不靠盲点坐标。
-                    # 放规则 match 列表最后，前面的 text/desc/id 选择器优先；都没命中才兜这一发。
-                    c = _match_corner_tr(nodes)
-                    if c:
-                        cx, cy = c
-                        hit = (rule.get("id"), by, f"@({cx},{cy})", cx, cy)
-                        if not args.dry_run:
-                            shell(f"input tap {cx} {cy}")
-                        break
-                    continue
-                if by == "outside-panel":
-                    # 点弹窗外空白处关闭（setCanceledOnTouchOutside 类弹窗，如好评弹窗）。
-                    # sel["of"] 给弹窗内容区的 id 列表（如 parentPanel/customPanel），
-                    # 面板不在树里（弹窗还没渲染/已关）就不命中，不乱点。
-                    c = _match_outside_panel(nodes, sel.get("of", []))
-                    if c:
-                        cx, cy = c
-                        hit = (rule.get("id"), by, f"@({cx},{cy})", cx, cy)
-                        if not args.dry_run:
-                            shell(f"input tap {cx} {cy}")
-                        break
-                    continue
-                hits = _match_nodes(nodes, _ATTR[by], sel["value"], sel.get("partial", False))
-                if hits:
-                    (cx, cy), v, _b = hits[0]
-                    hit = (rule.get("id"), by, v, cx, cy)
-                    if not args.dry_run:
-                        shell(f"input tap {cx} {cy}")
-                    break
-            if hit:
-                break
-        if hit:
-            rid, by, v, cx, cy = hit
-            print(f"{'[命中]' if args.dry_run else '[点掉]'} 第{rnd}轮 {rid}: {by}={v} @ ({cx},{cy})")
-            fired.append(hit)
-            quiet = 0
-        else:
-            quiet += 1
-            if quiet >= args.patience:
-                break
-        if rnd < args.rounds:
-            time.sleep(args.interval)
+    fired = _sweep_loop(args.rounds, args.interval, args.patience, rules=rules, only=only,
+                         dry_run=args.dry_run)
     print(f"[sweep] 处理 {len(fired)} 个广告/弹窗。" if fired else "[sweep] 界面干净，无可清理项。")
 
 
@@ -830,6 +858,118 @@ FORMAT_MIME_HINTS = {
 }
 
 
+def _ffprobe_cross_check(row, mediastore_dur_s, args):
+    """pull row对应的_data到本地临时文件，用宿主机ffprobe解出真实音频流的 duration/bit_rate/
+    sample_rate，与MediaStore的duration字段、以及可选的 --expect-bitrate-kbps/--expect-sample-rate/
+    --expect-suffix 交叉核对。返回 (extra文案, fail_msg或None)；宿主机没装ffprobe/_data取不到/
+    pull失败时打印警告并返回None（不让整条output-check因本地依赖缺失而失败）。
+    MediaStore 本身没有比特率/采样率字段（BITRATE 列 API 30+才有且不一定准），只能靠这里的
+    ffprobe 交叉核对——用于「另存为」弹窗里比特率/格式可由用户选择的场景（裁剪/转换模块），
+    验证产物真实值是否等于选择值，而不只是 UI 回显文案。"""
+    if not shutil.which("ffprobe"):
+        print("[output-check] ⚠ 宿主机未装 ffprobe（brew install ffmpeg），跳过真实时长/比特率/采样率交叉核对")
+        return None
+    data_path = _field(row, "_data")
+    if not data_path:
+        print("[output-check] ⚠ 该行没有 _data 路径，跳过 ffprobe 交叉核对")
+        return None
+    tmp = pathlib.Path(f"/tmp/adbkit-ffprobe-{os.getpid()}{pathlib.Path(data_path).suffix}")
+    try:
+        r = adb("pull", data_path, str(tmp))
+        if r.returncode != 0 or not tmp.exists():
+            print(f"[output-check] ⚠ pull {data_path} 失败，跳过 ffprobe 交叉核对")
+            return None
+        p = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "a:0",
+             "-show_entries", "format=duration:stream=sample_rate,bit_rate",
+             "-of", "default=noprint_wrappers=1", str(tmp)],
+            capture_output=True, text=True)
+        out = (p.stdout or "").strip()
+        if not out:
+            print(f"[output-check] ⚠ ffprobe 解析 {data_path} 失败：{(p.stderr or '').strip()[:200]}")
+            return None
+        vals = {}
+        for line in out.splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                vals.setdefault(k.strip(), v.strip())
+
+        note, fail = "", None
+
+        real_s = vals.get("duration")
+        if real_s and real_s != "N/A":
+            real_ms = int(round(float(real_s) * 1000))
+            ms_ms = int(mediastore_dur_s)
+            diff = abs(real_ms - ms_ms)
+            ok = diff <= args.tolerance_ms
+            verdict = "一致" if ok else "不一致"
+            note += (f"；ffprobe真实时长交叉核对{verdict}（ffprobe={real_ms}ms vs "
+                     f"MediaStore duration={ms_ms}ms，差{diff}ms，容忍{args.tolerance_ms}ms）")
+            print(f"[output-check] {'✓' if ok else '✗'} ffprobe真实时长交叉核对{verdict}："
+                  f"ffprobe={real_ms}ms vs MediaStore duration={ms_ms}ms（差{diff}ms）")
+            if not ok:
+                fail = fail or (
+                    f"[output-check] ✗ MediaStore duration与ffprobe真实时长不一致："
+                    f"MediaStore={ms_ms}ms vs ffprobe={real_ms}ms（差{diff}ms，容忍{args.tolerance_ms}ms）")
+        else:
+            print(f"[output-check] ⚠ ffprobe 未解出 duration，跳过时长交叉核对")
+
+        if getattr(args, "expect_bitrate_kbps", None) is not None:
+            bit_rate_s = vals.get("bit_rate")
+            if bit_rate_s and bit_rate_s != "N/A":
+                real_kbps = int(round(int(bit_rate_s) / 1000))
+                diff = abs(real_kbps - args.expect_bitrate_kbps)
+                tol = args.bitrate_tolerance_kbps
+                ok = diff <= tol
+                verdict = "一致" if ok else "不一致"
+                note += (f"；ffprobe真实比特率{verdict}（ffprobe={real_kbps}kbps vs "
+                         f"预期{args.expect_bitrate_kbps}kbps，差{diff}kbps，容忍{tol}kbps）")
+                print(f"[output-check] {'✓' if ok else '✗'} ffprobe真实比特率{verdict}："
+                      f"ffprobe={real_kbps}kbps vs 预期{args.expect_bitrate_kbps}kbps（差{diff}kbps）")
+                if not ok:
+                    fail = fail or (
+                        f"[output-check] ✗ 产物真实比特率与预期不一致："
+                        f"ffprobe={real_kbps}kbps vs 预期{args.expect_bitrate_kbps}kbps"
+                        f"（差{diff}kbps，容忍{tol}kbps）")
+            else:
+                print("[output-check] ⚠ ffprobe 未解出 bit_rate，跳过比特率交叉核对")
+                fail = fail or "[output-check] ✗ 要求校验比特率但 ffprobe 未解出 bit_rate（产物可能损坏或格式不含该字段）"
+
+        if getattr(args, "expect_sample_rate", None) is not None:
+            sr_s = vals.get("sample_rate")
+            if sr_s and sr_s != "N/A":
+                real_sr = int(sr_s)
+                ok = real_sr == args.expect_sample_rate
+                verdict = "一致" if ok else "不一致"
+                note += f"；ffprobe真实采样率{verdict}（ffprobe={real_sr}Hz vs 预期{args.expect_sample_rate}Hz）"
+                print(f"[output-check] {'✓' if ok else '✗'} ffprobe真实采样率{verdict}："
+                      f"ffprobe={real_sr}Hz vs 预期{args.expect_sample_rate}Hz")
+                if not ok:
+                    fail = fail or (
+                        f"[output-check] ✗ 产物真实采样率与预期不一致："
+                        f"ffprobe={real_sr}Hz vs 预期{args.expect_sample_rate}Hz")
+            else:
+                print("[output-check] ⚠ ffprobe 未解出 sample_rate，跳过采样率交叉核对")
+                fail = fail or "[output-check] ✗ 要求校验采样率但 ffprobe 未解出 sample_rate（产物可能损坏或格式不含该字段）"
+
+        if getattr(args, "expect_suffix", None):
+            real_suffix = pathlib.Path(data_path).suffix.lstrip(".").lower()
+            expect_suffix = args.expect_suffix.lstrip(".").lower()
+            ok = real_suffix == expect_suffix
+            verdict = "一致" if ok else "不一致"
+            note += f"；产物文件后缀{verdict}（实际=.{real_suffix} vs 预期=.{expect_suffix}）"
+            print(f"[output-check] {'✓' if ok else '✗'} 产物文件后缀{verdict}："
+                  f"实际=.{real_suffix} vs 预期=.{expect_suffix}")
+            if not ok:
+                fail = fail or (
+                    f"[output-check] ✗ 产物文件后缀与预期不一致："
+                    f"实际=.{real_suffix} vs 预期=.{expect_suffix}")
+
+        return (note, fail)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def cmd_output_check(args):
     """查 MediaStore 里最新的音频文件，独立验证"输出确实生成"（非 debug 包读不了 DB 时的黑盒断言）。
     --expect <子串>：断言最新文件名含该串，不含则 exit 非0。
@@ -841,7 +981,20 @@ def cmd_output_check(args):
     交叉核对，|实际-预期|<=--tolerance-ms（默认1000ms，容忍编码取整误差）才算一致，结论直接写进
     这行证据的断言里——不然"完整性通过"这种话只证明"文件不是空壳"，证明不了"时长对不对"。
     --expect-format <格式名>：跟另存为弹窗里读到的格式（如 format_text="MP3"）交叉核对 mime_type，
-    防止"保存框显示MP3，落盘却是别的格式"这类静默错位测不出来。"""
+    防止"保存框显示MP3，落盘却是别的格式"这类静默错位测不出来。
+    --ffprobe：pull 最新产物到本地，用宿主机 ffprobe 解出真实音频流 duration，跟 MediaStore 的
+    duration 字段交叉核对（容忍 --tolerance-ms）。MediaStore 完整性检查只能测"是不是空壳"
+    （_size>0/duration非空），测不出"_size>0 但 MediaStore 记录的时长本身就是错的"这类静默
+    元数据失真——2026-07-22 真机实测踩到过：CUT-EDGE-01（M4A裁剪转存AAC）MediaStore
+    duration=38383ms，但播放页显示00:34、ffprobe解出的真实时长34957ms，相差3.4s（P2，
+    见 issues.csv 里对应的 BUG 行）。需要宿主机装 ffprobe（brew install ffmpeg），没装则
+    打印警告并跳过，不让整条 output-check 因为缺本地依赖直接失败。
+    --expect-bitrate-kbps/--expect-sample-rate/--expect-suffix：MediaStore 没有采样率字段、
+    比特率字段（BITRATE 列 API 30+才有且不一定准），查不出"另存为/转换设置弹窗里选的比特率、
+    采样率、格式是否真的落到产物里"——这三个参数会自动触发跟 --ffprobe 一样的 pull+ffprobe
+    流程（不需要另外加 --ffprobe），比对 ffprobe 解出的真实 bit_rate/sample_rate 与产物文件
+    后缀。仅用于「另存为」弹窗比特率/格式可由用户改选的场景（裁剪/格式转换模块），其余产物
+    格式固定的模块不需要传这三个参数。"""
     proj = "_display_name:_size:duration:date_added:_data:mime_type"
     uri = "content://media/external/audio/media"
     r = shell(f'content query --uri {uri} --projection {proj} --sort "date_added DESC"')
@@ -890,11 +1043,23 @@ def cmd_output_check(args):
                         if not ok:
                             fail_msg = fail_msg or f"[output-check] ✗ 格式与预期不一致：预期{args.expect_format!r} vs 实际mime_type={mime or '空'}"
 
+                    needs_ffprobe = (args.ffprobe or args.expect_bitrate_kbps is not None
+                                      or args.expect_sample_rate is not None or args.expect_suffix)
+                    if needs_ffprobe:
+                        ffprobe_note = _ffprobe_cross_check(newest, dur_s, args)
+                        if ffprobe_note:
+                            extra += ffprobe_note[0]
+                            if ffprobe_note[1]:
+                                fail_msg = fail_msg or ffprobe_note[1]
+
     if args.case:
         oc_out = evid_dir(args.case, "logs") / "output-check.txt"
         oc_out.write_text("\n".join(rows[: args.n]))
-        _append_evidence(args.case, "output-check", "MediaStore", oc_out,
-                         assertion=(f"最新产物: {rows[0][:160]}{extra}" if rows else ""))
+        evid_type = "MediaStore+ffprobe" if (args.ffprobe or args.expect_bitrate_kbps is not None
+                                              or args.expect_sample_rate is not None or args.expect_suffix) else "MediaStore"
+        _append_evidence(args.case, "output-check", evid_type, oc_out,
+                         assertion=(f"最新产物: {rows[0][:160]}{extra}" if rows else ""),
+                         result="失败" if fail_msg else "通过")
     if fail_msg:
         sys.exit(fail_msg)
 
@@ -1039,6 +1204,25 @@ def build_parser():
                     help="上面那项的容忍误差(ms)，默认1000（容忍编码取整误差）")
     s.add_argument("--expect-format", dest="expect_format", default=None,
                     help="预期格式(如 MP3/WAV/AAC，通常来自另存为弹窗 format_text)，跟 mime_type 交叉核对")
+    s.add_argument("--ffprobe", action="store_true",
+                    help="pull最新产物到本地，用宿主机ffprobe解出真实音频流duration，与MediaStore的"
+                         "duration字段交叉核对（容忍--tolerance-ms）。测MediaStore完整性检查测不出的"
+                         "\"_size>0但时长元数据本身就是错的\"这类静默失真，需宿主机装ffprobe")
+    s.add_argument("--expect-bitrate-kbps", type=int, default=None, dest="expect_bitrate_kbps",
+                    help="预期比特率(kbps)，通常来自另存为/转换设置弹窗里读到的比特率文案，"
+                         "跟ffprobe解出的产物真实bit_rate交叉核对（MediaStore没有该字段）。"
+                         "传此参数会自动触发ffprobe pull，不需要另加--ffprobe")
+    s.add_argument("--bitrate-tolerance-kbps", type=int, default=32, dest="bitrate_tolerance_kbps",
+                    help="上面那项的容忍误差(kbps)，默认32（虽然读的是ffprobe stream级bit_rate，"
+                         "已排除容器/封面图开销干扰，但AAC等编码器实际落盘比特率相对目标值仍有正常"
+                         "波动，2026-07-23起从8放宽回32，见docs/decisions.md）")
+    s.add_argument("--expect-sample-rate", type=int, default=None, dest="expect_sample_rate",
+                    help="预期采样率(Hz)，通常来自转换设置弹窗里选择的采样率(如44100)，"
+                         "跟ffprobe解出的产物真实sample_rate精确比对（MediaStore没有该字段）。"
+                         "传此参数会自动触发ffprobe pull，不需要另加--ffprobe")
+    s.add_argument("--expect-suffix", dest="expect_suffix", default=None,
+                    help="预期文件后缀(如 mp3/aac，不带点)，跟产物_data真实后缀比对，"
+                         "传此参数会自动触发ffprobe pull，不需要另加--ffprobe")
     s.set_defaults(fn=cmd_output_check)
     s = sub.add_parser("alarm"); s.add_argument("label"); s.set_defaults(fn=cmd_alarm)
     return p

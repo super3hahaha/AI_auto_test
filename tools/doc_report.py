@@ -27,7 +27,7 @@
   跟 new_run.py 建新 Sheet 是同一套逻辑——不需要每条用例都刷 Doc，只在开新一轮时建+填一次，
   之后想更新就手动重跑（不传 --new，复用当前 doc_id 覆盖式刷新）。
 """
-import csv, json, sys, glob, pathlib, datetime, re
+import csv, json, sys, glob, pathlib, datetime, re, subprocess
 
 from _appctx import REPO, LEDGER as APP_LEDGER, TARGET_CFG  # 多 App 路径解析
 ROOT = REPO
@@ -52,7 +52,7 @@ OAUTH_TOKEN = _oauth_token_path()
 IMAGE_FOLDER_NAME = "AI_auto_test 证据图"
 
 sys.path.insert(0, str(ROOT / "tools"))
-from compile_cases import project_board_from_queue  # 复用 scope→board 投影
+from compile_cases import project_board_from_queue, build_summary  # 复用 scope→board 投影 + 摘要计数
 
 SCOPES = [
     "https://www.googleapis.com/auth/documents",
@@ -94,6 +94,43 @@ def read_summary():
     return d
 
 
+def last_log_note(cid):
+    """取 log.csv 里这条用例最后一条「完成执行」的备注——case_result.py 落判定时写的结论文本
+    只存在 log.csv 里，board.csv/queue.csv 都没有对应列，找不到别的地方能拿到"失败原因"。"""
+    p = LEDGER / "log.csv"
+    if not p.exists():
+        return ""
+    note = ""
+    for r in csv.DictReader(open(p, encoding="utf-8")):
+        if r.get("用例ID") == cid and r.get("动作") == "完成执行":
+            note = r.get("备注", "") or note
+    return note
+
+
+def failed_cases_without_issue(queue, issues):
+    """登记 issues.csv 是语义判断（Claude Code 人工做的一步，见 case_result.py 文档），自动化
+    链路只负责把 通过/失败/需复核 落进 queue.csv，不会自动建 issue 行——所以"这条用例执行结果
+    是失败"和"issues.csv 里有它的问题记录"完全可能对不上（真实发生过：跑完之后没人手工登记
+    问题，Doc 的"失败用例列表/详情"两节因为只读 issues.csv，会显示"本轮无失败用例"，
+    跟"结果统计"表里明明写着 失败=N 自相矛盾，读起来像内容丢了）。
+    这里补一层兜底：board 里"执行结果"=失败、但 issues.csv 找不到对应行的用例，
+    合成一条占位问题记录（问题ID 留空、状态="待登记"），保证失败的用例在报告里一定看得见，
+    只是没有正式问题描述那么完整——不能因为没人手工登记，失败就在报告里凭空消失。"""
+    issue_cids = {r.get("用例ID") for r in issues}
+    extra = []
+    for r in queue:
+        cid = r.get("用例ID", "")
+        if r.get("执行结果") == "失败" and cid not in issue_cids:
+            extra.append({
+                "问题ID": "", "用例ID": cid, "严重级别": "",
+                "标题": r.get("一句话测试目标") or r.get("测试目的", ""),
+                "预期结果": "", "实际结果": last_log_note(cid) or "（未登记问题详情，见证据链接自行核查）",
+                "复现步骤": "", "证据链接": r.get("证据链接", ""),
+                "状态": "待登记", "负责人备注": "本轮判定为失败但尚未人工登记正式问题，见上方「实际结果」。",
+            })
+    return extra
+
+
 def read_log_span():
     """从 log.csv（状态变更日志）取本轮第一条/最后一条记录的时间，算执行起止。
     log.csv 只追加不清空，但 new_run.py 开新一轮时会整份归档+清空（见 decisions.md #10），
@@ -103,6 +140,40 @@ def read_log_span():
         return None, None
     times = [r.get("时间", "") for r in csv.DictReader(open(p, encoding="utf-8")) if r.get("时间")]
     return (times[0], times[-1]) if times else (None, None)
+
+
+def device_os_version(serial):
+    """现查 `ro.build.version.release`（比如"13"）。设备当时不在线/adb 不可用就返回空——
+    报告生成时设备未必还连着（可能是收工很久之后手动重跑 doc_report），查不到不算错，
+    不强求非要有系统版本，跟 device_label() 的"没有就不拼"是同一个态度。"""
+    if not serial:
+        return ""
+    try:
+        r = subprocess.run(["adb", "-s", serial, "shell", "getprop", "ro.build.version.release"],
+                            capture_output=True, text=True, timeout=5)
+        ver = (r.stdout or "").strip()
+        return ver if r.returncode == 0 and ver else ""
+    except Exception:
+        return ""
+
+
+def device_label(serial):
+    """按 config/device_aliases.json（{serial: alias}，跨 App 共用，desktop 壳「设备别名」登记的
+    同一份文件）把 serial 翻成人读的别名；没登记过就退回原始 serial。能查到系统版本就拼在后面
+    （"别名 (Android 13)"），查不到（设备当时不在线）就只显示别名/serial，不强求。"""
+    if not serial:
+        return "-"
+    label = serial
+    p = ROOT / "config/device_aliases.json"
+    if p.exists():
+        try:
+            alias = json.loads(p.read_text(encoding="utf-8")).get(serial)
+            if alias:
+                label = alias
+        except Exception:
+            pass
+    ver = device_os_version(serial)
+    return f"{label} (Android {ver})" if ver else label
 
 
 def format_exec_span(start_t, end_t, fallback):
@@ -277,9 +348,11 @@ class LiveDoc:
 
         self.cursor = base + b.pos
 
-    def table(self, headers, rows, header_bg=DARK, cell_color_fn=None):
+    def table(self, headers, rows, header_bg=DARK, cell_color_fn=None, col_widths=None):
         """在 cursor 处插入一张表格（首行表头），headers/rows 均为字符串二维结构。
         cell_color_fn(row_idx, col_idx, text) -> 颜色 dict|None，给数据行单元格文字上色，不传就用默认深色。
+        col_widths：可选，跟 headers 等长的列表，元素是磅值(int)或 None（None=交给 Docs 默认等宽）。
+        不传就是原来的行为——不发送任何列宽请求，全部等宽。
         """
         all_rows = [list(headers)] + [list(r) for r in rows]
         n_rows, n_cols = len(all_rows), len(headers)
@@ -288,6 +361,14 @@ class LiveDoc:
         doc = self.docs.documents().get(documentId=self.doc_id).execute()
         table_el = [el for el in doc["body"]["content"] if "table" in el][-1]
         table = table_el["table"]
+
+        if col_widths:
+            width_reqs = [{"updateTableColumnProperties": {
+                "tableStartLocation": {"index": table_el["startIndex"]}, "columnIndices": [ci],
+                "tableColumnProperties": {"width": {"magnitude": w, "unit": "PT"}, "widthType": "FIXED_WIDTH"},
+                "fields": "width,widthType"}} for ci, w in enumerate(col_widths) if w]
+            if width_reqs:
+                self._batch(width_reqs)
 
         cells = []  # (原始起始 index, 行, 列, 文本)
         for ri, row in enumerate(table["tableRows"]):
@@ -551,7 +632,8 @@ def evidence_types_for_case(cid, evidence_rows, current_link=""):
 
 def format_repro_steps(raw):
     """把「复现步骤」原始文本整理成 1. 2. 3. 编号形式：多行就按行编号（已带编号的行不重复加），
-    单行按 → / -> 箭头拆分再编号；两种都不是就原样返回，不硬拆没有分隔线索的整段文字。"""
+    单行内联编号（比如整段写成"1.xxx 2.xxx 3.xxx"一行）按编号出现位置切开各自成行，
+    没有内联编号的单行按 → / -> 箭头拆分再编号；都不是就原样返回，不硬拆没有分隔线索的整段文字。"""
     raw = (raw or "").strip()
     if not raw:
         return raw
@@ -559,23 +641,22 @@ def format_repro_steps(raw):
     if len(lines) > 1:
         return "\n".join(l if re.match(r"^\d+[.、)]", l) else f"{i}. {l}"
                           for i, l in enumerate(lines, 1))
-    parts = [p.strip() for p in re.split(r"\s*(?:→|->)\s*", lines[0]) if p.strip()]
+    line = lines[0]
+    # 数字后紧跟句号/顿号/右括号、且后面不是数字（避免把"00:49.2"这类小数/时间戳误判成步骤号），
+    # 前面是行首或空白（避免匹配到词中间的数字）——这样才敢在同一行里认出多个"第几步"标记。
+    marker_re = re.compile(r"(?:^|(?<=\s))(\d{1,2})[.、)](?!\d)\s*")
+    matches = list(marker_re.finditer(line))
+    if len(matches) > 1:
+        parts = []
+        for i, m in enumerate(matches):
+            start = m.end()
+            end = matches[i + 1].start() if i + 1 < len(matches) else len(line)
+            parts.append((m.group(1), line[start:end].strip()))
+        return "\n".join(f"{num}. {text}" for num, text in parts if text)
+    parts = [p.strip() for p in re.split(r"\s*(?:→|->)\s*", line) if p.strip()]
     if len(parts) > 1:
         return "\n".join(f"{i}. {p}" for i, p in enumerate(parts, 1))
-    return lines[0]
-
-
-def case_screenshots_fallback(link):
-    """老逻辑兜底：某条用例还没按"截图预览"分级标注时（该列全空），退回目录里前 6 张截图。"""
-    if not link:
-        return []
-    base = ROOT / link
-    if not base.exists():
-        return []
-    pics = sorted(glob.glob(str(base / "screenshots" / "*.png")))
-    if not pics:  # 退到更深的子目录（按 <serial>/<attempt> 分层，run_id 制下可能深两层）
-        pics = sorted(glob.glob(str(base / "**" / "screenshots" / "*.png"), recursive=True))
-    return pics[:6]
+    return line
 
 
 def build_report(live, drive, folder_id, want_images):
@@ -591,6 +672,7 @@ def build_report(live, drive, folder_id, want_images):
     evidence = read_csv("evidence")
     _board_ids = {r.get("用例ID") for r in queue}  # queue 即本轮 board
     issues = [r for r in issues if r.get("用例ID") in _board_ids]  # 问题清单只留本轮用例
+    issues = issues + failed_cases_without_issue(queue, issues)  # 兜底：失败但没人登记 issue 的也得露面
     cfg = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     queue_by_cid = {r.get("用例ID"): r for r in queue}
@@ -600,11 +682,20 @@ def build_report(live, drive, folder_id, want_images):
     pass_n = summary.get("通过", "0")
     fail_n = summary.get("失败", "0")
     blocked_n = summary.get("阻塞", "0")
+    gap_n = summary.get("覆盖缺口", "0")
+    review_n = summary.get("需复核", "0")  # 判定还没做/没走 claude 复核的用例——不算通过也不算失败，
+                                            # 之前"结果统计"表没有这一列，pass+fail+blocked 加起来
+                                            # 对不上 done，「本轮未发现失败用例」还会跟着一起误导人
+                                            # （明明有条用例结果都没确认，却读起来像全过了）。
     try:
         rate = f"{int(pass_n) / max(int(done), 1) * 100:.0f}%" if int(done) else "—"
     except ValueError:
         rate = "—"
     high_sev_issues = [r for r in issues if r.get("严重级别", "").startswith(("P0", "P1"))]
+    try:
+        review_pending = int(review_n) > 0
+    except ValueError:
+        review_pending = False
 
     # ---- 标题区 ----
     b = DocBuilder()
@@ -614,8 +705,8 @@ def build_report(live, drive, folder_id, want_images):
     b.para([("项目名称：", {"bold": True, "color": DARK}), (cfg.get("app_name") or cfg.get("package", "-"), {"color": GREY})])
     if cfg.get("app_version"):
         b.para([("测试版本：", {"bold": True, "color": DARK}), (cfg["app_version"], {"color": GREY})])
-    # 测试设备：目前 target.json 只存 serial，机型/系统版本没有对应字段，留空不编
-    b.para([("测试设备：", {"bold": True, "color": DARK}), (cfg.get("serial", "-"), {"color": GREY})])
+    # 测试设备：优先显示 device_aliases.json 里登记的别名（比如"pixel4"），没登记过才退回 serial。
+    b.para([("测试设备：", {"bold": True, "color": DARK}), (device_label(cfg.get("serial", "")), {"color": GREY})])
     start_t, end_t = read_log_span()
     exec_span = format_exec_span(start_t, end_t, now)
     b.para([("执行时间：", {"bold": True, "color": DARK}), (exec_span, {"color": GREY})])
@@ -632,6 +723,8 @@ def build_report(live, drive, folder_id, want_images):
         tail += "，详见下方「失败用例详情」。"
     else:
         tail = "本轮未发现失败用例。"
+    if review_pending:  # 待复核不算失败，但也不能被"未发现失败用例"这句盖过去，得单独点出来
+        tail += f" 另有 {review_n} 条待复核（尚未走判定，结果未知），见 log.csv 状态变更日志。"
     b.para([
         (f"本轮共执行 {total} 条用例，通过率 ", {"bold": True}),
         (rate, {"bold": True, "color": BLUE}),
@@ -644,10 +737,13 @@ def build_report(live, drive, folder_id, want_images):
     b = DocBuilder()
     b.heading("二、结果统计", 1, color=DARK)
     live.flush(b)
+    # 阻塞/覆盖缺口这两类实际极少用到，按要求从这张表拿掉，保留"待复核"——它跟"通过"最容易被
+    # 混淆(两者在"失败=0"时读起来都像"没问题")，是加这些列的最初动机，必须留。数据本身仍在
+    # summary.csv/Sheet 摘要 tab 里，只是这张表不展示，不是把统计口径也删了。
     live.table(
-        headers=["用例总数", "通过", "失败", "阻塞", "通过率"],
-        rows=[[total, pass_n, fail_n, blocked_n, rate]],
-        cell_color_fn=lambda ri, ci, text: [DARK, GREEN, RED, GREY, BLUE][ci],
+        headers=["用例总数", "通过", "失败", "待复核", "通过率"],
+        rows=[[total, pass_n, fail_n, review_n, rate]],
+        cell_color_fn=lambda ri, ci, text: [DARK, GREEN, RED, BLUE, BLUE][ci],
     )
     b = DocBuilder()
     b.newline()
@@ -663,18 +759,18 @@ def build_report(live, drive, folder_id, want_images):
             cid = r.get("用例ID", "")
             qrow = queue_by_cid.get(cid)
             name = (qrow.get("一句话测试目标") or qrow.get("测试目的", "")) if qrow else ""
-            types = evidence_types_for_case(cid, evidence, qrow.get("证据链接", "") if qrow else "")
-            rows.append([cid, name, qrow.get("模块", "") if qrow else "", r.get("实际结果", ""), " / ".join(types) or "-"])
+            rows.append([cid, name, qrow.get("模块", "") if qrow else ""])
         live.table(
-            headers=["用例编号", "用例名称", "所属模块", "失败原因", "证据类型"],
+            headers=["用例编号", "用例名称", "所属模块"],
             rows=rows,
+            col_widths=[70, 330, 70],  # 编号/模块窄，名称宽——不然长文案挤成一堆窄列
         )
     else:
         b = DocBuilder()
         b.para([("本轮无失败用例。", {"color": GREY})])
         live.flush(b)
     b = DocBuilder()
-    b.para([("注：证据类型列为该用例本轮采集到的证据类型去重罗列，完整证据地址见下节「失败用例详情」。", {"color": GREY, "italic": True})])
+    b.para([("注：失败原因、证据类型、完整证据地址见下节「失败用例详情」。", {"color": GREY, "italic": True})])
     b.newline()
     live.flush(b)
 
@@ -690,7 +786,8 @@ def build_report(live, drive, folder_id, want_images):
         cid = r.get("用例ID", "")
         qrow = queue_by_cid.get(cid)
         current_link = qrow.get("证据链接", "") if qrow else ""
-        title = f"{r.get('问题ID','')} · {cid}  {r.get('标题','')}"
+        pid = r.get("问题ID", "")
+        title = f"{pid} · {cid}  {r.get('标题','')}" if pid else f"{cid}（待登记问题ID）  {r.get('标题','')}"
 
         seed = (qrow.get("Seed Data/前置数据", "") if qrow else "").strip()
         goal = (qrow.get("一句话测试目标") or qrow.get("测试目的", "")) if qrow else ""
@@ -725,17 +822,17 @@ def build_report(live, drive, folder_id, want_images):
             kv.append(["证据摘录", "\n".join(
                 f"【{t.get('证据类型','')}】{t.get('断言','')}" for t in key_texts)])
 
+        # 没人显式标「关键」就不硬塞一张——之前退到目录里"按文件名排序的第一张"兜底，
+        # 结果经常是 01-home.png 这种跟失败原因毫无关系的首页截图，反而误导阅读报告的人。
+        # 现在没有关键截图就宁可不放（没有"问题截图"这一行），比放一张不相关的图更诚实。
         img_uri = None
-        if want_images and current_link:
-            if not pics:
-                pics = case_screenshots_fallback(current_link)
-            if pics:
-                p = pics[0]
-                name = f"{cid}__{pathlib.Path(p).parent.parent.name}__{pathlib.Path(p).name}"
-                try:
-                    img_uri = upload_png(drive, folder_id, p, name, build_report._cache)
-                except Exception as ex:
-                    print(f"[warn] 上传截图失败（跳过）：{p} -> {ex}")
+        if want_images and current_link and pics:
+            p = pics[0]
+            name = f"{cid}__{pathlib.Path(p).parent.parent.name}__{pathlib.Path(p).name}"
+            try:
+                img_uri = upload_png(drive, folder_id, p, name, build_report._cache)
+            except Exception as ex:
+                print(f"[warn] 上传截图失败（跳过）：{p} -> {ex}")
 
         live.case_table(title, kv, image_uri=img_uri)
         b = DocBuilder()
@@ -753,10 +850,11 @@ def build_report(live, drive, folder_id, want_images):
         sev_order = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
         ranked = sorted(issues, key=lambda r: sev_order.get((r.get("严重级别", "") or "")[:2], 9))
         for i, r in enumerate(ranked, 1):
+            sev = r.get("严重级别", "")
             b.para([(f"{i}. ", {"bold": True}),
                     ("待修复：", {"bold": True, "color": DARK}),
                     (f"{r.get('标题','')}", {}),
-                    (f"（用例 {r.get('用例ID','')}，{r.get('严重级别','')}）", {"color": GREY})])
+                    (f"（用例 {r.get('用例ID','')}{'，' + sev if sev else ''}）", {"color": GREY})])
     else:
         b.para([("暂无待办：本轮全部用例通过。", {"color": GREY})])
     b.newline()
@@ -818,9 +916,15 @@ def main():
         if not folder_id:
             folder_id = ensure_folder(drive)
 
-    # 渲染前重新投影：报告读的是本轮 board（scope 过滤后），先刷新它
-    _, scope_desc, _ = project_board_from_queue()
-    print(f"[doc] 本轮范围 {scope_desc} → board.csv 已刷新")
+    # 渲染前重新投影：报告读的是本轮 board（scope 过滤后），先刷新它；同时重算 summary.csv——
+    # 只有 compile_cases.py 自己的 main() 才会调 build_summary，桌面壳的收尾链路（run_flow/
+    # judge_result → sync_sheets → doc_report）从不单独跑 compile_cases.py，summary.csv 会
+    # 一直停在上一次手动 compile 时的旧计数（已完成/通过/失败全是 0），而报告「一、执行结论」
+    # 「二、结果统计」偏偏读的就是这份 summary，不是这里刚投影出的新鲜 board——不补这一步，
+    # 不管账本里实际判了多少条，报告永远显示"通过 0 / 已完成 0"。见 docs/decisions.md。
+    board_rows, scope_desc, _ = project_board_from_queue()
+    build_summary(board_rows, scope_desc)
+    print(f"[doc] 本轮范围 {scope_desc.split('（')[0]} → board.csv 已刷新，summary.csv 已同步重算")
 
     live = LiveDoc(docs, doc_id)
     live.clear()

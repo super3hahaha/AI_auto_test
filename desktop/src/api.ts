@@ -159,6 +159,8 @@ export const api = {
     invoke<void>("set_target_serial", { appSlug: slug, serial }),
   setTargetScope: (slug: string, scope: string) =>
     invoke<void>("set_target_scope", { appSlug: slug, scope }),
+  setTargetDumpBackend: (slug: string, dumpBackend: string) =>
+    invoke<void>("set_target_dump_backend", { appSlug: slug, dumpBackend }),
   readSummary: (slug: string) => invoke<KV[]>("read_summary", { appSlug: slug }),
   readStructure: (slug: string) => invoke<StructureRow[]>("read_structure", { appSlug: slug }),
 

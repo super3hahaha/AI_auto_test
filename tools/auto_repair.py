@@ -25,7 +25,8 @@
 import csv, os, sys, subprocess, shutil, datetime, difflib, argparse
 from pathlib import Path
 
-from _appctx import REPO, LEDGER, load_cfg  # 多 App 路径解析
+from _appctx import REPO, LEDGER, load_cfg, ledger_lock  # 多 App 路径解析
+import exec_ledger
 
 MAX_ATTEMPTS = 3
 CLAUDE_TIMEOUT = 360  # 单次诊断上限(秒),超时按无法判定处理
@@ -82,10 +83,12 @@ def find_claude():
     return shutil.which("claude")
 
 
-def append_log(case, action, old_status, new_status, note):
+def append_log(case, action, old_status, new_status, note, serial=""):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG, "a", newline="") as f:
-        csv.writer(f).writerow([ts, case, action, old_status, new_status, "", note])
+    with ledger_lock():  # 多设备并行写账本必须持锁；「执行设备」列在行尾
+        exec_ledger.ensure_device_column(LOG)
+        with open(LOG, "a", newline="") as f:
+            csv.writer(f).writerow([ts, case, action, old_status, new_status, "", note, serial])
 
 
 def run_flow_once(python, case, script, serial):
@@ -216,7 +219,10 @@ def main():
             if attempt > 1:
                 append_log(a.case, "Claude自愈", "执行中", "已完成/需复核",
                            f"Claude自愈成功(第{attempt}次通过),前序已 patch 固化脚本的导航/健壮性;"
-                           f"通过判定仍需人工跑 output-check/logscan 确认")
+                           f"通过判定仍需人工跑 output-check/logscan 确认", serial)
+                # 稳定机器标记打到 stdout（append_log 只落 CSV，桌面壳读不到）：
+                # 前端 runStore.ts 靠这行识别「自愈通过」，别改这个 token。
+                print("[auto_repair] AUTOREPAIR_HEALED: true")
             print(f"\n[auto_repair] ✅ 第 {attempt} 次执行通过(exit 0)。")
             sys.exit(0)
 
@@ -237,7 +243,7 @@ def main():
 
         if verdict == "APP_DEFECT":
             note = f"疑似App缺陷(Claude诊断,未改任何文件):{diag_oneline(diag)};正式判定/登记issues请回 Claude Code"
-            append_log(a.case, "Claude接管", "执行中", "需人工介入", note)
+            append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
             print(f"\n[auto_repair] 🛑 判定为被测 App 缺陷——已停,不重试、不改脚本。已记 log.csv「需人工介入」。")
             sys.exit(2)
 
@@ -245,7 +251,7 @@ def main():
             after = script_abs.read_text(encoding="utf-8")
             if before == after:
                 note = f"Claude判脚本脆但未产生实际改动,无法自愈:{diag_oneline(diag)}"
-                append_log(a.case, "Claude接管", "执行中", "需人工介入", note)
+                append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
                 print("\n[auto_repair] ⚠️ 判为脚本脆却没改动脚本——停,记「需人工介入」。")
                 sys.exit(3)
             diff = "".join(difflib.unified_diff(
@@ -255,18 +261,18 @@ def main():
             print(diff)
             print(f"[auto_repair] (原版本已备份到 {a.script}.bak)")
             append_log(a.case, "Claude自愈", "执行中", "执行中",
-                       f"第{attempt}次失败后Claude patch固化脚本(导航/健壮性):{diag_oneline(diag)}")
+                       f"第{attempt}次失败后Claude patch固化脚本(导航/健壮性):{diag_oneline(diag)}", serial)
             continue  # 回到循环重跑
 
         # verdict is None / UNKNOWN
         note = f"Claude无法判定失败根因(保守不改脚本):{diag_oneline(diag)}"
-        append_log(a.case, "Claude接管", "执行中", "需人工介入", note)
+        append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
         print("\n[auto_repair] ❓ Claude无法判定——保守停,记「需人工介入」。")
         sys.exit(4)
 
     # —— 三次仍未通过 ——
     append_log(a.case, "Claude接管", "执行中", "需人工介入",
-               f"Claude自愈 {MAX_ATTEMPTS} 次仍未通过,需人工介入")
+               f"Claude自愈 {MAX_ATTEMPTS} 次仍未通过,需人工介入", serial)
     print(f"\n[auto_repair] 🛑 自愈 {MAX_ATTEMPTS} 次仍未通过——停,记「需人工介入」,请人工排查。")
     sys.exit(5)
 

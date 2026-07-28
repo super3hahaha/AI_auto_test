@@ -1,5 +1,5 @@
 {
-  "_comment": "通用广告/弹窗清障规则库，供 `adbkit.py sweep` 读取。跨 App 通用、随仓库版本管理。每条规则：id 唯一标识；scope 作用页（子串匹配当前前台窗口组件串，'任意页面'/'*' 表示不限页）；action 目前只有 tap_matched（点命中控件中心）；match 选择器列表（按顺序试，第一个命中即点，by ∈ id/text/desc/corner-tr，partial 缺省 false=精确/id 后缀匹配，true=子串；corner-tr 无 value，按结构点右上角关闭 X——用于视频/倒计时插屏那种无 text/desc/id 的关闭键，务必放 match 列表最后当兜底）；enabled 缺省 true。广告关闭类只在对应广告 SDK 全屏页触发（scope 卡住），text/desc 用 partial 兜住'Skip Ad'/'跳过广告 5s'这类带后缀的文案；权限/系统弹窗类作用页为任意页面、用精确 id。来源：同事共享的 ad-*/perm-*/system-* 规则。",
+  "_comment": "通用广告/弹窗清障规则库，供 `adbkit.py sweep` 读取。跨 App 通用、随仓库版本管理。每条规则：id 唯一标识；scope 作用页（子串匹配当前前台窗口组件串，'任意页面'/'*' 表示不限页）；action 目前只有 tap_matched（点命中控件中心）；match 选择器列表（按顺序试，第一个命中即点，by ∈ id/text/desc/corner-tr/keyevent-back，partial 缺省 false=精确/id 后缀匹配，true=子串；corner-tr 无 value，按结构点右上角关闭 X——用于视频/倒计时插屏那种无 text/desc/id 的关闭键；keyevent-back 无 value、无条件命中，按系统 BACK 键退出——用于 dump 里连 corner-tr 候选 box 都摸不到的纯 WebView 插屏创意，两者都务必放 match 列表最后当兜底）；enabled 缺省 true。广告关闭类只在对应广告 SDK 全屏页触发（scope 卡住），text/desc 用 partial 兜住'Skip Ad'/'跳过广告 5s'这类带后缀的文案；权限/系统弹窗类作用页为任意页面、用精确 id。来源：同事共享的 ad-*/perm-*/system-* 规则。",
   "version": 1,
   "rules": [
     {
@@ -18,7 +18,8 @@
         {"by": "desc", "value": "Skip", "partial": true},
         {"by": "desc", "value": "Close", "partial": true},
         {"by": "desc", "value": "Continue to app", "partial": true},
-        {"by": "corner-tr", "_note": "末位兜底：视频/倒计时创意的关闭X无text/desc/id，选择器够不着，按右上角结构位置点"}
+        {"by": "corner-tr", "_note": "末位兜底：视频/倒计时创意的关闭X无text/desc/id，选择器够不着，按右上角结构位置点"},
+        {"by": "keyevent-back", "_note": "终极兜底：纯WebView渲染的插屏创意，dump里连corner-tr需要的候选box都摸不到（2026-07-28 oppo a31 SiteGround广告真机实测，关闭X在左上角而非corner-tr认定的右上角），按系统BACK键退出该Activity；无条件命中，必须放最后一位"}
       ]
     },
     {
@@ -30,7 +31,8 @@
         {"by": "text", "value": "Skip", "partial": true},
         {"by": "text", "value": "Close", "partial": true},
         {"by": "text", "value": "跳过", "partial": true},
-        {"by": "text", "value": "关闭", "partial": true}
+        {"by": "text", "value": "关闭", "partial": true},
+        {"by": "keyevent-back", "_note": "终极兜底：同 ad-admob-close 那条（2026-07-28 见 gotchas.md），照搬到本规则以覆盖同款'dump 摸不到节点'的纯WebView插屏；本条尚未在这个具体 SDK 上真机验证过，无条件命中，必须放最后一位"}
       ]
     },
     {
@@ -42,7 +44,8 @@
         {"by": "text", "value": "Skip", "partial": true},
         {"by": "text", "value": "Close", "partial": true},
         {"by": "text", "value": "跳过", "partial": true},
-        {"by": "text", "value": "关闭", "partial": true}
+        {"by": "text", "value": "关闭", "partial": true},
+        {"by": "keyevent-back", "_note": "终极兜底：同 ad-admob-close 那条（2026-07-28 见 gotchas.md），照搬到本规则以覆盖同款'dump 摸不到节点'的纯WebView插屏；本条尚未在这个具体 SDK 上真机验证过，无条件命中，必须放最后一位"}
       ]
     },
     {
@@ -54,7 +57,8 @@
         {"by": "text", "value": "Skip", "partial": true},
         {"by": "text", "value": "Close", "partial": true},
         {"by": "text", "value": "跳过", "partial": true},
-        {"by": "text", "value": "关闭", "partial": true}
+        {"by": "text", "value": "关闭", "partial": true},
+        {"by": "keyevent-back", "_note": "终极兜底：同 ad-admob-close 那条（2026-07-28 见 gotchas.md），照搬到本规则以覆盖同款'dump 摸不到节点'的纯WebView插屏；本条尚未在这个具体 SDK 上真机验证过，无条件命中，必须放最后一位"}
       ]
     },
     {
@@ -66,7 +70,8 @@
         {"by": "text", "value": "Skip", "partial": true},
         {"by": "text", "value": "Close", "partial": true},
         {"by": "text", "value": "跳过", "partial": true},
-        {"by": "text", "value": "关闭", "partial": true}
+        {"by": "text", "value": "关闭", "partial": true},
+        {"by": "keyevent-back", "_note": "终极兜底：同 ad-admob-close 那条（2026-07-28 见 gotchas.md），照搬到本规则以覆盖同款'dump 摸不到节点'的纯WebView插屏；本条尚未在这个具体 SDK 上真机验证过，无条件命中，必须放最后一位"}
       ]
     },
     {
@@ -85,9 +90,9 @@
       "scope": "任意页面",
       "action": "tap_matched",
       "match": [
-        {"by": "id", "value": "com.android.permissioncontroller:id/permission_allow_button"},
-        {"by": "id", "value": "com.android.permissioncontroller:id/permission_allow_all_button"},
-        {"by": "id", "value": "com.android.permissioncontroller:id/permission_allow_foreground_only_button"}
+        {"by": "id", "value": "permission_allow_button", "_note": "不带包名前缀——同一个 id 后缀在 com.android.permissioncontroller（AOSP）和 com.android.packageinstaller（本仓 2026-07-28 oppo a31 真机实测命中的是这个旧包名）两种包名下都要能命中，非 partial 模式本来就按 id 后缀匹配（见 _match_nodes 的 endswith('/'+value)），带全包名反而把后缀匹配的意义废了"},
+        {"by": "id", "value": "permission_allow_all_button"},
+        {"by": "id", "value": "permission_allow_foreground_only_button"}
       ]
     },
     {

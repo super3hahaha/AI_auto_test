@@ -19,7 +19,7 @@
 import argparse, csv, json, os, shutil, subprocess, sys, shlex, datetime, pathlib, re, time
 import xml.etree.ElementTree as ET
 
-from _appctx import REPO, LEDGER, DUMPCACHE, load_cfg  # 多 App 路径解析
+from _appctx import REPO, LEDGER, DUMPCACHE, load_cfg, ledger_lock  # 多 App 路径解析
 ROOT = REPO            # 下文用 ROOT 指仓库根处（config 创证 / evidence / .dumpcache / relative_to）保持不变
 CACHE_ROOT = DUMPCACHE
 CFG = load_cfg()       # 当前活跃 App 的 apps/<slug>/target.json（AITEST_APP / config/active.json 决定）
@@ -101,22 +101,33 @@ def _append_evidence(case, step, etype, abs_path, assertion="", result=""):
     不做同路径去重——同一 (用例ID, 文件路径) 同一天被多次重跑命中同一文件名时，直接在后面
     多加一行，不覆盖/跳过之前已登记的行（旧证据保持原样，新证据接在后面，见 decisions.md #23；
     历史多轮的筛选交给 doc_report.py 的 current_link 前缀过滤，不在写入这层做）。
-    关键性不在这里判断：由人在判定环节用 case_result --evi 按文件路径升级为「关键，供报告用」。"""
-    header = ["用例ID", "步骤", "证据类型", "文件/链接", "截图预览", "断言", "结果", "采集时间", "备注"]
+    关键性不在这里判断：由人在判定环节用 case_result --evi 按文件路径升级为「关键，供报告用」。
+    多设备并行安全：整段 read-modify-write 在 ledger_lock 内；「执行设备」列（行尾）记 SERIAL，
+    矩阵跑时能按设备筛证据（路径里本来也有 serial 段，独立列是给云端 tab 筛/看的）。"""
+    header = ["用例ID", "步骤", "证据类型", "文件/链接", "截图预览", "断言", "结果", "采集时间", "备注",
+              "执行设备"]
     try:
         rel = str(pathlib.Path(abs_path).resolve().relative_to(ROOT))
     except ValueError:
         rel = str(abs_path)
-    rows = list(csv.reader(open(EVID_LEDGER, encoding="utf-8"))) if EVID_LEDGER.exists() else []
-    if not rows:
-        rows = [header]
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    row = [case, step, etype, rel, "过程留痕，仅本地", assertion, result, now, "自动登记"]
-    rows.append([_clean(x) for x in row])
-    EVID_LEDGER.parent.mkdir(parents=True, exist_ok=True)
-    with open(EVID_LEDGER, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerows(rows)
+    with ledger_lock():
+        rows = list(csv.reader(open(EVID_LEDGER, encoding="utf-8"))) if EVID_LEDGER.exists() else []
+        if not rows:
+            rows = [header]
+        if "执行设备" not in rows[0]:  # 旧账本就地补列（行尾，不动既有列位）
+            rows[0].append("执行设备")
+            for r in rows[1:]:
+                while len(r) < len(rows[0]):
+                    r.append("")
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+        vals = {"用例ID": case, "步骤": step, "证据类型": etype, "文件/链接": rel,
+                "截图预览": "过程留痕，仅本地", "断言": assertion, "结果": result,
+                "采集时间": now, "备注": "自动登记", "执行设备": SERIAL}
+        rows.append([_clean(vals.get(c, "")) for c in rows[0]])
+        EVID_LEDGER.parent.mkdir(parents=True, exist_ok=True)
+        with open(EVID_LEDGER, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerows(rows)
 
 
 # ---------- 子命令 ----------
@@ -645,6 +656,15 @@ def _sweep_one_round(nodes, focus, rules, only=None, dry_run=False):
                         shell(f"input tap {cx} {cy}")
                     return (rule.get("id"), by, f"@({cx},{cy})", cx, cy)
                 continue
+            if by == "keyevent-back":
+                # 终极兜底：整页在 dump 里一个可用节点都摸不到（纯 WebView 渲染的插屏创意，
+                # 连 corner-tr 需要的候选 box 都凑不出）——按系统 BACK 键退出该 Activity。
+                # 无条件命中（不看树），必须放在 match 列表最后一位，且只应出现在插屏类
+                # scope（如 AdActivity）下，避免误伤正常界面。真机验证见 gotchas.md
+                # 2026-07-28「插屏广告 WebView 摸不到节点」条目。
+                if not dry_run:
+                    shell("input keyevent 4")
+                return (rule.get("id"), by, "KEYCODE_BACK", -1, -1)
             if by == "outside-panel":
                 # 点弹窗外空白处关闭（setCanceledOnTouchOutside 类弹窗，如好评弹窗）。
                 # sel["of"] 给弹窗内容区的 id 列表（如 parentPanel/customPanel），
@@ -751,35 +771,84 @@ def cmd_swipe(args):
     print(shell(f"input swipe {args.x1} {args.y1} {args.x2} {args.y2} {args.ms}").stdout)
 
 
+def _u2_device_soft():
+    """尽力拿一个 uiautomator2 Device，拿不到返回 None（不 sys.exit）——跟 dump 专用的
+    `_u2_device()` 区别在于这个只给 longdrag 的 shell-motionevent 失败兜底用，拿不到
+    就该让调用方自己决定怎么报错，不能替它退出。"""
+    global _U2_DEV
+    if _U2_DEV is not None:
+        return _U2_DEV
+    try:
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            import uiautomator2 as u2
+        _U2_DEV = u2.connect(SERIAL) if SERIAL else u2.connect()
+        return _U2_DEV
+    except Exception:
+        return None
+
+
 def cmd_longdrag(args):
     """长按后拖动（真正的"长按+拖拽"手势，用于列表项/时间轴音轨这类需要先触发长按
     才能进入拖拽态的控件）。`input swipe`/`input draganddrop` 是一次性插值的触摸事件流，
     起手到开始移动之间几乎没有停顿，够不着 App 内部"按住不放 ≥ 长按阈值(~500ms)才认为
     进入拖拽态"的判断，实测两者都拖不动（见 docs/gotchas.md）。
-    本命令按真实手势拆成三段离散的 `input motionevent`：DOWN 按住原地不动 hold_ms
-    （默认 1200ms）→ 分 steps 段线性插值 MOVE 到终点（默认 600ms/8 段）→ UP 松手。
-    多次 adb shell 调用之间的"手指仍按住"状态由 Android 输入分发层维护，不依赖是不是
-    同一个 adb 进程发的，所以能跨多次 shell 调用维持同一次触摸序列。
+    本命令按真实手势拆成三段离散事件：DOWN 按住原地不动 hold_ms（默认 1200ms）→ 分 steps
+    段线性插值 MOVE 到终点（默认 600ms/8 段，但每段实际间隔有 300ms 下限，见下）→ UP 松手。
     【hold_ms 取值坑，2026-07-21 实测踩过】系统长按阈值理论上 ~500ms，但 700ms 这个
     "刚过线"的值在真机上时灵时不灵（同一段代码、同样坐标，第一次能拖动，MIX-CORE-01
     固化脚本里再跑几次就完全拖不动了，日志里两次显示的坐标和时序参数肉眼看不出区别）；
-    换成 1200ms 后反复重跑都稳定拖得动。怀疑是 adb shell 子进程调度/网络往返的时序抖动，
-    在 700ms 这种边界值上偶尔把两次事件之间的真实间隔拖到长按阈值以下。**别把 hold_ms
-    调回 700ms 附近这类"看起来够用"的边界值**，宁可多等一点也要稳（1200ms 对整条用例
-    的耗时影响可忽略）。"""
+    换成 1200ms 后反复重跑都稳定拖得动。**别把 hold_ms 调回 700ms 附近这类"看起来够用"
+    的边界值**，宁可多等一点也要稳。
+    【两条通道 + 每段间隔下限，2026-07-28 真机实测踩过】默认优先走 `adb shell input
+    motionevent`：DOWN 这一发同时兼当"探测"——Android 9 及更早的一些机型（实测 OPPO
+    CPH2015）的 `input` CLI 根本没有 motionevent 子命令（报 "Unknown command:
+    motionevent"），这条通道会整个空跑，且 shell() 不查返回码，脚本会误判"已拖动"。
+    探测到不支持时回退到 uiautomator2 的 `touch.down/move/up`（走设备上的 UiAutomator
+    注入通道，不依赖 input CLI，兼容性覆盖面更广）。但换到 u2 通道后又踩了第二个坑：
+    长按能被识别（按住时截图能看到轨道块出现选中边框），可原来 75ms/步（duration_ms=600
+    /steps=8 的默认值）这个节奏太快，移动完全不生效；把每步间隔提到 300ms 才成功拖动
+    （总时长从没变化变成确实变长）。所以两条通道都统一给每步间隔设了 300ms 下限——
+    这个下限别为了"跑快点"调低，多数用例这点耗时增量可忽略，但决定了老/低端 Android
+    设备上拖不拖得动。"""
     x1, y1, x2, y2 = args.x1, args.y1, args.x2, args.y2
     hold_s = args.hold_ms / 1000.0
-    step_s = (args.duration_ms / max(1, args.steps)) / 1000.0
-    shell(f"input motionevent DOWN {x1} {y1}")
+    step_s = max((args.duration_ms / max(1, args.steps)) / 1000.0, 0.3)
+
+    probe = shell(f"input motionevent DOWN {x1} {y1}")
+    if probe.returncode == 0 and "Unknown command" not in (probe.stderr or ""):
+        # shell input motionevent 通道可用（这次 DOWN 已经真实执行了，直接接着走）。
+        time.sleep(hold_s)
+        for i in range(1, args.steps + 1):
+            ix = round(x1 + (x2 - x1) * i / args.steps)
+            iy = round(y1 + (y2 - y1) * i / args.steps)
+            shell(f"input motionevent MOVE {ix} {iy}")
+            time.sleep(step_s)
+        shell(f"input motionevent UP {x2} {y2}")
+        print(f"[longdrag] (shell 通道) ({x1},{y1}) 按住 {args.hold_ms}ms → 分{args.steps}段"
+              f"（每段≥{int(step_s * 1000)}ms）拖至 ({x2},{y2})，已松手")
+        return
+
+    dev = _u2_device_soft()
+    if dev is None:
+        sys.exit(f"[longdrag] 这台设备的 `input` 不支持 motionevent 子命令（常见于 Android 10 以下"
+                  f"机型，实测 OPPO CPH2015/Android 9 会报 \"Unknown command: motionevent\"），"
+                  f"且 uiautomator2 也连不上：{(probe.stderr or '').strip()}\n"
+                  f"请先 `pip install uiautomator2` 并确认 `python3 -c \"import uiautomator2 as u2; "
+                  f"u2.connect('{SERIAL}')\"` 能成功连接（首次会自动往设备装 atx 常驻组件）——"
+                  f"这是目前唯一能在这类老设备上稳定触发长按拖拽的通道，回退不了。")
+    dev.touch.down(x1, y1)
     time.sleep(hold_s)
     for i in range(1, args.steps + 1):
         ix = round(x1 + (x2 - x1) * i / args.steps)
         iy = round(y1 + (y2 - y1) * i / args.steps)
-        shell(f"input motionevent MOVE {ix} {iy}")
+        dev.touch.move(ix, iy)
         time.sleep(step_s)
-    shell(f"input motionevent UP {x2} {y2}")
-    print(f"[longdrag] ({x1},{y1}) 按住 {args.hold_ms}ms → 分{args.steps}段拖至 ({x2},{y2})，"
-          f"耗时约 {args.duration_ms}ms，已松手")
+    dev.touch.up(x2, y2)
+    print(f"[longdrag] (u2 兜底通道，本机 input 不支持 motionevent) ({x1},{y1}) 按住 "
+          f"{args.hold_ms}ms → 分{args.steps}段（每段≥{int(step_s * 1000)}ms）拖至 "
+          f"({x2},{y2})，已松手")
 
 
 def _runas_prefix():

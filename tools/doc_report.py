@@ -29,7 +29,7 @@
 """
 import csv, json, sys, glob, pathlib, datetime, re, subprocess
 
-from _appctx import REPO, LEDGER as APP_LEDGER, TARGET_CFG  # 多 App 路径解析
+from _appctx import REPO, LEDGER as APP_LEDGER, TARGET_CFG, ledger_lock  # 多 App 路径解析
 ROOT = REPO
 LEDGER = APP_LEDGER                    # apps/<slug>/ledger（per-app）
 CFG_PATH = TARGET_CFG                  # apps/<slug>/target.json（per-app）
@@ -945,19 +945,20 @@ def main():
     # 回写 summary.csv 的「Google Doc 图文报告」链接（人工字段，compile 会保留）
     sp = LEDGER / "summary.csv"
     if sp.exists():
-        rows = list(csv.reader(open(sp, encoding="utf-8")))
-        hit = False
-        for r in rows:
-            if r and r[0] == "Google Doc 图文报告":
-                if len(r) < 2:
-                    r.append(url)
-                else:
-                    r[1] = url
-                hit = True
-        if not hit:
-            rows.append(["Google Doc 图文报告", url])
-        with open(sp, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerows(rows)
+        with ledger_lock():  # 账本 read-modify-write 统一持锁（多设备并行安全）
+            rows = list(csv.reader(open(sp, encoding="utf-8")))
+            hit = False
+            for r in rows:
+                if r and r[0] == "Google Doc 图文报告":
+                    if len(r) < 2:
+                        r.append(url)
+                    else:
+                        r[1] = url
+                    hit = True
+            if not hit:
+                rows.append(["Google Doc 图文报告", url])
+            with open(sp, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerows(rows)
         print("[doc] 已回写 summary.csv 的 Doc 链接。可再跑 sheets_sync.py 同步到看板。")
 
 

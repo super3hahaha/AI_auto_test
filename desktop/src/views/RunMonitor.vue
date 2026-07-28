@@ -11,15 +11,21 @@ const M = props.source ?? runStore;
 
 // 问题清单自动登记状态的中文短标（收尾阶段流转）
 function issueLabel(s: IssueState): string {
-  return { none: "", registering: "登记中…", registered: "已登记", manual: "人工" }[s];
+  return { none: "", registering: "登记中…", registered: "已登记", manual: "人工", skipped: "已跳过" }[s];
 }
-// 卡片 / 失败摘要上的徽标只显示「还需要处理」的状态——已自动登记完成（registered）
-// 不再占地方提示，只留「待人工登记」（manual）继续提醒，避免登记完成后仍反复刷屏。
+// 卡片 / 失败摘要上的徽标只显示「还需要处理」或「用户特意选了不一样结果」的状态——已自动登记
+// 完成（registered）不再占地方提示；「待人工登记」（manual）继续提醒；「已跳过」（skipped）是
+// 用户手动选的，跟默认路径不一样，留个标记方便回头确认当时为什么没登记。
 function showIssuePill(s: IssueState): boolean {
-  return s === "manual";
+  return s === "manual" || s === "skipped";
+}
+// 收尾流程还没跑到这一格（issue 仍是 "none"）且这一格是失败/需复核 → 可以切换「本条要不要登记」。
+// 调试固化脚本时常见：失败是脚本没写好，不是真缺陷，不想每次收尾都自动占用 issues.csv。
+function canToggleSkip(status: CellStatus, issue: IssueState): boolean {
+  return issue === "none" && (status === "fail" || status === "app_defect" || status === "needs_human");
 }
 
-type Filter = "all" | "ok" | "bad" | "needs";
+type Filter = "all" | "ok" | "bad";
 const filter = ref<Filter>("all");
 const eventsBox = ref<HTMLElement | null>(null);
 
@@ -43,13 +49,26 @@ function doneCountOf(s: string): number {
   return cellsOf(s).filter((c) => c.status !== "waiting" && c.status !== "running" && !c.recording).length;
 }
 function countsOf(s: string) {
-  const c = { ok: 0, bad: 0, needs: 0 };
+  const c = { ok: 0, bad: 0 };
   for (const cell of cellsOf(s)) {
     if (cell.status === "pass" || cell.status === "healed") c.ok++;
-    else if (cell.status === "fail" || cell.status === "app_defect") c.bad++;
-    else if (cell.status === "needs_human") c.needs++;
+    else if (cell.status === "fail" || cell.status === "app_defect" || cell.status === "needs_human") c.bad++;
   }
   return c;
+}
+
+// 设备总耗时：累加该设备所有格子的 elapsed（各格串行执行，求和≈墙钟时间）
+function totalElapsedOf(s: string): number {
+  return cellsOf(s).reduce((sum, c) => sum + (c.elapsed || 0), 0);
+}
+// h/min/s 格式化：<60s 只写 s；<1h 写 XminYs；否则写 XhYmZs
+function formatDuration(totalSec: number): string {
+  const s = Math.round(totalSec);
+  if (s < 60) return `${s}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h > 0 ? `${h}h${m}m${sec}s` : `${m}min${sec}s`;
 }
 
 // 全局失败用例摘要：跨设备汇总，供折叠后也能一眼看到哪些用例炸了
@@ -68,15 +87,13 @@ function inFilter(s: CellStatus): boolean {
   if (filter.value === "all") return true;
   if (filter.value === "ok") return s === "pass" || s === "healed";
   if (filter.value === "bad") return s === "fail" || s === "app_defect";
-  if (filter.value === "needs") return s === "needs_human";
   return true;
 }
 const counts = computed(() => {
-  const c = { ok: 0, bad: 0, needs: 0 };
+  const c = { ok: 0, bad: 0 };
   for (const cell of M.cells) {
     if (cell.status === "pass" || cell.status === "healed") c.ok++;
-    else if (cell.status === "fail" || cell.status === "app_defect") c.bad++;
-    else if (cell.status === "needs_human") c.needs++;
+    else if (cell.status === "fail" || cell.status === "app_defect" || cell.status === "needs_human") c.bad++;
   }
   return c;
 });
@@ -85,11 +102,12 @@ const counts = computed(() => {
 // 分母用 M.issueTotal（开始登记时就定住的固定值），不再按"目前处理到第几条"动态数——
 // 串行逐条登记时，还没轮到的格子 issue 仍是 "none"，若靠遍历 cells 数分母会出现 1/2→2/3→3/4 的诡异爬升。
 const issueStats = computed(() => {
-  const s = { total: M.issueTotal, registering: 0, registered: 0, manual: 0 };
+  const s = { total: M.issueTotal, registering: 0, registered: 0, manual: 0, skipped: 0 };
   for (const cell of M.cells) {
     if (cell.issue === "registering") s.registering++;
     else if (cell.issue === "registered") s.registered++;
     else if (cell.issue === "manual") s.manual++;
+    else if (cell.issue === "skipped") s.skipped++;
   }
   return s;
 });
@@ -101,10 +119,11 @@ const publishPhase = computed(() => {
   if (M.syncing) return { cls: "run", text: "同步表格中…" };
   if (M.docGenerating) return { cls: "run", text: "刷新报告中…" };
   // 收尾结束：若本轮有失败/需复核用例，把问题清单登记结果留在头部
-  if (issueStats.value.total > 0) {
+  if (issueStats.value.total > 0 || issueStats.value.skipped > 0) {
     const parts = [];
     if (issueStats.value.registered) parts.push(`已登记 ${issueStats.value.registered}`);
     if (issueStats.value.manual) parts.push(`待人工 ${issueStats.value.manual}`);
+    if (issueStats.value.skipped) parts.push(`已跳过 ${issueStats.value.skipped}`);
     return { cls: issueStats.value.manual ? "warn" : "ok", text: `问题清单：${parts.join(" · ")}` };
   }
   return null;
@@ -197,57 +216,63 @@ watch(
             <button :class="{ on: filter === 'all' }" @click="filter = 'all'">全部 {{ M.totalCount() }}</button>
             <button :class="{ on: filter === 'ok' }" @click="filter = 'ok'">通过 {{ counts.ok }}</button>
             <button :class="{ on: filter === 'bad' }" @click="filter = 'bad'">失败 {{ counts.bad }}</button>
-            <button :class="{ on: filter === 'needs' }" @click="filter = 'needs'">需人工 {{ counts.needs }}</button>
           </div>
           <div v-if="failedCells.length" class="fail-summary">
             <span class="fail-summary-t">⚠ 失败用例摘要（{{ failedCells.length }}）</span>
-            <button
-              v-for="fc in failedCells"
-              :key="M.key(fc.serial, fc.caseId)"
-              class="fail-chip mono"
-              @click="pickCell(fc.serial, fc.caseId)"
-            >
-              {{ fc.serial }} · {{ fc.caseId }}
-              <span v-if="showIssuePill(fc.issue)" class="issue-pill" :class="fc.issue">{{ issueLabel(fc.issue) }}</span>
-            </button>
+            <span v-for="fc in failedCells" :key="M.key(fc.serial, fc.caseId)" class="fail-chip-wrap">
+              <button class="fail-chip mono" @click="pickCell(fc.serial, fc.caseId)">
+                {{ fc.serial }} · {{ fc.caseId }}
+                <span v-if="showIssuePill(fc.issue)" class="issue-pill" :class="fc.issue">{{ issueLabel(fc.issue) }}</span>
+              </button>
+              <button
+                v-if="canToggleSkip(fc.status, fc.issue)"
+                class="skip-toggle"
+                :class="{ off: fc.issueSkip }"
+                :title="fc.issueSkip ? '点击恢复：收尾时正常登记问题清单' : '点击跳过：收尾时不登记问题清单（调试固化脚本时常用）'"
+                @click="M.toggleIssueSkip(fc.serial, fc.caseId)"
+              >{{ fc.issueSkip ? "不登记" : "登记" }}</button>
+            </span>
           </div>
           <div class="devices-scroll">
             <div v-for="s in serials" :key="s" class="device-panel">
               <div class="device-hd" @click="toggleDevice(s)">
                 <span class="chevron">{{ isCollapsed(s) ? "▸" : "▾" }}</span>
                 <span class="mono dev-serial">{{ s }}</span>
-                <span class="muted dev-prog">{{ doneCountOf(s) }}/{{ caseIds.length }} 完成</span>
+                <!-- 分母 = 该设备在 plan 里实际分到的格数（显式分派下各台不同，不能用全局用例数） -->
+                <span class="muted dev-prog">{{ doneCountOf(s) }}/{{ cellsOf(s).length }} 完成</span>
                 <span v-if="countsOf(s).ok" class="dev-ok">通过 {{ countsOf(s).ok }}</span>
                 <span v-if="countsOf(s).bad" class="dev-bad">失败 {{ countsOf(s).bad }}</span>
-                <span v-if="countsOf(s).needs" class="dev-needs">需人工 {{ countsOf(s).needs }}</span>
-                <button
-                  v-for="cid in caseIds.filter((cid) => M.cell(s, cid) && (M.cell(s, cid)!.status === 'fail' || M.cell(s, cid)!.status === 'app_defect'))"
-                  :key="cid"
-                  class="fail-chip sm mono"
-                  @click.stop="pickCell(s, cid)"
-                >
-                  {{ cid }}
-                </button>
+                <span v-if="totalElapsedOf(s)" class="dev-total-t">总耗时 {{ formatDuration(totalElapsedOf(s)) }}</span>
               </div>
               <div v-show="!isCollapsed(s)" class="device-grid">
                 <template v-for="cid in caseIds" :key="cid">
-                  <button
+                  <div
                     v-if="M.cell(s, cid)"
                     class="case-card"
+                    role="button"
+                    tabindex="0"
                     :class="{
                       dim: !inFilter(M.cell(s, cid)!.status),
                       sel: M.selectedKey === M.key(s, cid),
                     }"
                     @click="pickCell(s, cid)"
+                    @keydown.enter="pickCell(s, cid)"
                   >
                     <div class="case-id mono">{{ cid }}</div>
                     <div class="case-meta">
                       <span class="st-pill" :class="pillClass(M.cell(s, cid)!.status)">{{ labelOf(M.cell(s, cid)!.status) }}</span>
                       <span v-if="M.cell(s, cid)!.issue !== 'none'" class="issue-pill" :class="M.cell(s, cid)!.issue">{{ issueLabel(M.cell(s, cid)!.issue) }}</span>
+                      <button
+                        v-if="canToggleSkip(M.cell(s, cid)!.status, M.cell(s, cid)!.issue)"
+                        class="skip-toggle"
+                        :class="{ off: M.cell(s, cid)!.issueSkip }"
+                        :title="M.cell(s, cid)!.issueSkip ? '点击恢复：收尾时正常登记问题清单' : '点击跳过：收尾时不登记问题清单（调试固化脚本时常用）'"
+                        @click.stop="M.toggleIssueSkip(s, cid)"
+                      >{{ M.cell(s, cid)!.issueSkip ? "不登记" : "登记" }}</button>
                       <span v-if="M.cell(s, cid)!.recording" class="et recording">落库中…</span>
                       <span v-else-if="M.cell(s, cid)!.elapsed" class="et">{{ M.cell(s, cid)!.elapsed }}s</span>
                     </div>
-                  </button>
+                  </div>
                 </template>
               </div>
             </div>
@@ -309,6 +334,7 @@ watch(
 
 .fail-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 10px 0; padding: 8px 10px; border-radius: var(--radius); background: var(--bg-danger); }
 .fail-summary-t { font-size: 12px; font-weight: 500; color: var(--text-danger); flex-shrink: 0; }
+.fail-chip-wrap { display: inline-flex; align-items: center; gap: 3px; }
 .fail-chip { font-size: 11px; padding: 2px 8px; border-radius: var(--radius); background: var(--surface-2); color: var(--text-danger); border: 0.5px solid var(--border-danger, var(--text-danger)); cursor: pointer; }
 .fail-chip.sm { margin-left: 4px; padding: 1px 7px; }
 
@@ -320,7 +346,7 @@ watch(
 .dev-prog { font-size: 12px; margin-left: auto; }
 .dev-ok { font-size: 12px; color: var(--text-success); }
 .dev-bad { font-size: 12px; color: var(--text-danger); }
-.dev-needs { font-size: 12px; color: var(--text-warning); }
+.dev-total-t { font-size: 12px; color: var(--text-muted); }
 
 .device-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; padding: 4px 12px 12px; border-top: 0.5px solid var(--border); }
 .case-card { text-align: left; border: 0.5px solid var(--border); border-radius: var(--radius); padding: 8px 10px; background: var(--surface-1); cursor: pointer; }
@@ -343,6 +369,12 @@ watch(
 .issue-pill.registering { background: var(--bg-accent); color: var(--text-accent); }
 .issue-pill.registered { background: var(--bg-accent); color: var(--text-accent); }
 .issue-pill.manual { background: rgba(255,179,0,.16); color: #9a6700; }
+.issue-pill.skipped { background: var(--surface-2); color: var(--text-secondary); }
+/* 「本条要不要登记问题清单」切换按钮——收尾流程跑到这一格前都可以点，调试固化脚本时用来
+   取消不值得登记的失败。默认（登记）用中性描边；已切到「不登记」用醒目一点的灰底提醒别忘了改回来。 */
+.skip-toggle { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 0.5px solid var(--border); background: transparent; color: var(--text-secondary); cursor: pointer; }
+.skip-toggle:hover { background: var(--surface-2); }
+.skip-toggle.off { background: var(--surface-2); color: var(--text-primary); border-color: var(--border-strong); text-decoration: line-through; }
 .foot { padding: 8px 10px; font-size: 11px; border-top: 0.5px solid var(--border); flex-shrink: 0; }
 
 .right-hd { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 0.5px solid var(--border); font-size: 13px; font-weight: 500; }

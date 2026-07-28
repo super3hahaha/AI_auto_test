@@ -110,6 +110,17 @@ LANG_CODE=ja bash apps/<slug>/flows/flow_cut_save.sh <serial>
   CMP 语言包没覆盖的语言下会退化成英文而不是目标语言（详见 `docs/gotchas.md` 对应条目）。
   新语言第一次真机验证时，如果卡在某个跟被测 App 业务逻辑无关的系统级弹窗（同意/权限/更新
   提示），先怀疑是不是 `ad_rules.json` 哪条规则语言没覆盖全，而不是先怀疑 flow 脚本本身。
+- **"N 个已选中"这类带数字的动态文案，反查 key 前先分清是拼接还是模板**（详见
+  `docs/gotchas.md` 2026-07-27 条目）：拼接类（如"个已选中"）只存后缀，配 `--assert-text`
+  子串匹配用；模板类（如"%d个要合并的文件"）存的是带 `%d` 的完整句子，`t()` 查出模板后
+  用 `printf` 现填数字才能精确匹配、喂给 `waitfor text`。搞反了要么 `waitfor` 精确匹配不上，
+  要么白白多做一层不必要的字符串拼接。
+- **现状（2026-07-27）**：`apps/MP3Cutter/flows/` 下全部 18 个固化脚本已按上述方式接入
+  `LANG_CODE`/`t()` 机制（选择器文案统一查表，`tapid`/resource-id 类步骤本就语言无关不用改）。
+  `config/ad_rules.json` 的 `consent-agree` 规则也补了英文兜底。**但只做到了"查表能正确
+  换算出目标语言文案"这一层**，尚未逐条在真机上切换到非中文语言完整跑通验证（韩语环境下
+  只验证过首页入口按钮/隐私同意弹窗这两个点，见 gotchas.md），后续真要跑某个语言的完整
+  回归，仍需按上面「新语言第一次接入必须真机验证过」这条纪律走一遍。
 
 ## 跑固化脚本要用 `tools/run_flow.py`，别直接 `bash apps/<slug>/flows/xxx.sh`
 
@@ -208,6 +219,26 @@ CUT-CORE-01/MIX-CORE-01/SPLIT-CORE-01 都有重命名收尾这一步，新模块
    - **裁剪**：选区起止（`start_time_text`/`end_time_text`）→ 算出预期时长，回头跟 `output-check --expect-duration-ms` 核对（`flow_cut_save.sh` 03-editor 是范例）；保存框的格式/比特率（`format_text`/`bitrate_text`，通常还带 `tag_text`="(原始)"说明是沿用源文件参数而非App写死默认值）→ 回头跟产物文件名后缀/`output-check` 的 `mime_type` 核对。
    - **合并/混合**：选了哪些文件、顺序、`SHORTEST`（最短对齐）与否——这些直接决定产物时长/内容，同样要在选择完成那一步读出来存变量，结果页/`output-check` 再核对一遍，不能只验证"流程走完、文件生成了"。
    - **其他模块（分割/变速/变调等）同理**：先问自己"这一步如果值不对，产物会不会跟着错"，会的话就必须捕获+核对，这条纪律不是裁剪专属。
+8. **结果页"重命名"步骤的标准写法（已推广到几乎所有含重命名步骤的固化脚本，直接照抄，别重新探）**：
+   ```bash
+   $AK tapid iv_rename --timeout 5 >/dev/null      # 铅笔图标（多行列表场景用 --index N 按行区分）
+   $AK waitfor id file_name --timeout 5 >/dev/null  # 重命名对话框 EditText，预填原文件名且整体选中
+   $AK key 67 >/dev/null   # KEYCODE_DEL 单次退格即可清空整段选中内容，不需要 MOVE_END(123)+循环退格
+   $AK text "$NEWNAME" >/dev/null
+   $AK tapid button1 --timeout 5 >/dev/null   # 系统 AlertDialog 正向按钮（button2 是取消），非 App 自定义 id
+   ```
+   `button1` 在新文本和原文件名相同时是 disabled 的，只要新名字≠原名就天然满足 enabled，不用额外判断。
+   2026-07-28 真机验证过（`CUT-EDGE-02` 探路），随后推广到全部含重命名步骤的脚本，见
+   `docs/gotchas.md` 同日条目。**这条清空手法只适用于"预填 + 整体选中"的场景**——如果是
+   刚打进普通文本的输入框（如搜索框，没有选区可利用），单次退格只删一个字符，仍要老实
+   `MOVE_END`+循环退格清空，两种场景别混用同一套清空逻辑。
+9. **`output-check --expect`（断言 `date_added DESC` 最新一条）只适用于"一次操作产出一个文件"
+   的场景**（裁剪/合并/混合/单文件转换）。凡是**一次操作产出多个文件**（如"保存所有片段"批量
+   导出、未来任何批量导出功能），多个文件几乎同秒写入 MediaStore、`date_added` 精度只到秒，
+   实测会完全相同——`--expect` 断言"最新一条"在同值时取到哪条不确定（实测反而稳定取到先
+   重命名的那个），必然误判。**改法**：一次 `output-check --n <够用的数量> --allow-empty`
+   拉出多条记录，脚本自己按文件名精确 `grep` 出对应行分别核对 `_size`/`duration`，不依赖
+   "最新"语义——`flow_split_core01.sh` 的 `validate_row` 函数是范例，可直接照抄。
 
 ## 失败判定标准（硬规则，2026-07-22 起）
 
@@ -232,5 +263,20 @@ duration 不符）用 `|| true` 吞掉 output-check 的非0退出码，只 log �
    `apps/MP3Cutter/flows/flow_*.sh` 已按此标准改完，可直接抄写法（`FAILED=0` 声明 + 各校验点
    `else` 分支加 `FAILED=1` + 收尾 `exit` 判断），每个脚本顶部都留了一段简短注释说明本脚本的
    失败判定点。
+5. **规则2的「①打 `--result 失败`」必须落在 `shot` 调用之前，不能先截图后校验**。`adbkit.py
+   cmd_shot` 在没挂 `--assert-text`/`--assert-gone` 时，`--result` 默认硬编码「通过」——含义
+   只是"脚本走到了这一行"，不是"断言成立"。如果某一步的真正判定要靠一个**独立校验函数/if
+   分支**（比如结果页 UI 文案跟编辑页预期值做数值对比这类 `validate_*` 写法，output-check
+   /logscan 不适用的场景），必须先跑完这个校验、拿到通过/不通过的结论，再调 `shot` 并把结论
+   传进 `--result`（校验函数里额外设一个局部结果变量，如 `XXX_OK=1/0`，别指望复用跨越整条
+   脚本累加的全局 `FAILED`）；顺序反了的话，这一步截图登记的「结果」列会永远是「通过」，
+   证据面板单看这一步会跟终端日志/最终 exit 码对不上——`flow_split_core01.sh`/
+   `flow_split_core02.sh` 真机踩过这个坑，修法和排查方式见 `docs/gotchas.md` 2026-07-28
+   「shot 默认写死「通过」≠断言成立」条目。**排查现有脚本是否中招**：
+   `grep -B5 'shot .*--used-dump' apps/*/flows/flow_*.sh`，看紧邻的 `shot` 调用前面有没有
+   独立校验分支且没把结果传回 `--result`。
+   附带坑：这类校验函数如果在读不到预期文案时提前 `return 1`，脚本头部通常有 `set -e`，
+   裸调用（不在 `if`/`&&`/`||` 里）会被直接杀脚本、跳过后续证据收集——调用处记得配 `|| true`，
+   判定完全交给校验函数写的局部结果变量 + 全局 `FAILED`，不依赖函数的 shell 退出码。
 
 背景决策详情见 `docs/decisions.md` #33、#34。

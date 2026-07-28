@@ -347,6 +347,22 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 "新建看板"走的是 `new_run.py` 这条完全独立的路径，不会检查上一轮收尾是否完成）——加锁判据要覆盖
 所有能触发写入的入口，不能只挡最常见那个。
 
+**后续更新（2026-07-28）**：上面这条教训自己没吃透——`syncing || docGenerating` 只覆盖了收尾的
+后两段，漏了「登记问题清单」（`registerIssues`，跑在 sync 之前）和「存执行记录」（`saveRecord`，
+跑在 doc_report 之后）这两段窗口；而且判据只加在 `runSelected()` 和按钮 disabled 上，没加进
+`runStore.start()` 本身——"新建看板"二次确认弹窗的「确认开新一轮并执行」按钮直接调
+`launch(true)`，绕过 `runSelected()` 直达 `start()`，同样能在收尾没完成时把下一轮开起来。
+实际症状不止 doc_id 覆盖，还有**日志串轮**：`finish()` 里收尾链子（registerIssues→syncSheets→
+genDocReport→saveRecord）全程都在调 `this.pushEvent` 写 `this.events`；下一轮 `start()` 一旦跑
+起来会把 `this.events` 整个换成新数组，但收尾链子读的还是 `this` 这个活对象，之后每一次
+`pushEvent` 落的都是新数组——上一轮的登记/同步/Doc 日志、甚至"本轮已存入执行记录"这条完成提示，
+全都会夹进下一轮实时日志的中间。**修法**：加一个贯穿收尾全程的 `runStore.publishing` 标志
+（`finish()` 里在 `void this.publish()` 之前置 true，`.finally()` 里置 false），把守卫下沉到
+`start()` 内部的 `if (this.running || this.publishing) return;`——这样不管从哪个入口调
+`start()`（含绕过 `runSelected()` 的确认弹窗），只要上一轮收尾没完全跑完就一律拒绝。UI 侧
+`runSelected()`/按钮 disabled/确认弹窗按钮都统一改判 `running || publishing`，只是提前给用户反馈，
+真正兜底的是 `start()` 内部这道。
+
 ## 隐私同意弹窗(CMP)出现时机不固定，固定短窗 sweep 会漏点（2026-07-22，`flow_dl_tt.sh` DL-TT-01）
 
 `flow_dl_tt.sh` 每轮 `reset` 清空数据后都会重新触发"请求您同意将您的个人数据用于以下用途"
@@ -523,3 +539,249 @@ App，只要设备不是中文，大概率会在这同一个 CMP 弹窗上卡住
 **残留限制**：只覆盖了"中文 / CMP 语言包没覆盖时的英文兜底"这两种，如果某语言 CMP 有
 自己的本地化译文（比如日语真翻成了日语而不是退化成英文），这条规则还是接不住，出现再
 按同样方法（真机 dump 读 `content-desc`）补一条。
+
+## 账本锁 ledger_lock：flock 同进程不可重入，嵌套必须走计数（2026-07-28）
+
+- `tools/_appctx.ledger_lock()` 是 per-app 账本进程间锁（`ledger/.ledger.lock`，`fcntl.flock` 独占）。
+  **同一进程打开两个 fd 对同一文件 flock 会自己等死自己**——而嵌套持锁在本仓是常态
+  （`compile_cases.main` 持锁 → 调自带锁的 `project_board_from_queue`；`case_result` 持锁段里调
+  `exec_ledger.ensure_device_column` 也拿锁），所以实现用模块级计数做了进程内重入，别改回"每次开新 fd"。
+- **纪律**：账本 CSV 任何「读全表→改→覆盖写」必须**整段**包 `with ledger_lock():`，不是只包写那一行；
+  新增写点跟着包（flock 是 advisory，漏一个写者整个保护就破）。核对命令：
+  `grep -nE 'open\([A-Za-z_][^,)]*,\s*"[wa]"' tools/*.py`，逐个确认在锁内。
+- **锁内禁止慢操作**：不要拿着锁调 adb/claude/网络（`case_result.detect_coverage` 之前就踩过设计
+  阶段的这个坑——已挪到锁外先算好）。锁保护的是毫秒级文件写，拿锁秒级等设备会把并行跑的
+  其它设备全堵住。
+- 信号处理器里写账本是安全的：`run_flow._on_term` 补记「已中止」时若主线程恰好持锁，重入计数
+  直接放行（同进程），写完 `os._exit` 由内核释放锁，不会死锁。
+
+## sweep 摸不到节点的插屏广告：corner-tr 也救不了，加 keyevent-back 兜底（2026-07-28）
+
+- 真机现象：`apps/MP3Cutter` `CONV-CORE-01` 在 oppo a31（LRBMFAAEFYKFEQ65）上卡死，固化脚本
+  只留一张 `01-home.png` 就 exit 1。连真机查看，设备真卡在一个 AdMob 插屏（SiteGround 电商广告）
+  上不动，`dumpsys window` 显示前台焦点是 `AdActivity`。
+- 根因：这条广告创意是纯 WebView 渲染，`uiautomator dump` 整页只有系统状态栏节点，广告内容
+  （含关闭 X）**一个可用节点都没有**——`sweep` 靠 text/id/desc 的规则全部够不着；结构兜底
+  `corner-tr`（[tools/adbkit.py:444](../tools/adbkit.py:444)）同样救不了：它需要树里存在候选
+  box 才能算"右上角最小面积节点"，这里树是空的，`_match_corner_tr` 直接返回 `None`。而且就算
+  树不空，这条创意的关闭 X 实际在**左上角**（约 (48,48)，屏幕 720×1600），跟 corner-tr 认定的
+  右上角方向也是反的。
+- 排查方法：`adb shell dumpsys window | grep mCurrentFocus` 确认前台是不是广告 Activity；
+  `adb shell uiautomator dump` 拉下来看树里有没有非 `systemui` 节点——没有就是这类"WebView 黑洞"，
+  别再指望文字/id/坐标选择器。
+- **真机验证过的解法**：`adb shell input keyevent 4`（BACK）能干净退出这个 AdActivity 回到
+  App 首页；反而瞎猜坐标点左上角 X 没用（可能是触摸事件时序/hitbox 跟截图看到的不完全对应）。
+- **修法**：`config/ad_rules.json` 的 `ad-admob-close` 规则新增 `keyevent-back` 类型（无条件
+  命中，按 BACK 键），放在 `corner-tr` 之后当最终兜底；`tools/adbkit.py` `_sweep_one_round`
+  相应加了 `by == "keyevent-back"` 分支。**只加到了 `ad-admob-close`**（唯一真机验证过的），
+  其余广告 SDK（applovin/unity/fan/vungle）如果撞到同款"dump 摸不到节点"症状，照此加一条。
+- **残留限制**：BACK 键对"允许物理返回退出"的插屏才有效；如果某广告 SDK 拦截了 BACK 键不放行
+  （历史上没见过，但不能排除），这条兜底会无效，得再想别的辙（比如换用坐标盲点，需先在该设备
+  上真机验证一次可行坐标）。改动未在真机上重跑 `CONV-CORE-01` 回归验证，下次这个用例在类似
+  设备上跑到时留意是否真的不再卡在这张插屏上。
+- **2026-07-28 追加**：`CUT-FMT-01` 在同一台 oppo a31 上又撞到一次同类症状（这次是 Traveloka
+  创意，卡在第5种格式 vorbis 的「保存」按钮之后），`sweep --rounds 10` 确认跑过了但没能清掉——
+  截图证实广告仍整屏盖住。当时没能力回溯确认它落在哪个广告 Activity（设备已经翻页，
+  `dumpsys window` 查不到历史焦点），但既然 `keyevent-back` 只挂在 `ad-admob-close` 一条上，
+  已按上面「修法」段落的提醒把它也照搬加到 `ad-applovin-close`/`ad-unity-close`/
+  `ad-fan-close`/`ad-vungle-close` 四条规则末尾（`config/ad_rules.json`）——`_sweep_one_round`
+  对 `keyevent-back` 的处理本来就是通用的（按 `scope` 匹配 focus，不是写死判断 rule id），
+  加规则不用改 `tools/adbkit.py`。这四条目前**没有真机验证过**，只是照抄同款兜底防患于未然，
+  下次真撞上其中某个网络的插屏卡死时，留意是不是真的被这条新兜底救回来了。
+
+## perm-allow 规则带了包名前缀，反而废了 id 后缀匹配（2026-07-28）
+
+- 真机现象：oppo a31（LRBMFAAEFYKFEQ65）跑 `CUT-CORE-01`/`CONV-CORE-01` 反复卡死在存储权限弹窗
+  「允许「音频裁剪 & 铃声制作器」访问您设备上的照片、媒体内容和文件吗？」（拒绝/允许），`sweep`
+  死活点不掉。
+- 根因：`dumpsys window` 显示这个弹窗的 Activity 是 `com.google.android.packageinstaller/
+  com.android.packageinstaller.permission.ui.GrantPermissionsActivity`——注意包名是**旧的**
+  `com.android.packageinstaller`，不是 AOSP 新版的 `com.android.permissioncontroller`；真机
+  dump 出的按钮 resource-id 也是 `com.android.packageinstaller:id/permission_allow_button`。
+  而 `config/ad_rules.json` 的 `perm-allow` 规则把值写成了**带全包名**的
+  `com.android.permissioncontroller:id/permission_allow_button`——`_match_nodes`（
+  [tools/adbkit.py:500](../tools/adbkit.py:500)）非 partial 模式本来就是按 `endswith("/"+value)`
+  做 id **后缀**匹配，目的就是不管包名叫什么都能命中，结果规则里把包名也写死进 value，
+  后缀匹配的意义被自己废掉了——两个包名字符串谁也不是谁的后缀，永远不命中。
+- 排查方法：`dumpsys window | grep mCurrentFocus` 先确认弹窗 Activity 的包名，再
+  `uiautomator dump` 看按钮真实 resource-id 是哪个包名前缀；跟规则库里写的值逐字符对一下，
+  差在包名上这种问题肉眼很容易扫过去（两边都叫 `permission_allow_button`，只是前缀不同）。
+- **修法**：`perm-allow` 三条 match 全部去掉包名前缀，只留 `permission_allow_button`/
+  `permission_allow_all_button`/`permission_allow_foreground_only_button`，靠 `_match_nodes`
+  自带的后缀匹配去兼容 `permissioncontroller`/`packageinstaller`/其他 OEM 包名变体。已用
+  `sweep --dry-run` 在真机上验证命中、再用真实 `sweep` 验证点掉后弹窗消失、App 进入
+  `PickerActivity`（确认解卡）。
+- **同类排查提醒**：写新的 `by: id` 规则时，**默认不要带包名前缀**，除非 id 片段是
+  `back`/`close`/`title` 这类跨 App 通用词、明确要限定只匹配自己包（见后面
+  [[`tapid back` 裸 id 会被系统导航栏同名控件抢先命中]] 就是这种例外）；已有规则如果将来又在
+  新设备上卡住，先怀疑是不是同一个"包名前缀把后缀匹配废了"的坑，而不是急着当成新问题去写
+  新规则。
+
+## 多语言查表接入时，"N 个已选中"这类文案要先分清是拼接还是模板（2026-07-27）
+
+批量把 `apps/MP3Cutter/flows/flow_*.sh`（18 个）接入 `tools/lang_table.py`/`tools/lang_helper.sh`
+时，"2 个已选中"/"6个要合并的文件"这类带数字的文案不能直接拿完整字符串去反查 key——
+strings.xml 里没有这两句的字面值，反查会直接报"找不到 key"（NOKEY）。查清楚后发现是两种
+不同机制，处理方式不一样：
+
+- **拼接类**（如"个已选中"，key=`selected`）：App 代码是 `数字 + " " + 固定后缀` 现拼的，
+  strings.xml 只存后缀本身。这类字符串**不需要精确复原完整文案**：`adbkit --assert-text` 本来
+  就是子串匹配（`_present_any(partial=True)`），直接 `--assert-text "2 $(t 个已选中)"` 拼数字
+  +译文后缀即可命中；但 `waitfor text` 默认是**精确匹配**（`partial=False`），同一个后缀不能
+  直接拿来做 `waitfor`，得用 `--assert-text` 这条子串路径断言，别指望 `waitfor` 也能这么用。
+- **模板类**（如"%d个要合并的文件"，key=`multi_select_merger_title`）：strings.xml 里存的是
+  真正带 `%d` 占位符的完整模板，各语言的 `%d` 占位符本身保留不变（只有前后缀文字翻译）。这类
+  要用 `t()` 查出模板原样（`--key` 指定，因为查询文本里的 `%d` 不能直接拿去精确匹配某语言的
+  文案），再用 bash `printf "$TMPL" "$N"` 现填数字，得到跟原字面值等价的精确文案，可以直接喂
+  给 `waitfor text`（精确匹配）。
+
+**怎么分辨该用哪种**：反查一下 zh-rCN 原文对应的 key 存的是"纯后缀"还是"带 `%d` 的完整句子"
+（`python3 tools/lang_table.py locales`/直接翻 `strings_table.json` 找那个 key），带 `%d` 就是
+模板走 printf，没有 `%d`、值本身就是句子片段就是拼接走子串断言。别不看 key 内容就假设两种
+文案处理方式一样，会把 `waitfor` 精确匹配和子串匹配的语义搞混。
+
+**残留限制**：拼接类假设目标语言也是"数字+空格+后缀"这个顺序/格式（跟 zh-rCN 一致），这只是
+不同语言常见的排布，未必对所有语言都成立（比如某些语言习惯把数字放在词尾或需要插入单位词）；
+新语言第一次接入这几步（`flow_conv_core.sh`/`flow_mix_core.sh`/`flow_mix_shortest.sh`/
+`flow_merge_count.sh`/`flow_merge_fmt.sh`）时要真机核对这个假设，不能光凭代码跑通就当验证过，
+见 `.claude/skills/flow-freeze/SKILL.md`「多语言」一节。
+
+## `tapid back` 裸 id 会被系统导航栏同名控件抢先命中（2026-07-28，`MIX-CORE-01`）
+
+- 真机现象：oppo a31（LRBMFAAEFYKFEQ65）跑 `flow_mix_core.sh`，「选择音频」列表选完第1个文件后
+  `$AK tapid back --timeout 5` 报 `[warn] id='back' 有 2 个匹配，点第 0 个
+  (com.android.systemui:id/back)`；紧接着选第2个文件时 `tapid btn_search` 死等 6s 超时，
+  脚本 `exit=1`。
+- 根因：`_match_nodes`（[tools/adbkit.py:500](../tools/adbkit.py:500)）对 id 是后缀匹配
+  （`v.endswith("/"+value)`），传裸值 `"back"` 会同时命中 App 自己「选择音频」页里的返回箭头
+  和三键导航栏的 `com.android.systemui:id/back`（`uiautomator dump` 默认把导航栏也一起
+  dump 进树里）。两个节点谁在 dump 里排第一不固定，之前一直"运气好"点到 App 自己的箭头
+  （只收起搜索框回到文件列表），这次点到了导航栏那个——等效于按物理 Back，把整个选择音频页
+  弹出去了，不是简单收起搜索框，所以下一轮压根找不到 `btn_search`。
+- **跟 [[perm-allow 规则带了包名前缀，反而废了 id 后缀匹配]] 刚好相反的坑**：那条是"不该加
+  包名前缀却加了"（导致后缀匹配失效、永远点不到），这条是"该加包名前缀限定唯一包却没加"
+  （导致后缀匹配范围过宽、跨包误命中）。两条不矛盾：默认规则是"不加前缀让后缀匹配去兼容
+  同一个 App 的 OEM 包名变体"，但当某个 id 片段（`back`/`close`/`title` 这类通用词）恰好
+  跟 systemui/launcher 等**不同 App** 的控件同名时，就必须加包名前缀把匹配范围收窄到只认
+  自己的包，两种情况看 id 片段是否是"跨包通用词"来判断要不要加前缀，不能死记"永远不加"。
+- **修法**：`flow_mix_core.sh`/`flow_mix_shortest.sh`/`flow_conv_core.sh`/`flow_merge_fmt.sh`
+  这四处「选择音频」列表里的 `tapid back` 全部改成 `tapid "$PKG:id/back"`（`PKG` 各脚本头部
+  已定义），靠精确等值匹配（`v == value`）只命中 App 自己的返回箭头，不会再被系统导航栏抢。
+
+## `longdrag`（长按拖拽）在 Android 9 老设备上完全空转 + 拖动距离公式把两轨拖成不重叠（2026-07-28，`MIX-CORE-01`）
+
+- 真机现象：OPPO CPH2015（LRBMFAAEFYKFEQ65，Android 9 / API 28）跑 `flow_mix_core.sh`，
+  长按拖动 60s 音轨 3 次尝试全部"总时长仍是 01:00.0，拖动未生效"，最终如实记失败；同样的
+  脚本在 Pixel 4（Android 13）上一直跑得通。
+- **根因 1（`longdrag` 整个空转）**：`tools/adbkit.py` 的 `longdrag` 命令用
+  `adb shell input motionevent DOWN/MOVE/UP` 实现"长按进入拖拽态再移动"。这台设备的
+  `input` CLI **压根没有 `motionevent` 子命令**（直接报 `Unknown command: motionevent`），
+  而 `cmd_longdrag` 原来不检查任何一次 `shell()` 调用的返回码，于是三次 DOWN/MOVE/UP
+  全部静默失败，脚本却照样打印"已松手"当成功，实际上设备屏幕从头到尾没被摸过。用
+  `adb -s <serial> shell getprop ro.build.version.sdk` 能快速确认：这个坑只在
+  `sdkInt` 明显偏老（实测 28）的机型上出现，Pixel 4（`sdkInt`=33）没有这个子命令缺失问题。
+- **根因 2（换 uiautomator2 后，移动节奏太快也不生效）**：绕过 `input motionevent`、改用
+  `uiautomator2` 的 `touch.down/move/up`（走设备上的 UiAutomator 注入通道，不依赖 `input`
+  CLI）之后，长按本身能被识别（按住时截图能看到轨道块出现白色选中边框），但沿用原来
+  75ms/步（`duration_ms=600`/`steps=8`）的移动节奏依然完全不生效——总时长纹丝不动。把每步
+  间隔放慢到 300ms 才成功拖动（总时长从 01:00.0 变成 01:16.6，轨道也确实在画面上挪动了）。
+  **两条通道都要给每步移动间隔设 300ms 下限**，这个下限决定了老/低端 Android 设备上拖不拖得动，
+  别为了"跑快点"调低。
+- **修法（`tools/adbkit.py` `cmd_longdrag`）**：DOWN 这一发同时兼当探测——成功（返回码 0 且
+  stderr 不含 `Unknown command`）就走原来的 shell `input motionevent` 通道；探测到不支持就
+  自动回退到 `uiautomator2` 的 `touch.down/move/up`（`_u2_device_soft()`，拿不到设备返回
+  `None` 而不是直接退出，让调用方自己决定报错文案），两条通道统一把每步间隔下限设为 300ms。
+  u2 库/atx 组件不可用时给出明确的可执行报错（装库 + `u2.connect` 自检），不是含糊的失败。
+- **根因 3（拖动距离公式把两轨拖成首尾相接、不重叠）**：`flow_mix_core.sh` 原来的拖动终点
+  公式是"拖到 `audio_container` 右边界内侧一点"（19/20 处，几乎贴边）。在 60s/40s 这对固定
+  素材上，这个几乎贴边的距离实测会让 60s 轨道产生**整整 40s 的偏移**（总时长变 01:40.0）——
+  40s 偏移刚好等于短轨（40s）的全长，两条轨道变成首尾相接、完全不重叠，混合出来的音频听感上
+  没有真正重叠的一段（用户实测用耳朵/看 UI 发现的，不是脚本断言能测出来的——`MIX-CORE-01.yaml`
+  的 `expected` 只要求"总时长变长"，没有形式化"必须重叠"这条，所以脚本本身判定仍是通过的）。
+  **修法**：拖动终点公式从"容器宽度的 19/20 处"改成"起点 + 容器宽度的 1/6"，远离贴边区域
+  （贴边时还观察到"手指位移跟轨道实际位移对不上"的额外偏差，换成远离边界的距离后这个偏差
+  也消失了）。真机实测新公式产生约 15~20s 偏移（本次 17.6s，总时长 01:17.6），明显小于 40s，
+  能保证跟 40s 轨道有一段真实重叠。别把这个距离再调大接近整条容器宽度，会重新踩回"首尾相接
+  不重叠"的坑；也别指望光换回 shell 貼近边界那个公式配合"减少重试次数"能解决重叠问题——
+  重试次数和单次拖动距离是两个独立维度，决定重叠与否的只有单次拖动的距离本身。
+- **`SPLIT-CORE-01`/`SPLIT-CORE-02` 不受影响**：`flow_split_core01.sh`/`flow_split_core02.sh`
+  用的是 `input swipe`（普通滚动手势，调整分割点位置），完全不走 `longdrag`，不需要跟着改；
+  `input swipe` 是所有 Android 版本都支持的基础命令，在这台 API 28 设备上实测正常（真机确认过，
+  不是假设）。只有真正用到"长按进入拖拽态再移动"这种手势的脚本才会触达 `longdrag` 的这两个坑。
+
+## 重命名对话框清空原文件名：单次 `KEYCODE_DEL` 就够，不需要 MOVE_END+循环退格（2026-07-28）
+
+- **背景**：所有固化脚本的"结果页重命名"步骤，此前统一写成"`tapid iv_rename` 弹框 →
+  `waitfor id file_name` → `KEYCODE_MOVE_END`(123) → 循环 40 次 `KEYCODE_DEL`(67) 清空 →
+  `text` 输入新名字"，理由是 2026-07-22 真机实测过 `input text` 是在光标处插入、不会覆盖
+  选中内容（直接 `text` 会拼出 `AudioSplit_..._1split2026...` 这种追加脏名，见 `flow_split_core01.sh`
+  头注），所以必须先清空。`flow_cut_edge02.sh` 还在此基础上多加了一步 `tapid file_name` 抢焦点
+  （解决另一个独立的"焦点未就绪导致 text 静默丢失"时序坑），但这个坐标点击落在文本框内部，
+  按安卓原生行为会把选区折叠成普通光标，反而更容易清不干净。
+- **验证过程**：写了一个临时脚本 `tmp_rename_softkey_delete.sh`（探路用，不进 `flows/`），
+  真机（OPPO CPH2015 / Android 9）测试"直接点一下屏幕上可见的软键盘删除键"这个思路——
+  第一次估算坐标偏了一行，点中了字母键 `l`，结果证实：选区在"弹框→等 EditText 出现"这段
+  路径上是**完好的**（一次按键把整段选中文件名替换成了单个字符 `l`，不是追加），说明前面
+  "选区容易被打断"的担心是过度的，只要不去点/戳文本框内部，选区不会自己消失。
+- **关键发现**：把坐标点击换成纯按键码 `$AK key 67`（`adb shell input keyevent 67`，无坐标、
+  不依赖分辨率/键盘布局）单独测试，同样一次就把整段预填+全选的原文件名清空成空字符串——
+  跟点软键盘上可见的删除键效果完全一致。也就是说 `KEYCODE_DEL` 这个按键事件本身是识别
+  当前选区的（对着一段选中范围按一次 DEL 会删掉整个范围，这是安卓标准 TextView 按键处理逻辑，
+  跟 `input text` 的字符插入是两条不同代码路径，`input text` 才是那个不认选区、只在光标处
+  插入的例外）。
+- **结论/修法**：重命名清空步骤统一简化为"`tapid iv_rename` → `waitfor id file_name` →
+  单次 `$AK key 67` → `text 新名字`"，去掉 `KEYCODE_MOVE_END` 和循环退格，`flow_cut_edge02.sh`
+  额外的抢焦点 `tapid file_name` 也一并去掉（选区本来就没被打断，这步纯属画蛇添足外加风险）。
+  原有的读值校验+失败重试（MOVE_END+60次退格）保留，作为真正焦点时序坑的兜底，不再是主路径。
+  2026-07-28 已在 `CUT-EDGE-02` 真机跑通验证，随后推广到其余所有含重命名步骤的固化脚本。
+  **`flow_split_core02.sh` 的 `clear_edittext()` 共享函数不能直接改**：这个文件里同名函数
+  还挂着搜索框（`search_edit_text`）清空重试这个完全不同的场景——搜索框没有"预填+全选"这个
+  前提，清空的是刚打进去的普通文本，没有选区可利用，必须老实 MOVE_END+循环退格；只把
+  重命名那一处调用换成 `$AK key 67`，`clear_edittext()` 函数定义本身和搜索框那处调用原样保留。
+
+## 「音频分割」入口首次会弹非会员专属的欢迎/试用弹窗，挡住「选择音频」列表（2026-07-28，SPLIT-CORE-01/02）
+
+- **背景**：非会员账号首次点首页「音频分割」入口时，会先弹出一个"恭喜！由于这是您首次探索
+  我们的高级功能，作为特别欢迎礼，您这次可以免费使用「音频分割」功能"的欢迎弹窗，弹窗上只有
+  一个「立即开始」按钮，点掉它才能进入「选择音频」列表；不处理这个弹窗，后续
+  `tapid btn_search` 等选择器全部找不到节点，表现为"进不去文件选择页"，容易误判成选择器失效
+  或 App 缺陷。
+- **只在非会员账号出现**：会员（PRO 已解锁）账号不会弹这个引导，因为不存在"首次体验高级
+  功能"这个前提。`flow_split_core01.sh`/`flow_split_core02.sh` 两条固化脚本目前用的测试账号是
+  会员态，跑通时不会遇到这个弹窗，脚本里没写处理逻辑是"按当前账号状态正确地没写"，不是遗漏。
+- **换非会员账号跑这两条用例会卡住**：会停在 `$AK tapid btn --timeout 6`（文件访问按钮）之后，
+  等 `$AK waitfor text "$(t 选择音频)"` 超时失败。若后续需要用非会员账号覆盖这条路径（或者
+  测试账号意外掉级为非会员），需要先加一步识别并点掉这个欢迎弹窗（弹窗按钮文案「立即开始」，
+  具体 resource-id 待下次非会员真机探路时补充），再继续走选择音频流程。
+
+## shot 默认写死「通过」≠断言成立：数值校验必须挪到截图之前才能写回证据行（2026-07-28）
+
+- 现象：`flow_split_core01.sh` 真机跑出 FAILED=1（`validate_ui_pair` 报"结果页显示 00:36 vs
+  编辑页预期 25100ms，差 10900ms 超出容差"），但证据查看器里 `06-result` 这一步的「结果」列
+  显示「通过」——单看证据面板会误判整条用例通过，跟终端日志/最终 exit=1 完全对不上。
+- 根因：`adbkit.py cmd_shot` 没挂 `--assert-text`/`--assert-gone` 时 `result` 默认硬编码
+  「通过」（[tools/adbkit.py:242](../tools/adbkit.py:242)，语义是"脚本走到了这一行"而非"断言
+  成立"，代码注释里早点破过这个坑）。而 `flow_split_core01.sh`/`flow_split_core02.sh` 里唯一
+  能证明"分段/删除时长对不对"的 `validate_ui_pair`/删除后 `tv_total_time` 核对，写法是**先调
+  `shot` 截图登记完，再调校验函数**——校验函数只 `log` 到终端 + 置全局 `FAILED`，不会回头改
+  已经写进 `evidence.csv` 那一行的「结果」列，两条判定链路完全脱钩。
+- 影响范围：只有走"批量导出/删除后核对"这种"结果页 UI 需要跟编辑页预期值做数值对比"路径的
+  脚本会中这个坑——排查过全部 `apps/MP3Cutter/flows/flow_*.sh`，命中的是
+  `flow_split_core01.sh`（`06-result`）和 `flow_split_core02.sh`（`07-after-delete`、
+  `09-result`）三处；其余脚本的关键校验都走 `output-check --expect`（自己有独立的
+  `_append_evidence(..., result="失败" if fail_msg else "通过")` 分支，见
+  [tools/adbkit.py:1159-1160](../tools/adbkit.py:1159)，判定跟证据行是绑在一起写的），没有这条
+  "先截图后校验"的时序问题。
+- 修法：把三处都改成**先算校验结果、再截图**——`validate_ui_pair` 额外写一个全局变量
+  `UI_PAIR_OK`（1=过/0=不过，`FAILED`本身不能直接拿来判"这一次"过没过，因为它是跨越整条
+  脚本累加的全局态），调用方拿 `UI_PAIR_OK` 决定这次 `shot` 传 `--result 通过` 还是
+  `--result 失败`，再落地截图。删除校验那处没有独立函数，直接把 `DIFF_DEL` 判断挪到
+  `shot 07-after-delete` 调用之前。
+- 顺带坑：`validate_ui_pair` 在 `ui_text` 为空的早退分支写的是 `return 1`，而两个脚本头部都有
+  `set -e`——早退分支原来是脚本里唯一会触发这条路径的地方，且调用处是裸调用（不在
+  if/&&/|| 里），一旦真的踩中空文案就会被 `set -e` 直接杀掉整个脚本，跳过后续所有还没跑的
+  证据收集和 `FAILED` 收尾判定（违反 docs/flow-freeze.md 的"脚本仍跑完收集证据"约定）。这次
+  改动统一在调用处补了 `|| true`，让 `set -e` 不再拦这一条，判定完全交给 `UI_PAIR_OK`/`FAILED`。
+- 排查方法：怀疑某条固化脚本有类似脱钩时，搜 `grep -B5 'shot .*--used-dump' apps/*/flows/flow_*.sh`
+  看紧邻的 `shot` 调用前后有没有独立的数值校验函数/if 分支且没把结果传回 `--result`——用这个
+  模式快速定位，不用逐条脚本通读。

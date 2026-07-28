@@ -10,10 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
-// 当前正在执行的 run（run_flow / auto_repair）的进程组 id（== 组长 pid）。中止靠它 kill 整组，
-// 把 python→bash→adb→claude 一并带走（子进程默认继承父进程组，见 stream_child 的 process_group）。
-// 一次只跑一个 run（执行台串行编排 + 跑时禁开新 run），故一个全局槽足够。
-static RUN_PGID: Mutex<Option<i32>> = Mutex::new(None);
+// 当前正在执行的所有 run（run_flow / auto_repair / judge_result）的进程组 id（== 组长 pid）。
+// 中止靠它 kill 整组，把 python→bash→adb→claude 一并带走（子进程默认继承父进程组，见
+// stream_child 的 process_group）。多设备并行后每台设备一个 worker 同时各跑一个进程，
+// 单槽会被后启动的覆盖、abort 只能停最后一个——改成 (key=serial, pgid) 多槽登记，
+// abort_run 遍历全杀。用 Vec 而非 HashMap：HashMap::new() 不是 const，static 初始化不了；
+// 条目至多设备数级别，线性 retain 足够。
+static RUN_PGIDS: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -957,6 +960,24 @@ pub fn set_target_scope(app: AppHandle, app_slug: String, scope: String) -> Resu
     Ok(())
 }
 
+/// 设 UI dump 后端：写回 apps/<slug>/target.json 的 dump_backend（shell / u2）。
+/// u2 需设备预装并保活 atx-agent，切换前应先在设备上跑通 `tools/init_target.py --atx-init`
+/// 确认可连（见 decisions.md #30），这里不做设备端探测，纯写配置。
+#[tauri::command]
+pub fn set_target_dump_backend(app: AppHandle, app_slug: String, dump_backend: String) -> Result<(), String> {
+    if dump_backend != "shell" && dump_backend != "u2" {
+        return Err(format!("dump_backend 只能是 shell 或 u2，收到：{dump_backend}"));
+    }
+    let root = root_of(&app)?;
+    let p = app_root(&root, &app_slug).join("target.json");
+    let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+    v["dump_backend"] = Value::String(dump_backend);
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 概览 summary.csv
 // ---------------------------------------------------------------------------
@@ -1134,11 +1155,13 @@ fn pump<R: std::io::Read>(r: R, ch: &Channel<String>) {
     }
 }
 
-/// track=true 的会被登记为「当前可中止的 run」：放进自己的进程组（子孙进程都跟着），
-/// 并把组 pid 记进 RUN_PGID，供 abort_run kill 整组；退出时清空。装机/注册/新建看板不登记。
-fn stream_child(mut cmd: Command, on_event: Channel<String>, track: bool) -> Result<i32, String> {
+/// track_key=Some(_) 的会被登记为「当前可中止的 run」：放进自己的进程组（子孙进程都跟着），
+/// 并以 (key, pgid) 记进 RUN_PGIDS，供 abort_run kill 全部进程组；退出时按 (key, pgid) 摘除。
+/// key 用 serial（设备间并行、设备内串行——同一 serial 同时至多一个 tracked 进程）。
+/// 装机/注册/新建看板/收尾同步不登记（track_key=None）。
+fn stream_child(mut cmd: Command, on_event: Channel<String>, track_key: Option<String>) -> Result<i32, String> {
     #[cfg(unix)]
-    if track {
+    if track_key.is_some() {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0); // 新建进程组、以本进程为组长 → 子孙共享该 pgid，中止时一网打尽
     }
@@ -1148,8 +1171,9 @@ fn stream_child(mut cmd: Command, on_event: Channel<String>, track: bool) -> Res
         .spawn()
         .map_err(|e| format!("启动失败：{e}"))?;
 
-    if track {
-        *RUN_PGID.lock().unwrap() = Some(child.id() as i32);
+    let pgid = child.id() as i32;
+    if let Some(key) = &track_key {
+        RUN_PGIDS.lock().unwrap().push((key.clone(), pgid));
     }
 
     let stdout = child.stdout.take();
@@ -1165,8 +1189,8 @@ fn stream_child(mut cmd: Command, on_event: Channel<String>, track: bool) -> Res
     }
     let _ = h_err.join();
     let status = child.wait().map_err(|e| e.to_string())?;
-    if track {
-        *RUN_PGID.lock().unwrap() = None;
+    if let Some(key) = &track_key {
+        RUN_PGIDS.lock().unwrap().retain(|(k, p)| !(k == key && *p == pgid));
     }
     Ok(status.code().unwrap_or(-1))
 }
@@ -1221,28 +1245,28 @@ fn pump_capture<R: std::io::Read>(r: R, ch: &Channel<String>, cap: &std::sync::M
     }
 }
 
-/// 中止当前正在跑的 run：向其进程组发 SIGTERM（可捕获，让 run_flow/auto_repair 有机会补记「已中止」
-/// 日志后退出），整组 python→bash→adb→claude 一起收。没有在跑的 run 返回 false。
+/// 中止当前正在跑的所有 run：向每个已登记的进程组发 SIGTERM（可捕获，让 run_flow/auto_repair
+/// 有机会补记「已中止」日志后退出），整组 python→bash→adb→claude 一起收。多设备并行时每台
+/// 设备一个进程组，全部一起停。没有在跑的 run 返回 false。
 #[tauri::command]
 pub fn abort_run() -> Result<bool, String> {
-    let pgid = *RUN_PGID.lock().unwrap();
-    match pgid {
-        Some(pid) => {
-            #[cfg(unix)]
-            {
-                // kill -TERM -<pgid>：负号表示整个进程组
-                let _ = Command::new("kill")
-                    .args(["-TERM", &format!("-{pid}")])
-                    .status();
-                Ok(true)
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = pid;
-                Err("当前平台暂不支持中止".into())
-            }
+    let entries: Vec<(String, i32)> = RUN_PGIDS.lock().unwrap().clone();
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        for (_key, pid) in &entries {
+            // kill -TERM -<pgid>：负号表示整个进程组
+            let _ = Command::new("kill")
+                .args(["-TERM", &format!("-{pid}")])
+                .status();
         }
-        None => Ok(false),
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        Err("当前平台暂不支持中止".into())
     }
 }
 
@@ -1251,6 +1275,10 @@ pub fn abort_run() -> Result<bool, String> {
 fn python_cmd(root: &Path, python: &str, args: &[String], slug: Option<&str>) -> Command {
     let mut cmd = Command::new(python);
     cmd.args(args).current_dir(root);
+    // stdout 接的是管道（非 tty），CPython 默认走全缓冲（~8KB）而非行缓冲：auto_repair.py
+    // 里"Claude 接管诊断中…"这类关键播报会一直堆在缓冲区，直到诊断结束（可能卡 1-6 分钟）
+    // 才一次性冒出来，执行台日志区看起来像"卡住不动"。强制无缓冲让每行 print 立即到达管道。
+    cmd.env("PYTHONUNBUFFERED", "1");
     // 注意：这里【不要】注入 LANG/LC_ALL=…UTF-8。中文字段在日志里显示成 ���� 的根因不是
     // 「缺 UTF-8 locale」，恰恰相反——是 macOS 系统 /bin/bash（3.2）在 UTF-8 locale 下处理
     // 「变量紧贴多字节字面量」有多字节 bug。真正的修复是让 flow 的 bash 走字节模式（LC_ALL=C），
@@ -1274,6 +1302,8 @@ pub async fn run_flow(
     let root = root_of(&app)?;
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        // 中止登记键 = serial（设备内串行，同 serial 同时至多一个 run）；无 serial 退回 case_id
+        let track_key = if serial.is_empty() { case_id.clone() } else { serial.clone() };
         let mut args = vec!["tools/run_flow.py".to_string(), case_id, script];
         if !serial.is_empty() {
             args.push(serial);
@@ -1286,7 +1316,7 @@ pub async fn run_flow(
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
             cmd.env("LANG_CODE", lc);
         }
-        stream_child(cmd, on_event, true)
+        stream_child(cmd, on_event, Some(track_key))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1307,6 +1337,7 @@ pub async fn run_flow_repair(
     let root = root_of(&app)?;
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        let track_key = if serial.is_empty() { case_id.clone() } else { serial.clone() };
         let mut args = vec!["tools/auto_repair.py".to_string(), case_id, script];
         if !serial.is_empty() {
             args.push(serial);
@@ -1317,7 +1348,7 @@ pub async fn run_flow_repair(
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
             cmd.env("LANG_CODE", lc);
         }
-        stream_child(cmd, on_event, true)
+        stream_child(cmd, on_event, Some(track_key))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1449,7 +1480,7 @@ pub async fn new_run(app: AppHandle, app_slug: String, on_event: Channel<String>
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let cmd = python_cmd(&root, &cfg.python, &["tools/new_run.py".to_string()], Some(&app_slug));
-        stream_child(cmd, on_event, false)
+        stream_child(cmd, on_event, None)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1464,7 +1495,7 @@ pub async fn sync_sheets(app: AppHandle, app_slug: String, on_event: Channel<Str
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let cmd = python_cmd(&root, &cfg.python, &["tools/sheets_sync.py".to_string()], Some(&app_slug));
-        stream_child(cmd, on_event, false)
+        stream_child(cmd, on_event, None)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1486,6 +1517,7 @@ pub async fn judge_result(
     let root = root_of(&app)?;
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        let track_key = if serial.is_empty() { case_id.clone() } else { serial.clone() };
         let mut args = vec!["tools/judge_result.py".to_string(), case_id];
         if !serial.is_empty() {
             args.push(serial);
@@ -1493,7 +1525,7 @@ pub async fn judge_result(
         args.push("--status".to_string());
         args.push(status);
         let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
-        stream_child(cmd, on_event, true)
+        stream_child(cmd, on_event, Some(track_key))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1522,7 +1554,7 @@ pub async fn register_issue(
         args.push("--status".to_string());
         args.push(status);
         let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
-        stream_child(cmd, on_event, false)
+        stream_child(cmd, on_event, None)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1536,7 +1568,7 @@ pub async fn doc_report(app: AppHandle, app_slug: String, on_event: Channel<Stri
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let cmd = python_cmd(&root, &cfg.python, &["tools/doc_report.py".to_string()], Some(&app_slug));
-        stream_child(cmd, on_event, false)
+        stream_child(cmd, on_event, None)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1894,7 +1926,7 @@ pub async fn register_app(
             args.push(serial);
         }
         let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
-        let code = stream_child(cmd, on_event.clone(), false)?;
+        let code = stream_child(cmd, on_event.clone(), None)?;
         if code != 0 {
             return Ok(code);
         }

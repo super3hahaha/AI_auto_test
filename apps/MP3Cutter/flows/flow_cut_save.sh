@@ -189,14 +189,13 @@ if $AK waitfor text "$(t 音频已保存)" --timeout 15 >/dev/null 2>&1; then
   # 2026-07-23：原为精确到分钟，同分钟内连跑会撞名导致重命名误判失败，改成精确到秒
   # （见 docs/gotchas.md 2026-07-23 条目）。
   # 点文件名旁的铅笔图标(id/iv_rename，实测点它会弹「重命名」对话框)：EditText(id=file_name)
-  # 已预填原文件名且已获焦，光标不一定在末尾——先 MOVE_END 再连续退格清空（原名长度不定，
-  # 退格次数给足 40 次兜底，清不干净也不会误删到对话框外）。button1(重命名)在文本未变化时是
-  # disabled 的，只要新文件名和原名不同就会置为 enabled，天然满足。
+  # 已预填原文件名且整体选中——单次 KEYCODE_DEL 即可清空整段选中内容，不需要 MOVE_END+循环退格
+  # （2026-07-28 真机验证，见 docs/gotchas.md）。button1(重命名)在文本未变化时是 disabled 的，
+  # 只要新文件名和原名不同就会置为 enabled，天然满足。
   NEWNAME="cut$(date +%Y%m%d_%H%M%S)"
   $AK tapid iv_rename --timeout 5 >/dev/null
   $AK waitfor id file_name --timeout 5 >/dev/null
-  $AK key 123 >/dev/null   # KEYCODE_MOVE_END
-  for i in $(seq 1 40); do $AK key 67 >/dev/null; done   # KEYCODE_DEL 连续退格清空原名
+  $AK key 67 >/dev/null   # KEYCODE_DEL 单次退格，删除整段选中的原文件名
   $AK text "$NEWNAME" >/dev/null
   $AK tapid button1 --timeout 5 >/dev/null   # 对话框内「重命名」确认键（系统 AlertDialog 正向按钮，非 App 自定义 id）
   if $AK waitfor text "$NEWNAME.mp3" --timeout 8 >/dev/null 2>&1; then

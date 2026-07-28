@@ -15,7 +15,8 @@
 """
 import csv, json, re, subprocess, sys, argparse, datetime, pathlib
 
-from _appctx import LEDGER, load_cfg as _load_cfg  # 多 App 路径解析
+from _appctx import LEDGER, load_cfg as _load_cfg, ledger_lock  # 多 App 路径解析
+import exec_ledger
 Q = LEDGER / "queue.csv"
 LOG = LEDGER / "log.csv"
 EVID = LEDGER / "evidence.csv"
@@ -53,22 +54,38 @@ def main():
                     help="证据行: 步骤|类型|文件路径|断言|结果|关键标记（关键标记：关键，供报告用 / 过程留痕，仅本地）")
     ap.add_argument("--coverage", default=None,
                     help="覆盖「历史覆盖情况」文案；不传则现查设备版本+debuggable 自动生成")
+    ap.add_argument("--serial", default=None,
+                    help="本次判定对应的执行设备；不传则读 target.json 的 serial。多设备矩阵下"
+                         "必传，判定才能落到 executions.csv 正确的 (用例, 设备) 行")
     a = ap.parse_args()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    serial = a.serial or _load_cfg().get("serial") or ""
 
-    q = list(csv.reader(open(Q, encoding="utf-8"))); h = q[0]
-    ix = {c: h.index(c) for c in ["用例ID", "当前状态", "执行结果", "证据链接",
-                                   "关键截图", "问题ID", "结束时间", "历史覆盖情况"]}
-    old = ""
-    for r in q[1:]:
-        if r[ix["用例ID"]] == a.case:
-            old = r[ix["当前状态"]]
-            r[ix["当前状态"]] = "已完成"; r[ix["执行结果"]] = a.result
-            r[ix["证据链接"]] = a.evidence; r[ix["结束时间"]] = now
-            if a.shot: r[ix["关键截图"]] = a.shot
-            if a.issue: r[ix["问题ID"]] = a.issue
-            r[ix["历史覆盖情况"]] = a.coverage if a.coverage is not None else detect_coverage()
-    csv.writer(open(Q, "w", newline="", encoding="utf-8")).writerows(q)
+    # 判定先落 executions（逐台真值），queue 的「当前状态/执行结果」再由聚合规则回写——
+    # 矩阵跑「3 台 2 通过 1 失败」时 queue 概览显示「失败」，逐台明细看 executions/流水 tab 设备列。
+    exec_ledger.upsert(a.case, serial, 当前状态="已完成", 执行结果=a.result,
+                       证据链接=a.evidence, 关键截图=a.shot or None, 问题ID=a.issue or None,
+                       备注=a.note)
+
+    # 覆盖情况文案在拿锁前算好——detect_coverage 要调 adb（秒级），不能拿着账本锁等设备响应，
+    # 否则并行跑的其它设备的毫秒级账本写全被堵住
+    coverage = a.coverage if a.coverage is not None else detect_coverage()
+    with ledger_lock():
+        q = list(csv.reader(open(Q, encoding="utf-8"))); h = q[0]
+        ix = {c: h.index(c) for c in ["用例ID", "当前状态", "执行结果", "证据链接",
+                                       "关键截图", "问题ID", "结束时间", "历史覆盖情况"]}
+        old = ""
+        for r in q[1:]:
+            if r[ix["用例ID"]] == a.case:
+                old = r[ix["当前状态"]]
+                r[ix["当前状态"]] = "已完成"; r[ix["执行结果"]] = a.result
+                r[ix["证据链接"]] = a.evidence; r[ix["结束时间"]] = now
+                if a.shot: r[ix["关键截图"]] = a.shot
+                if a.issue: r[ix["问题ID"]] = a.issue
+                r[ix["历史覆盖情况"]] = coverage
+        csv.writer(open(Q, "w", newline="", encoding="utf-8")).writerows(q)
+    # 概览列按本轮全部设备的执行行聚合覆盖（单设备时聚合值=上面直写值，行为不变）
+    exec_ledger.apply_to_queue(a.case)
 
     # run_flow.py/auto_repair.py 跑完这条用例，会先自己写一行「完成执行」日志（只是执行事实：
     # exit code + 耗时，它自己不判定）；case_result.py 紧接着（或稍后改判时）再调一次，就地
@@ -79,65 +96,82 @@ def main():
     # 上一次结论"，都统一覆盖同一行「完成执行」，因为一条用例在一次真实执行里最多只该有一行
     # 这个动作的记录。合并时把上一行备注里的"耗时约Xs"部分保留下来，不然覆盖会把 run_flow.py
     # 记的执行耗时信息丢掉。
-    log_rows = list(csv.reader(open(LOG, encoding="utf-8"))) if LOG.exists() else []
-    new_note = a.note
-    last_idx = None
-    if len(log_rows) > 1:
-        lh = log_rows[0]
-        li_case = lh.index("用例ID"); li_action = lh.index("动作"); li_note = lh.index("备注")
-        last_idx = next((i for i in range(len(log_rows) - 1, 0, -1)
-                          if log_rows[i][li_case] == a.case and log_rows[i][li_action] == "完成执行"), None)
+    with ledger_lock():
+        exec_ledger.ensure_device_column(LOG)  # 旧账本先补「执行设备」列（行尾）
+        log_rows = list(csv.reader(open(LOG, encoding="utf-8"))) if LOG.exists() else []
+        new_note = a.note
+        last_idx = None
+        if len(log_rows) > 1:
+            lh = log_rows[0]
+            li_case = lh.index("用例ID"); li_action = lh.index("动作"); li_note = lh.index("备注")
+            li_dev = lh.index(exec_ledger.DEVICE_COL) if exec_ledger.DEVICE_COL in lh else None
+
+            # 多设备并行下同一用例会有多台各自的「完成执行」行——必须按设备列匹配到"本台"那行
+            # 覆盖，否则 A 台的判定会把 B 台的执行记录顶掉。设备列为空的旧行（补列迁移前写入/
+            # 手工补记）退化为不区分设备，沿用原来的"最后一行"语义。
+            def _dev_of(row):
+                return row[li_dev] if (li_dev is not None and len(row) > li_dev) else ""
+            last_idx = next((i for i in range(len(log_rows) - 1, 0, -1)
+                              if log_rows[i][li_case] == a.case and log_rows[i][li_action] == "完成执行"
+                              and (not serial or _dev_of(log_rows[i]) in ("", serial))), None)
+            if last_idx is not None:
+                m = re.search(r"耗时约\d+秒", log_rows[last_idx][li_note] or "")
+                if m and m.group(0) not in new_note:
+                    new_note = f"{m.group(0)}；{new_note}"
+        new_row = [now, a.case, "完成执行", old or "执行中", f"已完成/{a.result}", a.evidence, new_note, serial]
         if last_idx is not None:
-            m = re.search(r"耗时约\d+秒", log_rows[last_idx][li_note] or "")
-            if m and m.group(0) not in new_note:
-                new_note = f"{m.group(0)}；{new_note}"
-    new_row = [now, a.case, "完成执行", old or "执行中", f"已完成/{a.result}", a.evidence, new_note]
-    if last_idx is not None:
-        log_rows[last_idx] = new_row
-        csv.writer(open(LOG, "w", newline="", encoding="utf-8")).writerows(log_rows)
-    else:
-        with open(LOG, "a", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(new_row)
+            log_rows[last_idx] = new_row
+            csv.writer(open(LOG, "w", newline="", encoding="utf-8")).writerows(log_rows)
+        else:
+            with open(LOG, "a", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(new_row)
 
     # --evi：按 (用例ID, 文件路径) upsert——adbkit 采证时已自动登记（默认「过程留痕」），
     # 这里按文件路径找到那行、升级成关键标记/精确断言；没有对应行才新增。避免与自动登记重复。
     # 命中已有行时只改「关键标记/断言/结果」，「步骤/证据类型」保留自动登记的原值不覆盖
     # （这两项是采证时的客观事实，不该由判定这步手动重填，见下面 hit 分支注释）。
-    header = ["用例ID", "步骤", "证据类型", "文件/链接", "截图预览", "断言", "结果", "采集时间", "备注"]
-    erows = list(csv.reader(open(EVID, encoding="utf-8"))) if EVID.exists() else []
-    if not erows:
-        erows = [header]
-    eh = erows[0]
-    ei = {name: i for i, name in enumerate(eh)}
-    upd = new = 0
-    for e in a.evi:
-        parts = e.split("|")
-        while len(parts) < 6:
-            parts.append("")
-        step, typ, file_path, assertion, res, key_flag = parts[:6]
-        if not file_path:
-            print(f"[case_result] 警告：证据行 {step!r} 未指定具体文件路径，将记为“证据文件缺失”")
-            file_path = "证据文件缺失"
-        if not key_flag:
-            print(f"[case_result] 警告：证据行 {step!r} 未标注「关键/过程留痕」")
-        # 倒序找最后一个匹配行——adbkit 不再按路径去重（decisions.md #23），同一路径
-        # 同一天重跑会积累好几行，正序 next() 会命中最早那行（可能是今天第一次跑、
-        # 断言还很粗糙的旧行），必须找最新那行升级，不然升级到了错误/过时的那一行。
-        hit = next((r for r in reversed(erows[1:])
-                    if len(r) > ei["文件/链接"] and r[ei["用例ID"]] == a.case and r[ei["文件/链接"]] == file_path), None)
-        if hit:
-            # 「步骤」「证据类型」是采证时就确定的客观事实（adbkit 自动登记时已经写对），
-            # 判定升级只改「关键与否/断言/结果」这几项主观判断，不碰前两项——不然调用方
-            # 传的值一旦手滑写错（2026-07-03 真出过一次：忘了 +UI XML 后缀），会静默覆盖
-            # 掉本来正确的自动登记内容。--evi 里的 step/typ 两段仅用于「新增」分支。
-            hit[ei["截图预览"]] = key_flag; hit[ei["断言"]] = assertion
-            hit[ei["结果"]] = res; hit[ei["备注"]] = "判定升级"
-            upd += 1  # 采集时间保留 adbkit 采证时的原值
-        else:
-            erows.append([a.case, step, typ, file_path, key_flag, assertion, res, now, "人工登记"])
-            new += 1
-    with open(EVID, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(erows)
+    header = ["用例ID", "步骤", "证据类型", "文件/链接", "截图预览", "断言", "结果", "采集时间", "备注",
+              exec_ledger.DEVICE_COL]
+    with ledger_lock():
+        exec_ledger.ensure_device_column(EVID)  # 旧账本先补「执行设备」列（行尾）
+        erows = list(csv.reader(open(EVID, encoding="utf-8"))) if EVID.exists() else []
+        if not erows:
+            erows = [header]
+        eh = erows[0]
+        ei = {name: i for i, name in enumerate(eh)}
+        upd = new = 0
+        for e in a.evi:
+            parts = e.split("|")
+            while len(parts) < 6:
+                parts.append("")
+            step, typ, file_path, assertion, res, key_flag = parts[:6]
+            if not file_path:
+                print(f"[case_result] 警告：证据行 {step!r} 未指定具体文件路径，将记为“证据文件缺失”")
+                file_path = "证据文件缺失"
+            if not key_flag:
+                print(f"[case_result] 警告：证据行 {step!r} 未标注「关键/过程留痕」")
+            # 倒序找最后一个匹配行——adbkit 不再按路径去重（decisions.md #23），同一路径
+            # 同一天重跑会积累好几行，正序 next() 会命中最早那行（可能是今天第一次跑、
+            # 断言还很粗糙的旧行），必须找最新那行升级，不然升级到了错误/过时的那一行。
+            # 证据路径含 serial 段（evid_dir 自动加），天然按设备唯一，无需再按设备列匹配。
+            hit = next((r for r in reversed(erows[1:])
+                        if len(r) > ei["文件/链接"] and r[ei["用例ID"]] == a.case and r[ei["文件/链接"]] == file_path), None)
+            if hit:
+                # 「步骤」「证据类型」是采证时就确定的客观事实（adbkit 自动登记时已经写对），
+                # 判定升级只改「关键与否/断言/结果」这几项主观判断，不碰前两项——不然调用方
+                # 传的值一旦手滑写错（2026-07-03 真出过一次：忘了 +UI XML 后缀），会静默覆盖
+                # 掉本来正确的自动登记内容。--evi 里的 step/typ 两段仅用于「新增」分支。
+                hit[ei["截图预览"]] = key_flag; hit[ei["断言"]] = assertion
+                hit[ei["结果"]] = res; hit[ei["备注"]] = "判定升级"
+                upd += 1  # 采集时间保留 adbkit 采证时的原值
+            else:
+                row = {"用例ID": a.case, "步骤": step, "证据类型": typ, "文件/链接": file_path,
+                       "截图预览": key_flag, "断言": assertion, "结果": res, "采集时间": now,
+                       "备注": "人工登记", exec_ledger.DEVICE_COL: serial}
+                erows.append([row.get(c, "") for c in eh])
+                new += 1
+        with open(EVID, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(erows)
     print(f"[case_result] {a.case} → 已完成/{a.result}（证据 升级{upd}条 / 新增{new}条）")
 
 

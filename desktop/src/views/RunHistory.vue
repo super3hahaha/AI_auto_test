@@ -14,6 +14,7 @@ const records = ref<RunRecordMeta[]>([]);
 const selectedId = ref("");
 const source = ref<MonitorSource | null>(null);
 const loading = ref(false);
+const switching = ref(false); // openRecord 读盘中（selectedId/source 都还没切到新记录）——盖层提示，避免读盘慢时像是卡死或没反应
 const err = ref("");
 
 const selectedMeta = computed(() => records.value.find((r) => r.id === selectedId.value));
@@ -30,11 +31,13 @@ async function reload() {
   try {
     records.value = await api.listRunRecords(store.activeSlug);
     if (records.value.length) {
-      // 保留当前选中；失效/首次则落到最新一条（列表已按时间倒序）
-      if (!selectedId.value || !records.value.some((r) => r.id === selectedId.value)) {
-        selectedId.value = records.value[0].id;
-      }
-      await openRecord(selectedId.value);
+      // 保留当前选中；失效/首次则落到最新一条（列表已按时间倒序）。注意：目标 id 先存进局部变量
+      // 传给 openRecord，不要在这里先动 selectedId——否则 selectedMeta（同步）先跳到新记录，
+      // source（openRecord 内 await 读盘）还没跟上，又是顶部摘要和下面内容对不上号的老毛病。
+      const targetId = selectedId.value && records.value.some((r) => r.id === selectedId.value)
+        ? selectedId.value
+        : records.value[0].id;
+      await openRecord(targetId);
     } else {
       selectedId.value = "";
       source.value = null;
@@ -47,14 +50,22 @@ async function reload() {
 }
 
 async function openRecord(id: string) {
-  selectedId.value = id;
+  // 关键：selectedId 和 source 必须同一拍切换——RunMonitor 靠 `:key="selectedId"` 整个重挂来吃到新
+  // source（组件内 `const M = props.source ?? runStore` 只在 setup 时读一次，prop 变了不会自动跟）。
+  // 之前先切 selectedId 再 await 读盘：顶部条（读 selectedMeta，同步）先变成新记录的摘要，但下面
+  // RunMonitor 挂载时 source 还是上一条的旧值，读盘慢时甚至会一直卡在旧数据——摘要和内容对不上号。
   err.value = "";
+  switching.value = true;
   try {
     const rec = await api.readRunRecord(store.activeSlug, id);
     source.value = makeRecordSource(rec);
+    selectedId.value = id;
   } catch (e: any) {
     err.value = String(e);
     source.value = null;
+    selectedId.value = id;
+  } finally {
+    switching.value = false;
   }
 }
 
@@ -83,7 +94,7 @@ function fmtTime(ms: number): string {
 
 function optionLabel(r: RunRecordMeta): string {
   const bad = r.bad + r.needs;
-  return `${fmtTime(r.startedAt)} · ${r.title} · 通过 ${r.ok}${bad ? ` · 失败/需人工 ${bad}` : ""}`;
+  return `${fmtTime(r.startedAt)} · ${r.title} · 通过 ${r.ok}${bad ? ` · 失败 ${bad}` : ""}`;
 }
 
 // 父组件（Runner）切到本子 tab 时会调 reload()
@@ -100,14 +111,19 @@ defineExpose({ reload });
           v-if="records.length"
           class="rec-select"
           :value="selectedId"
+          :disabled="switching"
           @change="openRecord(($event.target as HTMLSelectElement).value)"
         >
           <option v-for="r in records" :key="r.id" :value="r.id">{{ optionLabel(r) }}</option>
         </select>
         <span class="muted count">共 {{ records.length }} 条</span>
+        <span v-if="switching" class="muted switching-t">加载中…</span>
       </div>
       <div class="bar-r" v-if="selectedMeta">
         <span class="mono rec-id">{{ selectedMeta.id }}</span>
+        <span v-if="selectedMeta.runId" class="tag run-id-tag" :title="`该记录跑在轮次 ${selectedMeta.runId}（看板/证据/总览页的批次概念）`">
+          轮次 {{ selectedMeta.runId }}
+        </span>
         <span v-if="selectedMeta.brain" class="tag">自愈</span>
         <span class="muted meta-sub">{{ selectedMeta.deviceCount }} 设备 × {{ selectedMeta.caseCount }} 用例</span>
         <button class="del-btn" @click="removeRecord">删除本条</button>
@@ -124,8 +140,9 @@ defineExpose({ reload });
       </div>
     </div>
 
-    <!-- 记录内容：复用执行台（RunMonitor）布局，数据源为保存的快照。切 id 用 key 重挂，本地选中态归零 -->
-    <div v-else-if="source" class="monitor-wrap">
+    <!-- 记录内容：复用执行台（RunMonitor）布局，数据源为保存的快照。切 id 用 key 重挂，本地选中态归零。
+         switching 期间调暗——这里还是上一条选中的内容（新记录还没读盘完），别让人当成已经切好了 -->
+    <div v-else-if="source" class="monitor-wrap" :class="{ dim: switching }">
       <RunMonitor :key="selectedId" :source="source" />
     </div>
   </div>
@@ -138,7 +155,9 @@ defineExpose({ reload });
 .bar-l { display: flex; align-items: center; gap: 10px; min-width: 0; flex: 1; }
 .bar-title { font-size: 14px; font-weight: 500; flex-shrink: 0; }
 .rec-select { flex: 1; min-width: 0; max-width: 560px; font-size: 12px; padding: 5px 8px; }
+.rec-select:disabled { opacity: 0.6; }
 .count { font-size: 12px; flex-shrink: 0; }
+.switching-t { font-size: 12px; flex-shrink: 0; color: var(--text-accent); }
 .bar-r { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
 .rec-id { font-size: 12px; color: var(--text-secondary); }
 .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--bg-accent); color: var(--text-accent); }
@@ -152,4 +171,5 @@ defineExpose({ reload });
 
 .monitor-wrap { flex: 1; min-height: 0; display: flex; }
 .monitor-wrap :deep(.monitor) { flex: 1; min-width: 0; }
+.monitor-wrap.dim { opacity: 0.45; pointer-events: none; transition: opacity 0.1s; }
 </style>

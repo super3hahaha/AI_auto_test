@@ -16,35 +16,42 @@ serial 不传则读 config/target.json 的 serial。
 """
 import csv, json, os, subprocess, sys, argparse, datetime, pathlib, time, signal
 
-from _appctx import REPO, LEDGER, load_cfg as _load_cfg  # 多 App 路径解析
+from _appctx import REPO, LEDGER, load_cfg as _load_cfg, ledger_lock  # 多 App 路径解析
+import exec_ledger  # (run_id, 用例, serial) 执行明细表——多设备并行的逐台真值
 ROOT = REPO
 LOG = LEDGER / "log.csv"
 QUEUE = LEDGER / "queue.csv"
 
 
-def _append_log(ts, case, action, old_status, new_status, evidence, note):
-    with open(LOG, "a", newline="") as f:
-        csv.writer(f).writerow([ts, case, action, old_status, new_status, evidence, note])
+def _append_log(ts, case, action, old_status, new_status, evidence, note, serial=""):
+    # 「执行设备」列在行尾（老账本先补列），多设备并行时每条执行事件都能定位到是哪台跑的
+    with ledger_lock():
+        exec_ledger.ensure_device_column(LOG)
+        with open(LOG, "a", newline="") as f:
+            csv.writer(f).writerow([ts, case, action, old_status, new_status, evidence, note, serial])
 
 
 def _current_status(case):
-    with open(QUEUE) as f:
-        for row in csv.DictReader(f):
-            if row["用例ID"] == case:
-                return row["当前状态"]
+    with ledger_lock():
+        with open(QUEUE) as f:
+            for row in csv.DictReader(f):
+                if row["用例ID"] == case:
+                    return row["当前状态"]
     return ""
 
 
 def _update_queue_times(case, start_ts, end_ts):
-    rows = list(csv.reader(open(QUEUE)))
-    header = rows[0]
-    idx = {name: i for i, name in enumerate(header)}
-    for row in rows[1:]:
-        if row[idx["用例ID"]] == case:
-            row[idx["开始时间"]] = start_ts
-            row[idx["结束时间"]] = end_ts
-    with open(QUEUE, "w", newline="") as f:
-        csv.writer(f).writerows(rows)
+    # 多设备并行时后写的覆盖先写的——queue 这两列只是概览（最后一台的时间），逐台真值在 executions.csv
+    with ledger_lock():
+        rows = list(csv.reader(open(QUEUE)))
+        header = rows[0]
+        idx = {name: i for i, name in enumerate(header)}
+        for row in rows[1:]:
+            if row[idx["用例ID"]] == case:
+                row[idx["开始时间"]] = start_ts
+                row[idx["结束时间"]] = end_ts
+        with open(QUEUE, "w", newline="") as f:
+            csv.writer(f).writerows(rows)
 
 
 def main():
@@ -67,13 +74,18 @@ def main():
     start_dt = datetime.datetime.now()
     start_ts = start_dt.strftime("%Y-%m-%d %H:%M:%S")
     _append_log(start_ts, a.case, "开始执行", old_status, "执行中", "",
-                f"跑固化脚本 {a.script}（run_flow.py 自动计时）")
+                f"跑固化脚本 {a.script}（run_flow.py 自动计时）", serial)
+    # 执行明细表（多设备逐台真值）：本 (run_id, 用例, serial) 行进入「执行中」
+    exec_ledger.upsert(a.case, serial, 当前状态="执行中", 执行结果="", 开始时间=start_ts)
 
     # 桌面壳「中止任务」按钮向进程组发 SIGTERM（可捕获）。补记一行「已中止」再退出，账本不留
     # 悬空的「执行中」行（见 memory: 任何真机执行都要登记）。SIGKILL 不可捕获则兜不住——桌面侧用 TERM。
+    # 账本写受 ledger_lock 保护：ledger_lock 按进程计数可重入，即便 TERM 恰好打在主线程持锁写账本
+    # 的间隙，这里也只是复用已持有的锁写完就 _exit，不会自锁死。
     def _on_term(signum, frame):
         end_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        _append_log(end_ts, a.case, "完成执行", "执行中", "已中止", "", "任务被用户中止（SIGTERM）")
+        _append_log(end_ts, a.case, "完成执行", "执行中", "已中止", "", "任务被用户中止（SIGTERM）", serial)
+        exec_ledger.upsert(a.case, serial, 当前状态="已中止", 结束时间=end_ts, 备注="任务被用户中止（SIGTERM）")
         os._exit(143)
     signal.signal(signal.SIGTERM, _on_term)
 
@@ -115,8 +127,11 @@ def main():
         note = f"固化脚本异常退出(exit={result.returncode})，耗时约{elapsed:.0f}秒"
         new_status = "已完成/需复核"
 
-    _append_log(end_ts, a.case, "完成执行", "执行中", new_status, evidence, note)
+    _append_log(end_ts, a.case, "完成执行", "执行中", new_status, evidence, note, serial)
     _update_queue_times(a.case, start_ts, end_ts)
+    # 执行明细表：本 (run_id, 用例, serial) 行落终态执行事实（判定结果由 case_result 稍后回写）
+    exec_ledger.upsert(a.case, serial, 当前状态="已完成", 结束时间=end_ts,
+                       耗时秒=f"{elapsed:.0f}", 证据链接=evidence, 备注=note)
 
     print(f"\n[run_flow] {a.case} 耗时 {elapsed:.1f}秒，exit={result.returncode}，已写入 log.csv/queue.csv")
 

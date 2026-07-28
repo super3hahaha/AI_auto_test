@@ -36,15 +36,20 @@ AI_auto_test/
 │           ├── structure.csv # 结构视图：模块→目的→覆盖用例
 │           ├── queue.csv     # 测试队列：全量真值，一行一个用例
 │           ├── board.csv     # 本轮投影（scope 命中），随时可重建
-│           ├── evidence.csv  # 证据链：一行一份证据物料 + 断言（纯追加，见 #23）
-│           ├── issues.csv    # 问题清单：BUG/RISK/GAP/BLOCK
+│           ├── evidence.csv  # 证据链：一行一份证据物料 + 断言（纯追加，见 #23）；行尾「执行设备」列
+│           ├── issues.csv    # 问题清单：BUG/RISK/GAP/BLOCK；行尾「执行设备」列（多台复现合并成逗号清单）
+│           ├── executions.csv # ★ 执行明细（多设备逐台真值）：主键 (run_id, 用例ID, serial)，一「用例×设备×轮」一行；
+│           │                 #   queue 的「当前状态/执行结果」是它的聚合概览（失败一票否决），工具层见 tools/exec_ledger.py
 │           ├── runs.csv      # 执行批次台账：一行一 run_id（看板锚点）
 │           ├── excluded.csv  # 排除用例
-│           ├── log.csv       # 状态变更日志：只追加
-│           ├── archive/<run_id>/  # 开新一轮时上一轮 log/evidence/issues 整份归档
+│           ├── log.csv       # 状态变更日志：只追加；行尾「执行设备」列
+│           ├── .ledger.lock  # 账本进程间锁文件（flock；多设备并行写保护，见 _appctx.ledger_lock）
+│           ├── archive/<run_id>/  # 开新一轮时上一轮 log/evidence/issues/executions 整份归档
 │           └── run_records/  # 桌面壳执行记录：完整跑完(未中止)的一轮执行台快照 <id>.json（{meta,cells,events}）；gitignore；「执行记录」子tab按 id 回看
 ├── tools/               # 跨 App 通用框架工具（共享）
-│   ├── _appctx.py       # ★ 多 App 上下文：解析活跃 App → 各路径（所有工具都 import 它）
+│   ├── _appctx.py       # ★ 多 App 上下文：解析活跃 App → 各路径（所有工具都 import 它）；
+│   │                    #   含 ledger_lock() 账本进程间锁（可重入 flock，所有账本 CSV 写点必须包它）
+│   ├── exec_ledger.py   # ★ executions.csv 读写 + (run_id,用例,serial) upsert + 聚合回 queue + 旧表补「执行设备」列
 │   ├── _probe_skip.py   # 临时探针：跳过/关闭按钮出没时 dump 树，看它进不进无障碍树/选择器是什么
 │   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/db/sp/seed/logscan/sweep...），唯一碰 adb 的地方
 │   ├── lang_table.py    # 多语言 strings.xml 资源包(目录/zip，来源可以是翻译导出包，也可以是 lang-string-compare
@@ -54,7 +59,7 @@ AI_auto_test/
 │   ├── init_target.py   # 探测包名/版本/主Activity/db_name/debuggable → 写 target.json；--atx-init 装/验 u2 后端
 │   ├── preflight.py     # 开跑前只读自检：设备在线/App装没装/素材是否推到设备/当前看板（零副作用，见上一轮问答）
 │   ├── compile_cases.py # cases/*.yaml → ledger/queue.csv（幂等，保留运行时状态）
-│   ├── case_result.py   # 一条用例收工回写（queue.csv + log.csv + evidence.csv 一次性落）
+│   ├── case_result.py   # 一条用例收工回写（executions.csv + queue.csv + log.csv + evidence.csv 一次性落；--serial 定位设备行）
 │   ├── case_issue.py    # 结构化登记一条问题到 issues.csv（csv.writer 转义 + 按问题ID upsert + ID 格式校验）；替代手写 CSV
 │   ├── issue_register.py # 桌面收尾自动登记问题：读证据→headless claude 写描述字段+查重→调 case_issue.py（前缀由终态确定性映射，见 decisions #35）
 │   ├── judge_result.py  # 把执行台一格终态确定性映射进账本（pass→通过/fail→失败/app_defect·needs_human→需复核）
@@ -71,7 +76,7 @@ AI_auto_test/
 │   │   ├── Setup.vue          # 首屏：选活跃 App / 配置 target.json，配置完才进主界面
 │   │   ├── Overview.vue       # 总览面板（overview-panel-prd.md）
 │   │   ├── Devices.vue        # 设备列表/选设备
-│   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
+│   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38；多设备时用例行尾设备chips逐格分派，见decisions #39)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
 │   │   ├── RunMonitor.vue     # Runner 内嵌的运行监控子组件（流式日志/状态，不单独作为 tab）；数据源可为实时 runStore 或传入的 source 快照（执行记录复用）
 │   │   ├── RunHistory.vue     # 「执行记录」子tab：列出保存的执行台快照(run_records/)、按 id 切换、用 RunMonitor 只读渲染（makeRecordSource 包快照）
 │   │   ├── Evidence.vue       # 证据查看器（截图/ui dump/日志），MVP-1 首个落地面；左栏按 设备(可收起)→用例→attempt 三层分组(不同设备跑的用例不同)，设备名走 read_device_aliases 映射
@@ -90,7 +95,7 @@ AI_auto_test/
     ├── assets/          # 文档配图（dataflow.png/svg），非测试素材
     ├── decisions.md     # 非显然的架构选择与原因
     ├── gotchas.md       # 已知坑
-    ├── handoff-parallel-multidevice.md  # 多设备并行执行设计（评审定稿，未动工）
+    ├── handoff-parallel-multidevice.md  # 多设备并行执行设计（2026-07-28 已实施，文档留作架构说明）
     └── handoff-appium-integration.md    # 引入 Appium 与 adb 能力分层并存的评审（结论：不建议）
 ```
 

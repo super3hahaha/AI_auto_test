@@ -31,8 +31,9 @@ claude 读本次证据、把一条结构化问题写进 issues.csv。
 import csv, os, sys, subprocess, shutil, datetime, argparse
 from pathlib import Path
 
-from _appctx import REPO, LEDGER, CASES, load_cfg
+from _appctx import REPO, LEDGER, CASES, load_cfg, ledger_lock
 from auto_repair import find_claude, newest_attempt_dir  # 复用：定位 claude / 本次证据目录
+import exec_ledger
 
 CLAUDE_TIMEOUT = 360
 ISSUE_MODEL = os.environ.get("ISSUE_REGISTER_MODEL", "claude-sonnet-5")
@@ -77,8 +78,8 @@ SYSTEM_PROMPT = """你是 AI_auto_test 自动化测试框架的「问题登记�
 【唯一允许的落盘方式】只能通过运行下面这条命令把问题写进账本，**禁止直接 Edit/Write 任何文件**\
 （你没有编辑权限）：
   python3 tools/case_issue.py <问题ID> <用例ID> <严重级别> "<标题>" "<预期结果>" "<实际结果>" "<复现步骤>" "<证据链接>" \
-      --key-evidence "<关键截图相对路径>"
-各字段务必用双引号包裹；字段内有双引号时转义或改用中文引号。--key-evidence 传上面选出的那张\
+      --serial "<设备serial>" --key-evidence "<关键截图相对路径>"
+各字段务必用双引号包裹；字段内有双引号时转义或改用中文引号。--serial 原样传提示里给你的「设备serial」（多设备并行时问题清单靠它标明哪台设备复现）。--key-evidence 传上面选出的那张\
 截图相对仓库根的路径（必须原样照抄「本次证据文件」列表里的路径，一个字都不能改，否则匹配不上\
 evidence.csv 会被跳过标关键）；没有合适的截图就整个不传这个参数，不要瞎填。\
 跑成功后它会打印「新增/更新 问题 ...」，传了 --key-evidence 的话还会再打印一行「已标为『关键』」\
@@ -93,10 +94,12 @@ ISSUE_VERDICT: REGISTERED
 ISSUE_VERDICT: UNCERTAIN"""
 
 
-def append_log(case, new_status, evidence_rel, note):
+def append_log(case, new_status, evidence_rel, note, serial=""):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    with open(LOG, "a", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerow([ts, case, "问题登记", "", new_status, evidence_rel, note])
+    with ledger_lock():  # 收尾串行调用，但 CLI 手动并行也会走到——统一持锁；「执行设备」列在行尾
+        exec_ledger.ensure_device_column(LOG)
+        with open(LOG, "a", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow([ts, case, "问题登记", "", new_status, evidence_rel, note, serial])
 
 
 def already_finalized(case, evidence_rel):
@@ -234,7 +237,7 @@ def main():
     claude_bin = find_claude()
     if not claude_bin:
         note = "[未完成] 本机找不到 claude CLI，自动登记不可用——请回 Claude Code 手动登记 issues.csv"
-        append_log(a.case, "需人工登记", evidence_rel, note)
+        append_log(a.case, "需人工登记", evidence_rel, note, serial)
         print(f"[issue_register] ⚠️ {note}")
         sys.exit(4)
 
@@ -255,17 +258,17 @@ def main():
         if before == after:
             # 声称登记了但 issues.csv 没变 —— 视为未落盘，交人工，不打终审（允许重试）
             note = f"[未完成] claude 声称已登记但 issues.csv 无改动，请人工核实：{diag_oneline(diag)}"
-            append_log(a.case, "需人工登记", evidence_rel, note)
+            append_log(a.case, "需人工登记", evidence_rel, note, serial)
             print("[issue_register] ⚠️ 判 REGISTERED 但 issues.csv 未变化——记「需人工登记」。")
             sys.exit(3)
         note = f"[终审] 自动登记({prefix}-·{a.status})：{diag_oneline(diag)}"
-        append_log(a.case, "已登记", evidence_rel, note)
+        append_log(a.case, "已登记", evidence_rel, note, serial)
         print(f"[issue_register] ✅ {a.case} 已登记进 issues.csv。")
         sys.exit(0)
 
     # UNCERTAIN / None(超时/失败)
     note = f"[未完成] 自动登记未完成({verdict or '无法判定/超时'})，请回 Claude Code 手动登记：{diag_oneline(diag)}"
-    append_log(a.case, "需人工登记", evidence_rel, note)
+    append_log(a.case, "需人工登记", evidence_rel, note, serial)
     print(f"[issue_register] ❓ {a.case} 未能自动登记——记「需人工登记」，交人工。")
     sys.exit(2)
 

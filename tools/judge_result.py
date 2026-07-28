@@ -70,7 +70,10 @@ def main():
     result_cn = RESULT_MAP[a.status]
     note = NOTE_MAP[a.status]
     r = subprocess.run(
-        [sys.executable, "tools/case_result.py", a.case, result_cn, evidence_rel, note],
+        # --serial 必传：多设备并行下判定要落到 executions.csv 的 (用例, 本设备) 行，
+        # 不传会退回 target.json 的默认 serial，矩阵跑时判定会串台
+        [sys.executable, "tools/case_result.py", a.case, result_cn, evidence_rel, note,
+         "--serial", serial],
         cwd=str(REPO),
     )
     print(f"[judge_result] {a.case} → {a.status} 映射为「{result_cn}」，已落 case_result.py")

@@ -29,7 +29,7 @@ runs.csv（首列），证据目录也按它归档（evidence/<app>/<ver>/<run_i
 """
 import json, re, shutil, sys, argparse, datetime, pathlib, subprocess, csv
 
-from _appctx import REPO, LEDGER as APP_LEDGER, TARGET_CFG  # 多 App 路径解析
+from _appctx import REPO, LEDGER as APP_LEDGER, TARGET_CFG, ledger_lock  # 多 App 路径解析
 ROOT = REPO
 CFG = TARGET_CFG                                     # 被测 App 配置：apps/<slug>/target.json（per-app）
 SA_JSON = ROOT / "config/service_account.json"       # 账号级凭证：共享
@@ -105,30 +105,33 @@ def archive_and_reset(prev_run_id):
     dest = ARCHIVE / prev_run_id
     dest.mkdir(parents=True, exist_ok=True)
 
-    # log.csv / evidence.csv / issues.csv：整份归档，本地清空只留表头
-    # （issues.csv 曾经只挪走「已关闭」的、未关闭的留本地跟踪——2026-07-03 用户明确纠正：
-    # 不管开没开闭，只要不是这一轮跑出来的就不该出现在新一轮账本里，跟 log/evidence 保持一致）
-    for name in ("log.csv", "evidence.csv", "issues.csv"):
-        src = LEDGER / name
-        if not src.exists():
-            continue
-        rows = list(csv.reader(open(src, encoding="utf-8")))
-        if len(rows) > 1:
-            shutil.copyfile(src, dest / name)
-        with open(src, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(rows[0] if rows else [])
-    print(f"[new_run] log.csv / evidence.csv / issues.csv 已归档到 {dest}，本地已清空")
+    # 整段持账本锁：归档=读表+清空重写，撞上并行中的写者会把人家刚写的行归丢/清丢
+    with ledger_lock():
+        # log.csv / evidence.csv / issues.csv / executions.csv：整份归档，本地清空只留表头
+        # （issues.csv 曾经只挪走「已关闭」的、未关闭的留本地跟踪——2026-07-03 用户明确纠正：
+        # 不管开没开闭，只要不是这一轮跑出来的就不该出现在新一轮账本里，跟 log/evidence 保持一致。
+        # executions.csv 是逐台执行明细，同理按轮归档。）
+        for name in ("log.csv", "evidence.csv", "issues.csv", "executions.csv"):
+            src = LEDGER / name
+            if not src.exists():
+                continue
+            rows = list(csv.reader(open(src, encoding="utf-8")))
+            if len(rows) > 1:
+                shutil.copyfile(src, dest / name)
+            with open(src, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(rows[0] if rows else [])
+        print(f"[new_run] log / evidence / issues / executions 已归档到 {dest}，本地已清空")
 
-    # queue.csv：运行时字段重置回初始值，用例定义列不动
-    if QUEUE.exists():
-        rows = list(csv.reader(open(QUEUE, encoding="utf-8")))
-        h = rows[0]
-        idx = {c: h.index(c) for c in QUEUE_RUNTIME_RESET if c in h}
-        for r in rows[1:]:
-            for c, i in idx.items():
-                r[i] = "待执行" if c == "当前状态" else ""
-        csv.writer(open(QUEUE, "w", newline="", encoding="utf-8")).writerows(rows)
-    print("[new_run] queue.csv 运行时状态已重置为「待执行」")
+        # queue.csv：运行时字段重置回初始值，用例定义列不动
+        if QUEUE.exists():
+            rows = list(csv.reader(open(QUEUE, encoding="utf-8")))
+            h = rows[0]
+            idx = {c: h.index(c) for c in QUEUE_RUNTIME_RESET if c in h}
+            for r in rows[1:]:
+                for c, i in idx.items():
+                    r[i] = "待执行" if c == "当前状态" else ""
+            csv.writer(open(QUEUE, "w", newline="", encoding="utf-8")).writerows(rows)
+        print("[new_run] queue.csv 运行时状态已重置为「待执行」")
 
     subprocess.run([sys.executable, str(ROOT / "tools/compile_cases.py")], check=False)
 

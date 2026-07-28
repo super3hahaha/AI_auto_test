@@ -10,7 +10,8 @@
 """
 import csv, sys, glob, pathlib, json, re, yaml
 
-from _appctx import LEDGER, CASES, load_cfg  # 多 App 路径解析（CASES=apps/<slug>/cases, LEDGER=apps/<slug>/ledger）
+from _appctx import LEDGER, CASES, load_cfg, ledger_lock  # 多 App 路径解析（CASES=apps/<slug>/cases, LEDGER=apps/<slug>/ledger）
+import exec_ledger
 QUEUE = LEDGER / "queue.csv"
 BOARD = LEDGER / "board.csv"
 
@@ -25,20 +26,26 @@ EVID = LEDGER / "evidence.csv"
 
 # ledger/ 不进 git（见 docs/decisions.md #13），fresh clone 后这些只追加的账本文件
 # 不存在；首次跑 compile 时补上表头，避免 case_result.py 之类第一次 append 时缺表头。
+# log/issues/evidence 的「执行设备」列在行尾（多设备并行标明哪台跑的，handoff-parallel §3）。
 BOOTSTRAP_HEADERS = {
-    LEDGER / "log.csv": ["时间", "用例ID", "动作", "原状态", "新状态", "证据", "备注"],
+    LEDGER / "log.csv": ["时间", "用例ID", "动作", "原状态", "新状态", "证据", "备注",
+                         exec_ledger.DEVICE_COL],
     LEDGER / "issues.csv": ["问题ID", "用例ID", "严重级别", "标题", "预期结果", "实际结果",
-                                  "复现步骤", "证据链接", "状态", "负责人备注"],
+                                  "复现步骤", "证据链接", "状态", "负责人备注", exec_ledger.DEVICE_COL],
     LEDGER / "excluded.csv": ["排除用例", "为什么需要外部依赖"],
+    LEDGER / "executions.csv": exec_ledger.HEADER,  # (run_id, 用例, serial) 执行明细（逐台真值）
 }
 
 
 def bootstrap_ledger():
-    LEDGER.mkdir(parents=True, exist_ok=True)  # 新 App 工作区首次 compile 时账本目录可能还不存在
-    for path, header in BOOTSTRAP_HEADERS.items():
-        if not path.exists():
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                csv.writer(f).writerow(header)
+    with ledger_lock():  # LEDGER.mkdir 由 ledger_lock 顺带保证
+        for path, header in BOOTSTRAP_HEADERS.items():
+            if not path.exists():
+                with open(path, "w", newline="", encoding="utf-8") as f:
+                    csv.writer(f).writerow(header)
+        # 老账本就地迁移：三个流水表补「执行设备」列（幂等，已有列不动）
+        for name in ("log.csv", "evidence.csv", "issues.csv"):
+            exec_ledger.ensure_device_column(LEDGER / name)
 
 PRIO_ORDER = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
 REQUIRED = ["id", "goal"]
@@ -97,26 +104,28 @@ def parse_scope(raw, all_ids, all_prios):
 def project_board_from_queue():
     """从 queue.csv（全量真值）按 target.scope 投影出 board.csv（本轮清单，执行顺序号重编 1..N）。
     纯基于 queue.csv 的列，不依赖 YAML，可供 sheets_sync/doc_report 复用。
-    返回 (board_rows, scope_desc, id_set)。"""
-    rows = list(csv.reader(open(QUEUE, encoding="utf-8")))
-    header, data = rows[0], rows[1:]
-    i_id, i_prio = header.index("用例ID"), header.index("优先级")
-    all_ids = {r[i_id] for r in data}
-    all_prios = {r[i_prio].upper() for r in data if r[i_prio]}
-    raw = load_scope()
-    mode, values = parse_scope(raw, all_ids, all_prios)
-    board = [header]
-    seq = 1
-    for r in data:
-        ok = (mode is None) or (mode == "prio" and r[i_prio].upper() in values) \
-            or (mode == "id" and r[i_id] in values)
-        if ok:
-            rr = list(r)
-            rr[1] = str(seq)  # 执行顺序列，board 内从 1 重编
-            seq += 1
-            board.append(rr)
-    with open(BOARD, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(board)
+    返回 (board_rows, scope_desc, id_set)。整段持账本锁：并行执行中收尾同步时，
+    不能读到别的写者写了一半的 queue、也不能把 board 写到一半被人读走。"""
+    with ledger_lock():
+        rows = list(csv.reader(open(QUEUE, encoding="utf-8")))
+        header, data = rows[0], rows[1:]
+        i_id, i_prio = header.index("用例ID"), header.index("优先级")
+        all_ids = {r[i_id] for r in data}
+        all_prios = {r[i_prio].upper() for r in data if r[i_prio]}
+        raw = load_scope()
+        mode, values = parse_scope(raw, all_ids, all_prios)
+        board = [header]
+        seq = 1
+        for r in data:
+            ok = (mode is None) or (mode == "prio" and r[i_prio].upper() in values) \
+                or (mode == "id" and r[i_id] in values)
+            if ok:
+                rr = list(r)
+                rr[1] = str(seq)  # 执行顺序列，board 内从 1 重编
+                seq += 1
+                board.append(rr)
+        with open(BOARD, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(board)
     label = raw or "全量"
     scope_desc = f"{label}（{len(board) - 1} / 全量 {len(data)} 条）"
     id_set = {r[i_id] for r in board[1:]}
@@ -162,14 +171,15 @@ def build_structure(cases):
             prio,
             "、".join(purposes) or "见各用例目标",
         ])
-    with open(STRUCT, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows)
+    with ledger_lock():
+        with open(STRUCT, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(rows)
     return len(order)
 
 
 def build_summary(board_rows, scope_desc):
     """从本轮 board 的运行时状态 + 证据表算摘要计数（本轮口径）。
-    保留"创建日期""Google Doc"等人工/外部字段。"""
+    保留"创建日期""Google Doc"等人工/外部字段。写 summary.csv 持账本锁（并行安全）。"""
     h = board_rows[0]
     i_id = h.index("用例ID")
     i_st, i_res = h.index("当前状态"), h.index("执行结果")
@@ -240,8 +250,9 @@ def build_summary(board_rows, scope_desc):
     rows.append(["— 阅读与执行规则 —", ""])
     rows.extend([list(g) for g in guide])
 
-    with open(SUMMARY, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows)
+    with ledger_lock():
+        with open(SUMMARY, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(rows)
 
 
 def main():
@@ -279,8 +290,9 @@ def main():
             c.get("frozen_script", ""),
         ])
 
-    with open(QUEUE, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows)
+    with ledger_lock():
+        with open(QUEUE, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(rows)
 
     # 本轮投影：按 target.scope 从 queue 过滤出 board.csv（看板/报告的本轮视图）；
     # 结构/摘要按本轮 in-scope 子集算。全量真值 queue.csv 不受影响。

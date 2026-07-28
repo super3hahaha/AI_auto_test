@@ -53,8 +53,69 @@ async function loadLangLocales() {
 // ── 右栏：设备 + 看板 + 执行 ──
 const devices = ref<DeviceRow[]>([]);
 const pickedSerials = ref<string[]>([]);
+
+// ── 「用例 × 设备」逐格分派（docs/handoff-parallel-multidevice.md §5.4）──
+// 默认语义不变：勾了的用例在所有勾选设备上跑（=矩阵，整行铺满）。勾选 >1 台设备时，
+// 每条已勾用例行尾出现设备 chips，可逐格取消 → 显式分派（该用例只落勾中的设备）。
+// rowSerials[caseId] 存该行的显式覆盖；没有条目 = 跟随 pickedSerials 全铺（含后勾的新设备）。
+const rowSerials = reactive<Record<string, string[]>>({});
+function rowDevs(caseId: string): string[] {
+  // 只勾 1 台设备时 chips 不出现（见下方模板 v-if），此时不存在"分派"这回事——必须无条件跟随
+  // pickedSerials，不能套用之前多设备时留下的覆盖（哪怕它是空数组）。否则「之前勾 2 台时把某
+  // 几条用例的 chips 全点掉」这个历史状态，会在退回单设备后变成"看不见 chips 却分派不到任何
+  // 设备"，用户既看不到问题、也无从修复（真实复现过：CUT-EDGE-01/02、MERGE-COUNT-01）。
+  if (pickedSerials.value.length <= 1) return pickedSerials.value;
+  const base = rowSerials[caseId] ?? pickedSerials.value;
+  return base.filter((s) => pickedSerials.value.includes(s)); // 与当前勾选设备求交，掉线/取消勾选自动剪枝
+}
+function toggleRowDev(caseId: string, serial: string) {
+  const cur = new Set(rowDevs(caseId));
+  if (cur.has(serial)) cur.delete(serial);
+  else cur.add(serial);
+  // 按 pickedSerials 顺序存，chips 显示顺序稳定
+  rowSerials[caseId] = pickedSerials.value.filter((s) => cur.has(s));
+}
+// 一行是不是"整行铺满"（跟随全部勾选设备）——铺满时可以把覆盖条目删掉，让后勾的新设备自动加入
+function resetRowDevs(caseId: string) {
+  delete rowSerials[caseId];
+}
+// chips 显示文本：优先设备别名，退回 serial 尾 4 位（完整 serial 放 title 悬停可见）
+function chipLabel(serial: string) {
+  const d = devices.value.find((x) => x.serial === serial);
+  return d?.alias || serial.slice(-4);
+}
+function chipTitle(serial: string) {
+  const d = devices.value.find((x) => x.serial === serial);
+  return `${serial}${d?.model ? " · " + d.model : ""}`;
+}
+// 执行计划：serial → caseId[]（用例顺序按中栏列表顺序，即 frozen 的顺序）
+function buildPlan(cases: { case_id: string }[]): Record<string, string[]> {
+  const plan: Record<string, string[]> = {};
+  for (const s of pickedSerials.value) plan[s] = [];
+  for (const c of cases) {
+    for (const s of rowDevs(c.case_id)) plan[s].push(c.case_id);
+  }
+  for (const s of Object.keys(plan)) {
+    if (!plan[s].length) delete plan[s]; // 一格没分到的设备不起 worker
+  }
+  return plan;
+}
 const boardMode = ref<"current" | "new">("current"); // 关联当前 / 新建看板
 const brainMode = ref(false); // 脚本自愈：失败自动交 claude 诊断+改脚本重跑
+// UI dump 后端：shell(默认,纯adb,零依赖) / u2(uiautomator2,单次快约4倍，需设备预装并保活
+// atx-agent，跟 Appium 会抢 UiAutomation 互斥，见 decisions.md #30)。切 App 时随 loadAll 从
+// target.json 读回当前值；执行前若与勾选状态不一致，写回 target.json 再跑（adbkit 按
+// target.json 的 dump_backend 选后端，不是运行时参数）。
+const dumpU2 = ref(false);
+async function loadDumpBackend() {
+  if (!store.activeSlug) { dumpU2.value = false; return; }
+  try {
+    const cfg = await api.readTargetConfig(store.activeSlug);
+    dumpU2.value = cfg?.dump_backend === "u2";
+  } catch {
+    dumpU2.value = false;
+  }
+}
 const err = ref("");
 const confirmNewBoard = ref(false);
 
@@ -158,7 +219,7 @@ async function loadDevices() {
 async function loadAll() {
   err.value = "";
   try {
-    await Promise.all([loadFlows(), loadDevices(), loadLangLocales()]);
+    await Promise.all([loadFlows(), loadDevices(), loadLangLocales(), loadDumpBackend()]);
   } catch (e: any) {
     err.value = String(e);
   }
@@ -166,28 +227,42 @@ async function loadAll() {
 
 // 「▶ 执行选中」→ 校验 → 跳到执行台 tab → 交给 runStore 串行编排（for 设备 × for 用例）
 function runSelected() {
-  // 收尾阶段（sync_sheets/doc_report）跑完前禁止开新一轮：它们跑完会把当前 doc_id 写回
-  // target.json，若这时用户已经手动/自动开了新一轮（尤其「新建看板」会先建一份新 Doc、
-  // 也回写 target.json），旧一轮收尾晚完成的那次写入会把新 Doc 的 doc_id 覆盖回旧的——
-  // 线上明明刷新成功，desktop 却把指针指回了上一轮的 Doc。见 docs/gotchas.md 对应条目。
-  if (runStore.running || runStore.syncing || runStore.docGenerating) return;
+  // 收尾阶段（登记问题清单→同步表格→刷新Doc→存执行记录）跑完前禁止开新一轮：一是 sync_sheets/
+  // doc_report 会把当前 doc_id 写回 target.json，若这时新一轮已经开跑（尤其「新建看板」会先建一份
+  // 新 Doc、也回写 target.json），旧一轮收尾晚完成的那次写入会把新 Doc 的 doc_id 覆盖回旧的——线上
+  // 明明刷新成功，desktop 却把指针指回了上一轮的 Doc（见 docs/gotchas.md 对应条目）；二是旧一轮收尾
+  // 还在流式 push 的日志会串进新一轮已经清空重建的事件面板。runStore.publishing 覆盖收尾全程（不只
+  // syncing/docGenerating 两段，「登记问题清单」「存执行记录」这两段窗口也要挡），start() 内部也会
+  // 再挡一层（防住「新建看板」二次确认弹窗直接调 launch() 绕过这里的情况）。
+  if (runStore.running || runStore.publishing) return;
   if (!store.activeSlug) { err.value = "请先在左栏选一个 App"; return; }
   const cases = frozen.value.filter((f) => pickedCases.value.includes(f.case_id));
   if (!cases.length) { err.value = "中栏请至少勾选一个固化用例"; return; }
   if (!pickedSerials.value.length) { err.value = "右栏请至少勾选一台设备"; return; }
+  // 逐格分派校验：每个勾选用例至少落一台设备（把设备 chips 全点掉的行拦下来）
+  const orphan = cases.filter((c) => !rowDevs(c.case_id).length).map((c) => c.case_id);
+  if (orphan.length) { err.value = `这些用例没有分配任何设备：${orphan.join(", ")}（点行尾设备 chips 或重置整行）`; return; }
   err.value = "";
   if (boardMode.value === "new") { confirmNewBoard.value = true; return; }
   launch(false);
 }
 
-function launch(newBoard: boolean) {
+async function launch(newBoard: boolean) {
   confirmNewBoard.value = false;
   const cases = frozen.value
     .filter((f) => pickedCases.value.includes(f.case_id))
     .map((f) => ({ case_id: f.case_id, script: f.script, module: f.module }));
+  // 执行计划：整行全铺 = 矩阵；有行做过 chips 取舍 = 显式分派。两者同一条编排路径。
+  const plan = buildPlan(cases);
+  const planSerials = Object.keys(plan);
+  const cellCount = planSerials.reduce((n, s) => n + plan[s].length, 0);
+  const isMatrix = cellCount === cases.length * planSerials.length;
+  // adbkit 按 target.json 的 dump_backend 选后端，不是运行时参数——执行前先把勾选状态写回，
+  // 保证固化脚本这次真的用的是 UI 上看到的后端（而不是上次残留的值）。
+  const slug = store.activeSlug;
+  await api.setTargetDumpBackend(slug, dumpU2.value ? "u2" : "shell");
   subTab.value = "monitor"; // 立即跳到执行台看实时过程
   // 选了某个留存版本 → 执行前先在每台设备上强制重装这个版本（不管设备当前是不是已经是它）
-  const slug = store.activeSlug;
   const ver = selectedVersion[slug];
   const apkPath = ver ? appVersions[slug]?.find((v) => v.version === ver)?.path : undefined;
   const pkg = store.activeApp()?.package;
@@ -195,10 +270,10 @@ function launch(newBoard: boolean) {
     .start({
       slug,
       cases,
-      serials: [...pickedSerials.value],
+      plan,
       brain: brainMode.value,
       newBoard,
-      title: `${slug} · ${cases.length} 用例 × ${pickedSerials.value.length} 设备${ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
+      title: `${slug} · ${cases.length} 用例 × ${planSerials.length} 设备${isMatrix ? "" : `（分派 ${cellCount} 格）`}${ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
       apkPath: apkPath && pkg ? apkPath : undefined,
       package: apkPath && pkg ? pkg : undefined,
       langCode: langCode.value || undefined,
@@ -331,7 +406,11 @@ async function removeApp(slug: string) {
   }
 }
 
-watch(() => store.activeSlug, () => { pickedCases.value = []; loadAll(); });
+watch(() => store.activeSlug, () => {
+  pickedCases.value = [];
+  Object.keys(rowSerials).forEach((k) => delete rowSerials[k]); // 逐格分派覆盖是 per-App 的，切 App 清掉
+  loadAll();
+});
 onMounted(() => { loadAll(); });
 // keep-alive 保活后切回本 tab 时刷新设备/用例列表；正在执行则不动，避免打断在跑的任务与日志。
 onActivated(() => { if (!runStore.running) loadAll(); });
@@ -433,6 +512,10 @@ onActivated(() => { if (!runStore.running) loadAll(); });
           </div>
         </div>
         <div class="col-body">
+          <div v-if="frozen.length && pickedSerials.length > 1" class="muted grid-hint">
+            已勾 {{ pickedSerials.length }} 台设备：默认每条勾选用例在所有设备上跑（矩阵）；点用例行尾的
+            设备 chips 可逐格取消 → 指定用例只落指定设备（显式分派）。
+          </div>
           <template v-if="frozen.length">
             <label
               v-for="f in frozen"
@@ -447,6 +530,23 @@ onActivated(() => { if (!runStore.running) loadAll(); });
               <span class="case-mod muted">{{ f.module }}</span>
               <span v-if="f.purpose" class="case-purpose muted">{{ f.purpose }}</span>
               <span v-if="f.priority" class="pill sm" :class="priorityPill(f.priority)">{{ f.priority }}</span>
+              <!-- 逐格分派 chips：仅多设备 + 该用例已勾时出现；点击不联动 label 的勾选框 -->
+              <span v-if="pickedCases.includes(f.case_id) && pickedSerials.length > 1" class="dev-chips">
+                <button
+                  v-for="s in pickedSerials"
+                  :key="s"
+                  class="dev-chip mono"
+                  :class="{ on: rowDevs(f.case_id).includes(s) }"
+                  :title="chipTitle(s)"
+                  @click.prevent.stop="toggleRowDev(f.case_id, s)"
+                >{{ chipLabel(s) }}</button>
+                <button
+                  v-if="rowSerials[f.case_id]"
+                  class="dev-chip reset"
+                  title="重置：该用例回到「所有勾选设备都跑」"
+                  @click.prevent.stop="resetRowDevs(f.case_id)"
+                >↺</button>
+              </span>
             </label>
           </template>
           <div v-else-if="store.activeSlug" class="muted empty-hint">该 App 还没有固化用例（queue.csv 无固化脚本行）。</div>
@@ -516,12 +616,19 @@ onActivated(() => { if (!runStore.running) loadAll(); });
               <span class="muted brain-sub">失败时 Claude 接管：诊断→只改导航/健壮性→重跑（至多 3 次）。判为 App 缺陷则停。</span>
             </span>
           </label>
+          <label class="brain-opt" :class="{ on: dumpU2 }">
+            <input type="checkbox" v-model="dumpU2" />
+            <span class="brain-txt">
+              UI dump 用 u2 加速
+              <span class="muted brain-sub">uiautomator2 比默认 shell dump 快约 4 倍，但需设备预装并保活 atx-agent，跟 Appium 互斥。写入 target.json 的 dump_backend。</span>
+            </span>
+          </label>
           <button
             class="primary run-btn"
-            :disabled="runStore.running || runStore.syncing || runStore.docGenerating"
+            :disabled="runStore.running || runStore.publishing"
             @click="runSelected"
           >
-            {{ runStore.running ? "执行中…" : (runStore.syncing || runStore.docGenerating) ? "收尾中…（同步/刷新Doc）" : "▶ 执行选中" }}
+            {{ runStore.running ? "执行中…" : runStore.publishing ? "收尾中…（登记/同步/刷新Doc）" : "▶ 执行选中" }}
           </button>
         </div>
       </div>
@@ -550,7 +657,13 @@ onActivated(() => { if (!runStore.running) loadAll(); });
         </p>
         <div class="dactions">
           <button @click="confirmNewBoard = false">取消</button>
-          <button class="primary" @click="launch(true)">确认开新一轮并执行</button>
+          <button
+            class="primary"
+            :disabled="runStore.running || runStore.publishing"
+            @click="launch(true)"
+          >
+            {{ runStore.publishing ? "上一轮收尾中，请稍候…" : "确认开新一轮并执行" }}
+          </button>
         </div>
       </div>
     </div>
@@ -659,6 +772,18 @@ h2 { margin: 0; font-weight: 500; }
 .case-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius); font-size: 13px; cursor: pointer; }
 .case-item:hover { background: var(--surface-1); }
 .case-item.locked { opacity: 0.6; cursor: default; }
+
+/* 「用例 × 设备」逐格分派 */
+.grid-hint { font-size: 11px; line-height: 1.5; padding: 6px 8px 2px; }
+.dev-chips { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; margin-left: auto; }
+.dev-chip {
+  font-size: 10px; padding: 1px 7px; border-radius: 999px; cursor: pointer;
+  border: 0.5px solid var(--border); background: var(--surface-2); color: var(--text-muted);
+  text-decoration: line-through; opacity: 0.7;
+}
+.dev-chip.on { background: var(--bg-accent); color: var(--text-accent); border-color: var(--text-accent); text-decoration: none; opacity: 1; }
+.dev-chip.reset { text-decoration: none; opacity: 1; }
+.dev-chip:hover { border-color: var(--border-strong, var(--text-accent)); }
 
 .case-toolbar { display: flex; gap: 6px; }
 .case-id { flex-shrink: 0; }

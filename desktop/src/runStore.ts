@@ -1,6 +1,8 @@
 // 运行状态（跨组件、跨 tab 共享，且独立于组件生命周期——切 tab/切子 tab 都不丢）。
 // 场景库点「执行选中」→ 填充这里并跳到执行台 tab；执行台监控页只读这里渲染。
-// 编排本身（串行 for 设备 × for 用例）也放这里，不再挂在组件上。
+// 编排本身也放这里，不再挂在组件上。并发模型（docs/handoff-parallel-multidevice.md §2）：
+// 设备间并行、设备内串行——每台设备一个 worker，Promise.all 并发；执行计划是静态的
+// plan: serial → caseId[]（勾满网格=矩阵，逐格勾=显式分派，同一条编排路径，无分片/动态分配）。
 import { reactive } from "vue";
 import { api } from "./api";
 import { store } from "./store";
@@ -30,11 +32,15 @@ export interface RunCell {
   recording: boolean; // 脚本已跑完（status 已是 pass/fail 等终态），但 judge_result 还没落库——
                      // 整轮"完成"要等这个也变 false，不然进度会显示"N/N 完成"却其实还在判定。
   issue: IssueState; // 收尾阶段这一格问题清单的自动登记状态（仅失败/需复核格才会流转）
+  issueSkip: boolean; // 用户手动勾掉「本条不登记问题清单」——常见于调试固化脚本时，失败是脚本没写好，
+                       // 不是真 App 缺陷，不值得占用 issues.csv。只在 issue 还是 "none"（还没开始登记）
+                       // 时可切换，一旦收尾流程跑到这一格就定型，不能反悔（撤销已登记不在这个口子里）。
 }
 
 // 问题清单自动登记状态（issue_register.py）：none=不适用（通过格）/未开始；registering=收尾登记中；
-// registered=已登记进 issues.csv；manual=自动登记没完成，需回 Claude Code 手动登记。
-export type IssueState = "none" | "registering" | "registered" | "manual";
+// registered=已登记进 issues.csv；manual=自动登记没完成，需回 Claude Code 手动登记；
+// skipped=用户在登记前主动勾掉，本条不登记（不算「未完成」，不需要人工处理）。
+export type IssueState = "none" | "registering" | "registered" | "manual" | "skipped";
 
 export interface RunEvent {
   level: "info" | "error";
@@ -45,7 +51,8 @@ export interface RunEvent {
 // 完整跑完（未中止）的一轮执行台落成一份快照存进 apps/<slug>/ledger/run_records/<id>.json，
 // 「执行记录」页按 id 切换、用 RunMonitor 只读渲染。meta 带够列表用的摘要，list 只回 meta。
 export interface RunRecordMeta {
-  id: string;        // 由 startedAt 派生的 YYYYMMDD-HHmmss
+  id: string;        // 由 startedAt 派生的 YYYYMMDD-HHmmss，只是本地快照文件名，与下面的轮次 id 是两套体系
+  runId?: string;     // 跑这轮时 store.runs 里 is_current 的 run_id（看板/证据/总览用的轮次概念）；此字段加入前存的旧记录没有
   slug: string;
   title: string;
   brain: boolean;
@@ -82,6 +89,7 @@ export interface MonitorSource {
   doneCount(): number;
   totalCount(): number;
   abort(): unknown;
+  toggleIssueSkip(serial: string, caseId: string): unknown;
 }
 
 // 每格一条待跑任务：{case_id, script, module}
@@ -115,6 +123,13 @@ export const runStore = reactive({
   selectedKey: "" as string, // 选中的格子 key（serial|caseId）；空=看全部事件
   issueTotal: 0, // 本轮登记问题清单的固定分母（开始登记时定住，串行处理不再跟着涨）
   completed: false, // 本轮是否「完整跑完」（编排循环自然走到底，非中止/非早退失败）——只有它为真才存执行记录
+  // 本轮收尾（登记问题清单→同步表格→刷新Doc→存执行记录）是否还没跑完。finish() 里这条链子是
+  // fire-and-forget 起的，若不拦，用户可以在它跑完前就点开下一轮：下一轮 start() 会把 events/cells
+  // 清空重建，但上一轮收尾里仍在流式 push 的日志走的是同一个 this.pushEvent → this.events，会串进
+  // 下一轮的实时日志里（真实症状：新一轮的 run_flow 输出中间夹杂上一轮的 [doc]/登记 日志）。
+  // start() 据此拒绝在上一轮收尾完成前开新一轮（而不是只挡 syncing/docGenerating 两段，那样会漏掉
+  // 「登记问题清单」和「存执行记录」这两段收尾窗口）。
+  publishing: false,
 
   key(serial: string, caseId: string) {
     return `${serial}|${caseId}`;
@@ -141,8 +156,8 @@ export const runStore = reactive({
   // 场景库触发：newBoard=true 时先跑 new_run.py 开新一轮
   async start(opts: {
     slug: string;
-    cases: RunCaseSpec[];
-    serials: string[];
+    cases: RunCaseSpec[]; // 用例定义（case_id→script/module 查找表），实际跑哪些格看 plan
+    plan: Record<string, string[]>; // serial → 该设备要跑的 caseId 列表（静态执行计划，见 §2）
     brain: boolean;
     newBoard: boolean;
     title: string;
@@ -150,7 +165,10 @@ export const runStore = reactive({
     package?: string;
     langCode?: string; // 场景库显式选的目标语言代号（如 ko）；不传=不切语言，走脚本固化时的原文
   }) {
-    if (this.running) return;
+    if (this.running || this.publishing) return;
+    const specById = new Map(opts.cases.map((c) => [c.case_id, c]));
+    // 计划里的 serial 顺序即 worker 顺序；空列表的设备直接剔除
+    const serials = Object.keys(opts.plan).filter((s) => (opts.plan[s] ?? []).length > 0);
     this.running = true;
     this.aborting = false;
     this.slug = opts.slug;
@@ -161,8 +179,10 @@ export const runStore = reactive({
     this.cells = [];
     this.issueTotal = 0;
     this.completed = false;
-    for (const s of opts.serials) {
-      for (const c of opts.cases) {
+    for (const s of serials) {
+      for (const cid of opts.plan[s]) {
+        const c = specById.get(cid);
+        if (!c) continue; // plan 里引用了不存在的用例（理论上不会，防御）
         this.cells.push({
           serial: s,
           caseId: c.case_id,
@@ -173,6 +193,7 @@ export const runStore = reactive({
           lines: [],
           recording: false,
           issue: "none",
+          issueSkip: false,
         });
       }
     }
@@ -182,8 +203,9 @@ export const runStore = reactive({
         ? "脚本自愈已启用（引擎: on，失败步骤将由 claude 接管诊断+改脚本重跑）"
         : "脚本自愈未启用（引擎: off，失败步骤将诚实判失败）"
     );
+    const caseCount = new Set(this.cells.map((c) => c.caseId)).size;
     this.pushEvent(
-      `共 ${this.cells.length} 格待执行（${opts.serials.length} 设备 × ${opts.cases.length} 用例）`
+      `共 ${this.cells.length} 格待执行（${serials.length} 设备 · ${caseCount} 用例 · 设备间并行、设备内串行）`
     );
     if (opts.langCode === AUTO_LANG) {
       this.pushEvent("语言：自动（执行前逐台现查设备当前系统语言并换算成 LANG_CODE，见下方逐设备日志）");
@@ -244,9 +266,10 @@ export const runStore = reactive({
 
     // 选了留存版本 → 逐台强制重装（adb install -r 本身幂等，不用先查设备当前版本，
     // 装错版本跑测试比多花几秒重装的代价大得多）。任一台装机失败就整轮放弃，不带着错版本瞎跑。
+    // 装机保持串行：install 是一次性准备步骤，几秒钟的事，不值得为它并行化增加失败归因难度。
     if (opts.apkPath && opts.package) {
-      this.pushEvent(`📦 强制重装选中版本到 ${opts.serials.length} 台设备…`);
-      for (const s of opts.serials) {
+      this.pushEvent(`📦 强制重装选中版本到 ${serials.length} 台设备…`);
+      for (const s of serials) {
         try {
           const code = await api.installApk(opts.apkPath, opts.package, s, (l) => this.pushEvent(`[install ${s}] ${l}`));
           if (code !== 0) {
@@ -263,61 +286,71 @@ export const runStore = reactive({
       this.pushEvent("📦 装机完成");
     }
 
-    outer: for (const s of opts.serials) {
-      for (const c of opts.cases) {
-        if (this.aborting) break outer;
-        const cell = this.cell(s, c.case_id)!;
-        cell.status = "running";
-        this.pushEvent(`▶ ${s} / ${c.case_id} 开始（${this.brain ? "auto_repair" : "run_flow"}）`);
-        const t0 = Date.now();
-        const runner = opts.brain ? api.runFlowRepair : api.runFlow;
-        const lc = await resolveLangFor(s);
-        try {
-          const code = await runner(opts.slug, c.case_id, c.script, s, lc, (l) => {
-            cell.lines.push(l);
-            this.pushEvent(`[${s}/${c.case_id}] ${l}`, /失败|异常|✖|error|Error/.test(l) ? "error" : "info");
-          });
-          cell.elapsed = Math.round((Date.now() - t0) / 1000);
-          cell.exitCode = code;
-          let st = classify(code, this.brain, this.aborting);
-          // 自愈模式下 exit 0 且日志里有自愈成功痕迹 → 标「自愈通过」
-          if (st === "pass" && this.brain && cell.lines.some((l) => l.includes("自愈成功"))) {
-            st = "healed";
-          }
-          cell.status = st;
-          this.pushEvent(`${st === "pass" || st === "healed" ? "✔" : "✖"} ${s}/${c.case_id} → ${labelOf(st)}（exit ${code} · ${cell.elapsed}s）`, st === "pass" || st === "healed" ? "info" : "error");
-
-          // 所有终态（pass/healed/fail/app_defect/needs_human）都必须落账本——纯确定性映射，
-          // 不调 claude：run_flow.py/auto_repair.py 只写 log.csv 和时间戳，从不碰 queue.csv 的
-          // "当前状态"列，这条不调，这条用例会一直停在"待执行"，看起来像完全没跑过（真实踩过：
-          // CUT-EDGE-02 明明跑了且失败，因为当时这步被跳过，账本显示"已完成 2"漏了它）。
-          if (!this.aborting && (st === "pass" || st === "healed" || st === "fail" || st === "app_defect" || st === "needs_human")) {
-            // recording=true 期间这格的 pass/fail 只是"脚本跑没跑崩"的初步状态，落账本还没完成——
-            // doneCount()/进度条据此排除它，避免"N/N 完成"却其实还没写进账本的误导。落库是纯本地
-            // 文件写入，几乎瞬时，这个态停留时间很短，不会像以前 claude 判定那样卡 1-2 分钟。
-            cell.recording = true;
-            try {
-              const jcode = await api.judgeResult(opts.slug, c.case_id, s, st, (l) => {
-                cell.lines.push(l); // 落账本输出也并入该格日志，否则选中卡片时"该格日志"里看不到
-                this.pushEvent(`[落账本 ${s}/${c.case_id}] ${l}`, /失败|异常|✖|error|Error/.test(l) ? "error" : "info");
-              });
-              if (jcode !== 0) {
-                this.pushEvent(`⚠ ${s}/${c.case_id} 落账本异常（exit ${jcode}）`, "error");
-              }
-            } catch (e: any) {
-              this.pushEvent(`✖ ${s}/${c.case_id} 落账本调用异常：${e}`, "error");
-            } finally {
-              cell.recording = false;
-            }
-          }
-        } catch (e: any) {
-          cell.elapsed = Math.round((Date.now() - t0) / 1000);
-          cell.status = this.aborting ? "aborted" : "fail";
-          cell.exitCode = -1;
-          this.pushEvent(`✖ ${s}/${c.case_id} 调用异常：${e}`, "error");
+    // 跑一格（一台设备上的一条用例）：执行 → 分类 → 落账本。账本写入端已有进程间锁
+    // （tools/_appctx.ledger_lock），多台设备的 judge_result 并发落库是安全的。
+    const runCell = async (s: string, c: RunCaseSpec) => {
+      const cell = this.cell(s, c.case_id)!;
+      cell.status = "running";
+      this.pushEvent(`▶ ${s} / ${c.case_id} 开始（${this.brain ? "auto_repair" : "run_flow"}）`);
+      const t0 = Date.now();
+      const runner = opts.brain ? api.runFlowRepair : api.runFlow;
+      const lc = await resolveLangFor(s);
+      try {
+        const code = await runner(opts.slug, c.case_id, c.script, s, lc, (l) => {
+          cell.lines.push(l);
+          this.pushEvent(`[${s}/${c.case_id}] ${l}`, /失败|异常|✖|error|Error/.test(l) ? "error" : "info");
+        });
+        cell.elapsed = Math.round((Date.now() - t0) / 1000);
+        cell.exitCode = code;
+        let st = classify(code, this.brain, this.aborting);
+        // 自愈模式下 exit 0 且日志里有稳定机器标记 → 标「自愈通过」（标记见 auto_repair.py）
+        if (st === "pass" && this.brain && cell.lines.some((l) => l.includes("AUTOREPAIR_HEALED: true"))) {
+          st = "healed";
         }
+        cell.status = st;
+        this.pushEvent(`${st === "pass" || st === "healed" ? "✔" : "✖"} ${s}/${c.case_id} → ${labelOf(st)}（exit ${code} · ${cell.elapsed}s）`, st === "pass" || st === "healed" ? "info" : "error");
+
+        // 所有终态（pass/healed/fail/app_defect/needs_human）都必须落账本——纯确定性映射，
+        // 不调 claude：run_flow.py/auto_repair.py 只写 log.csv 和时间戳，从不碰 queue.csv 的
+        // "当前状态"列，这条不调，这条用例会一直停在"待执行"，看起来像完全没跑过（真实踩过：
+        // CUT-EDGE-02 明明跑了且失败，因为当时这步被跳过，账本显示"已完成 2"漏了它）。
+        if (!this.aborting && (st === "pass" || st === "healed" || st === "fail" || st === "app_defect" || st === "needs_human")) {
+          // recording=true 期间这格的 pass/fail 只是"脚本跑没跑崩"的初步状态，落账本还没完成——
+          // doneCount()/进度条据此排除它，避免"N/N 完成"却其实还没写进账本的误导。落库是纯本地
+          // 文件写入，几乎瞬时，这个态停留时间很短，不会像以前 claude 判定那样卡 1-2 分钟。
+          cell.recording = true;
+          try {
+            const jcode = await api.judgeResult(opts.slug, c.case_id, s, st, (l) => {
+              cell.lines.push(l); // 落账本输出也并入该格日志，否则选中卡片时"该格日志"里看不到
+              this.pushEvent(`[落账本 ${s}/${c.case_id}] ${l}`, /失败|异常|✖|error|Error/.test(l) ? "error" : "info");
+            });
+            if (jcode !== 0) {
+              this.pushEvent(`⚠ ${s}/${c.case_id} 落账本异常（exit ${jcode}）`, "error");
+            }
+          } catch (e: any) {
+            this.pushEvent(`✖ ${s}/${c.case_id} 落账本调用异常：${e}`, "error");
+          } finally {
+            cell.recording = false;
+          }
+        }
+      } catch (e: any) {
+        cell.elapsed = Math.round((Date.now() - t0) / 1000);
+        cell.status = this.aborting ? "aborted" : "fail";
+        cell.exitCode = -1;
+        this.pushEvent(`✖ ${s}/${c.case_id} 调用异常：${e}`, "error");
       }
-    }
+    };
+
+    // 设备间并行：每台设备一个 worker（Promise.all），worker 内按 plan 给它的用例列表串行跑。
+    // 中止：每格开跑前检查 aborting；abort_run 会向所有已登记进程组发 SIGTERM，全部一起停。
+    const worker = async (s: string) => {
+      for (const cid of opts.plan[s]) {
+        if (this.aborting) break;
+        const spec = specById.get(cid);
+        if (spec) await runCell(s, spec);
+      }
+    };
+    await Promise.all(serials.map((s) => worker(s)));
 
     if (this.aborting) {
       for (const c of this.cells) {
@@ -337,7 +370,10 @@ export const runStore = reactive({
     // 先把本轮快照抓成局部引用（新一轮 start() 会另建新数组，这些引用仍指向本轮，不被后续 mutate）。
     // completed 决定要不要存执行记录：中止（this.aborting 曾为真）/早退失败的轮次 completed 一直是 false。
     const completed = this.completed;
-    const snap = { slug: this.slug, title: this.title, brain: this.brain, startedAt: this.startedAt };
+    // runId：跑这轮时 store.runs 里当前批次的 run_id（新建看板会在 start() 里先 loadRuns 落定它）——
+    // 落到执行记录的 meta 里，才能跟看板/证据/总览页的「轮次」概念对上，不然两套 id 各跑各的对不上号。
+    const runId = store.runs.find((r) => r.is_current)?.run_id || "";
+    const snap = { slug: this.slug, title: this.title, brain: this.brain, startedAt: this.startedAt, runId };
     const cellsRef = this.cells;
     const eventsRef = this.events;
     this.completed = false;
@@ -345,15 +381,18 @@ export const runStore = reactive({
     // 桌面端跑的结果否则只留本地、报告也不会带上最新判定。fire-and-forget：在后台流式跑，
     // 日志进事件面板；失败只提示、不阻塞（不重跑，避免收尾阶段无限重试）。
     // 存执行记录排在 publish 之后 —— 让快照带上收尾阶段落定的问题清单登记状态（issue 字段）。
-    void this.publish().then(() => {
-      if (completed) void this.saveRecord(snap, cellsRef, eventsRef);
-    });
+    // publishing 全程占用（登记问题清单→同步→刷新Doc→存执行记录），start() 据此拒绝在这之前开新一轮
+    // ——避免上一轮仍在流式 push 的收尾日志串进下一轮已经清空重建的 events 数组。
+    this.publishing = true;
+    void this.publish()
+      .then(() => (completed ? this.saveRecord(snap, cellsRef, eventsRef) : undefined))
+      .finally(() => { this.publishing = false; });
   },
 
   // 把「完整跑完」的这一轮执行台落成一份持久化快照（apps/<slug>/ledger/run_records/<id>.json）。
   // 只在 finish() 里、且 completed 为真时调；中止/早退失败的轮次不会走到这里。
   async saveRecord(
-    snap: { slug: string; title: string; brain: boolean; startedAt: number },
+    snap: { slug: string; title: string; brain: boolean; startedAt: number; runId: string },
     cells: RunCell[],
     events: RunEvent[]
   ) {
@@ -367,6 +406,7 @@ export const runStore = reactive({
     const record: RunRecord = {
       meta: {
         id: fmtRunRecordId(snap.startedAt),
+        runId: snap.runId,
         slug: snap.slug,
         title: snap.title,
         brain: snap.brain,
@@ -404,15 +444,31 @@ export const runStore = reactive({
   // 和 Doc 的失败详情。串行逐格调：headless claude 会写同一份 issues.csv，并发会撞车。
   // 中止的这一轮不登记（aborted 不是判定结果，且证据可能不完整）。fire-and-forget 风格：
   // 单格失败只提示、不中断整个收尾。
+  // 手动切换某一格「本条不登记问题清单」——只在 issue 还是 "none"（收尾流程还没跑到它）时生效，
+  // 供调试固化脚本时用：脚本没写好导致的失败不是真缺陷，不想每次都占用 issues.csv。
+  toggleIssueSkip(serial: string, caseId: string) {
+    const cell = this.cell(serial, caseId);
+    if (!cell || cell.issue !== "none") return;
+    cell.issueSkip = !cell.issueSkip;
+  },
+
   async registerIssues() {
     if (!this.slug || this.aborting) return;
     const targets = this.cells.filter(
       (c) => c.status === "fail" || c.status === "app_defect" || c.status === "needs_human"
     );
     if (!targets.length) return;
-    this.issueTotal = targets.length; // 开始登记时就定住分母，串行逐条处理不再让分母跟着涨
-    this.pushEvent(`自动登记问题清单：${targets.length} 条失败/需复核用例（issue_register）…`);
-    for (const cell of targets) {
+    // 用户已勾「跳过」的格子直接定型为 skipped，不占登记分母、不调用 issue_register
+    const toSkip = targets.filter((c) => c.issueSkip);
+    const toRegister = targets.filter((c) => !c.issueSkip);
+    for (const cell of toSkip) cell.issue = "skipped";
+    if (toSkip.length) {
+      this.pushEvent(`⏭ 已跳过登记 ${toSkip.length} 条用例（手动取消，不写入问题清单）`);
+    }
+    if (!toRegister.length) return;
+    this.issueTotal = toRegister.length; // 开始登记时就定住分母，串行逐条处理不再让分母跟着涨
+    this.pushEvent(`自动登记问题清单：${toRegister.length} 条失败/需复核用例（issue_register）…`);
+    for (const cell of toRegister) {
       // fail/app_defect→BUG-、needs_human→RISK-（前缀由 issue_register 按 status 确定性映射，这里只透传）
       const status = cell.status as "fail" | "app_defect" | "needs_human";
       cell.issue = "registering";
@@ -549,6 +605,9 @@ export function makeRecordSource(record: RunRecord): MonitorSource {
     },
     abort() {
       /* 静态记录无可中止 */
+    },
+    toggleIssueSkip() {
+      /* 只读历史快照，问题清单登记早已定型，不可回头切换 */
     },
   });
   return src as unknown as MonitorSource;

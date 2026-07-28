@@ -39,6 +39,8 @@ pub fn run() {
             commands::delete_run_record,
             commands::run_flow,
             commands::run_flow_repair,
+            commands::list_lang_locales,
+            commands::resolve_device_lang_code,
             commands::abort_run,
             commands::new_run,
             commands::sync_sheets,

@@ -606,6 +606,35 @@ fn write_device_aliases(root: &Path, map: &HashMap<String, String>) -> Result<()
         .map_err(|e| e.to_string())
 }
 
+// 型号/系统版本缓存：只有设备在线时才查得到这些值，拔掉后 adb devices 里就没有这行了。
+// 不缓存的话，「未连接」的已登记设备每次都显示空——缓存最后一次在线时查到的值，拔掉也能看。
+#[derive(Serialize, Deserialize, Default, Clone)]
+struct DeviceInfoEntry {
+    #[serde(default)]
+    model: String,
+    #[serde(default)]
+    os_version: String,
+}
+
+fn device_info_cache(root: &Path) -> HashMap<String, DeviceInfoEntry> {
+    let p = root.join("config/device_info_cache.json");
+    let text = match fs::read_to_string(&p) {
+        Ok(t) => t,
+        Err(_) => return Default::default(),
+    };
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_device_info_cache(root: &Path, map: &HashMap<String, DeviceInfoEntry>) {
+    let p = root.join("config/device_info_cache.json");
+    if let Some(parent) = p.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string_pretty(map) {
+        let _ = fs::write(&p, text + "\n");
+    }
+}
+
 // 只对在线设备查，离线/未授权/未插上都不值得等 adb 超时
 fn getprop(serial: &str, prop: &str) -> String {
     let out = Command::new("adb").args(["-s", serial, "shell", "getprop", prop]).output();
@@ -615,13 +644,19 @@ fn getprop(serial: &str, prop: &str) -> String {
     }
 }
 
-fn adb_devices(default_serial: &str, aliases: &HashMap<String, String>) -> Result<Vec<DeviceRow>, String> {
+fn adb_devices(
+    root: &Path,
+    default_serial: &str,
+    aliases: &HashMap<String, String>,
+) -> Result<Vec<DeviceRow>, String> {
     let out = Command::new("adb").args(["devices", "-l"]).output();
     let out = match out {
         Ok(o) => o,
         Err(e) => return Err(format!("adb 不可用：{e}（确认 adb 在 PATH 里）")),
     };
     let text = String::from_utf8_lossy(&out.stdout);
+    let mut cache = device_info_cache(root);
+    let mut cache_dirty = false;
     let mut devices = vec![];
     for line in text.lines().skip(1) {
         let line = line.trim();
@@ -645,6 +680,17 @@ fn adb_devices(default_serial: &str, aliases: &HashMap<String, String>) -> Resul
         } else {
             String::new()
         };
+        // 查到了新值就刷新缓存，供下次拔掉后兜底显示
+        if !model.is_empty() || !os_version.is_empty() {
+            let entry = cache.entry(serial.clone()).or_default();
+            if !model.is_empty() {
+                entry.model = model.clone();
+            }
+            if !os_version.is_empty() {
+                entry.os_version = os_version.clone();
+            }
+            cache_dirty = true;
+        }
         devices.push(DeviceRow {
             is_default: !default_serial.is_empty() && serial == default_serial,
             serial,
@@ -655,19 +701,24 @@ fn adb_devices(default_serial: &str, aliases: &HashMap<String, String>) -> Resul
         });
     }
     // 登记过别名但这次没插上的设备也列出来（state=absent），方便管理「已知设备」清单
+    // 型号/系统查不到（没插上没法 adb shell），兜底用上次在线时缓存的值
     let seen: std::collections::HashSet<String> = devices.iter().map(|d| d.serial.clone()).collect();
     for (serial, alias) in aliases {
         if seen.contains(serial) {
             continue;
         }
+        let cached = cache.get(serial).cloned().unwrap_or_default();
         devices.push(DeviceRow {
             is_default: !default_serial.is_empty() && serial == default_serial,
             serial: serial.clone(),
             state: "absent".to_string(),
-            model: String::new(),
+            model: cached.model,
             alias: alias.clone(),
-            os_version: String::new(),
+            os_version: cached.os_version,
         });
+    }
+    if cache_dirty {
+        write_device_info_cache(root, &cache);
     }
     Ok(devices)
 }
@@ -678,7 +729,7 @@ pub fn list_devices(app: AppHandle, app_slug: String) -> Result<Vec<DeviceRow>, 
     let cfg = read_target(&root, &app_slug);
     let default_serial = cfg.get("serial").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let aliases = device_aliases(&root);
-    adb_devices(&default_serial, &aliases)
+    adb_devices(&root, &default_serial, &aliases)
 }
 
 /// 读取序列号→别名映射本身（不走 adb，纯读 config/device_aliases.json）。
@@ -1217,6 +1268,7 @@ pub async fn run_flow(
     case_id: String,
     script: String,
     serial: String,
+    lang_code: Option<String>,
     on_event: Channel<String>,
 ) -> Result<i32, String> {
     let root = root_of(&app)?;
@@ -1226,7 +1278,14 @@ pub async fn run_flow(
         if !serial.is_empty() {
             args.push(serial);
         }
-        let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        // LANG_CODE 只在场景库显式选了目标语言时才注入；run_flow.py 的 subprocess 环境是
+        // {**os.environ, ...}，父进程(python)这里带上的 env 会原样透传进 flow 脚本，
+        // 脚本里 lang_helper.sh 的 t() 据此查表换算断言文案（不传就是没接过语言机制的老脚本，
+        // 行为不变）。语言由场景库矩阵显式指定，脚本自己绝不去猜设备当前系统语言。
+        if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
+            cmd.env("LANG_CODE", lc);
+        }
         stream_child(cmd, on_event, true)
     })
     .await
@@ -1242,6 +1301,7 @@ pub async fn run_flow_repair(
     case_id: String,
     script: String,
     serial: String,
+    lang_code: Option<String>,
     on_event: Channel<String>,
 ) -> Result<i32, String> {
     let root = root_of(&app)?;
@@ -1251,11 +1311,135 @@ pub async fn run_flow_repair(
         if !serial.is_empty() {
             args.push(serial);
         }
-        let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        // auto_repair.py 转手调 run_flow.py 时 env=os.environ.copy()，同样会把这里注入的
+        // LANG_CODE 一路透传下去，见 run_flow 里的注释。
+        if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
+            cmd.env("LANG_CODE", lc);
+        }
         stream_child(cmd, on_event, true)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// 某 App 的多语言文案表(apps/<slug>/lang/strings_table.json)覆盖了哪些语言代号——供场景库
+/// 「语言」选择器列出可选项；文件不存在（该 App 还没建过语言表）就返回空列表，前端据此隐藏/
+/// 禁用选择器，不报错。"default"(Android 未加 -<locale> 后缀的默认目录，含义因翻译包而异，
+/// 不是一个明确语言代号) 不作为可选项列出。
+#[tauri::command]
+pub fn list_lang_locales(app: AppHandle, app_slug: String) -> Result<Vec<String>, String> {
+    let root = root_of(&app)?;
+    available_lang_locales(&root, &app_slug)
+}
+
+/// `list_lang_locales` 与 `resolve_device_lang_code` 共用的实际读表逻辑，抽出来避免重复解析。
+fn available_lang_locales(root: &Path, app_slug: &str) -> Result<Vec<String>, String> {
+    let path = app_root(root, app_slug).join("lang").join("strings_table.json");
+    let txt = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(_) => return Ok(vec![]),
+    };
+    let v: Value = serde_json::from_str(&txt).map_err(|e| format!("{path:?} 解析失败：{e}"))?;
+    let mut set = std::collections::BTreeSet::new();
+    if let Value::Object(entries) = v {
+        for (_key, locales) in entries {
+            if let Value::Object(m) = locales {
+                for loc in m.keys() {
+                    if loc != "default" {
+                        set.insert(loc.clone());
+                    }
+                }
+            }
+        }
+    }
+    Ok(set.into_iter().collect())
+}
+
+/// 设备当前系统语言的原始值（如 "ko-KR"）+ 换算到该 App 语言表里实际可用的代号（找不到对应
+/// 词条则为 None）。前端「语言」选择器选「自动」时，执行前逐台设备现查一次，不在 UI 层瞎猜。
+#[derive(Serialize)]
+pub struct ResolvedLocale {
+    pub raw: String,          // adb 读到的原始系统语言（getprop/settings 查不到时是空串）
+    pub code: Option<String>, // 最终采用的 LANG_CODE；直接匹配到设备语言，或匹配不上时回退到 en（表里得真有 en 这个 key）
+    pub fallback: bool,       // code 是不是靠"设备语言在表里找不到对应词条，回退默认 en"这条兜底给出的（而非真实匹配到设备语言）
+}
+
+/// 设备当前系统语言，优先 `persist.sys.locale`（单值，框架保持与下面同步），查不到再退
+/// `settings get system system_locales`（逗号分隔的优先级列表，取第一个——即 Android 设置里
+/// 排第一的语言）。两条都是设备在线时的只读查询，不改设备任何状态。
+fn device_locale_raw(serial: &str) -> String {
+    let p = getprop(serial, "persist.sys.locale");
+    if !p.is_empty() {
+        return p;
+    }
+    let out = Command::new("adb")
+        .args(["-s", serial, "shell", "settings", "get", "system", "system_locales"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .trim()
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
+/// BCP-47 系统语言（如 "ko-KR"/"zh-Hans-CN"/"id-ID"）→ `strings_table.json` 用的 Android 资源
+/// 目录代号（如 "ko"/"zh-rCN"/"in"）候选列表，按优先级尝试，第一个在表里实际存在的即采用。
+/// 中文按脚本/地区子标签区分简繁；`id`(现代 BCP-47) 是 Android 历史遗留的 `in` 这类别名单独映射；
+/// 其余语言取主语言子标签（region 一律丢弃，表里都是不带地区的裸语言代号）。
+fn candidate_table_codes(raw: &str) -> Vec<String> {
+    if raw.is_empty() {
+        return vec![];
+    }
+    let lower = raw.to_lowercase();
+    if lower.starts_with("zh") {
+        return if lower.contains("tw") || lower.contains("hant") || lower.contains("hk") || lower.contains("mo") {
+            vec!["zh-rTW".to_string(), "zh-rCN".to_string()]
+        } else {
+            vec!["zh-rCN".to_string(), "zh-rTW".to_string()]
+        };
+    }
+    let lang = lower.split(['-', '_']).next().unwrap_or("").to_string();
+    if lang.is_empty() {
+        return vec![];
+    }
+    // Android 沿用的历史遗留语言代号（偏离现行 ISO 639-1/BCP-47），strings_table.json 是从
+    // Android values-<locale>/ 目录建的表，键用的就是这套旧代号。
+    let legacy = match lang.as_str() {
+        "id" => Some("in"),   // 印尼语：BCP-47 现行 id，Android 资源目录历史上一直用 in
+        "he" => Some("iw"),   // 希伯来语：BCP-47 现行 he，Android 资源目录历史上一直用 iw
+        _ => None,
+    };
+    match legacy {
+        Some(alias) => vec![alias.to_string(), lang],
+        None => vec![lang],
+    }
+}
+
+#[tauri::command]
+pub fn resolve_device_lang_code(
+    app: AppHandle,
+    app_slug: String,
+    serial: String,
+) -> Result<ResolvedLocale, String> {
+    let root = root_of(&app)?;
+    let raw = device_locale_raw(&serial);
+    let available = available_lang_locales(&root, &app_slug)?;
+    // 设备语言（查得到时）换算不出表里的代号，或者压根查不到设备语言 → 回退默认 en（前提是这个
+    // App 的语言表里确实有 en 这个 key，没有就没法兜，仍是 None，前端提示不注入）。
+    let direct = candidate_table_codes(&raw).into_iter().find(|c| available.contains(c));
+    let (code, fallback) = match direct {
+        Some(c) => (Some(c), false),
+        None => {
+            let has_en = available.iter().any(|c| c == "en");
+            (has_en.then(|| "en".to_string()), has_en)
+        }
+    };
+    Ok(ResolvedLocale { raw, code, fallback })
 }
 
 /// 开新一轮看板（new_run.py）。破坏性：会归档重置当前 App 本地账本 —— 前端必须先二次确认。

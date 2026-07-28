@@ -285,7 +285,7 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 **修法**：`tools/adbkit.py` 的 `output-check` 加了 `--ffprobe` 参数（需宿主机装
 `ffmpeg`/`ffprobe`，`brew install ffmpeg`）：自动 `adb pull` 最新产物到本地临时文件，跑
 `ffprobe -show_entries format=duration` 解出真实时长，与 MediaStore 的 `duration` 字段做交叉
-核对（容忍 `--tolerance-ms`，默认1000ms），跑完删除临时文件。宿主机没装 ffprobe 时打印警告并
+核对（容忍 `--tolerance-ms`，默认100ms，2026-07-28 从1000ms收紧），跑完删除临时文件。宿主机没装 ffprobe 时打印警告并
 跳过，不让整条 `output-check` 因为缺本地依赖直接失败。
 
 **通用教训**：**任何"时长/大小类"断言，只要怀疑产物可能有静默失真，就该在 MediaStore 之外再加
@@ -431,3 +431,95 @@ Claude」（`runStore.brain`）分两套路径：
 `grep -rn 'CASE="<旧ID>"' apps/<app>/flows/` 确认没有固化脚本还焊着旧 ID——`rename_case.py`
 目前**不会**帮你查这个（它的文档里明确说"多用例合并在一个 yaml 里的文件不支持，手动改"，
 且即便是它支持的单文件用例，也只改 yaml + queue.csv/board.csv，从不碰 flows/ 目录）。
+
+## `adbkit.py ui --field` 抓出的空字符串，分不清"控件真的没这个文本"还是"根本没抓到控件"（2026-07-23，`RING-SET-01`）
+
+`cmd_ui` 原来的实现里，`--field <id>` 不管是"XML 里压根没有这个 resource-id 的节点"
+还是"节点存在但 `text` 属性本来就是空字符串"，两种情况打印出来都是同一行
+`FIELD:<name>=`，下游 `field_of()` 一律读成空字符串，两种语义被拍扁成一个值，
+判断逻辑无源可依。`RING-SET-01`（首页「我的铃声」入口设置铃声）真机跑出来
+「电话铃声」「闹钟铃声」两行文件名都是空的（见截图），当时没法确定这是「设备本来
+就没设置铃声（合法状态）」还是「脚本抓取/时序出了问题（该判失败）」。
+
+**修法**：`cmd_ui` 现在会分别track "是否匹配到节点"，匹配不到时吐哨兵值
+`FIELD:<name>=<NOTFOUND>`（跟"匹配到但文本为空"区分开）。固化脚本这边的判断方法：
+1) 值是 `<NOTFOUND>` → 控件没抓到，脚本/时序问题，直接判失败；
+2) 值是空字符串 → 不能直接采信为"没设置"，要交叉查系统层 `adb shell settings get
+system <key>`（本例是 ringtone/alarm_alert/notification_sound）：系统层也是空/null
+才认定"真实未设置"；系统层有值但 UI 空，说明抓取/渲染跟系统状态对不上，判失败。
+`flow_ring_set.sh` 的 `check_hub_field()` 是这套判断的参考实现。**教训**：任何
+"允许显示为空"的 UI 字段（列表默认值、可选设置项等），只要要靠这个空值做断言，
+都得留一手系统层或其它独立信源交叉核对，不能光凭 UI 抠出来的空字符串就下结论——
+空可能是真状态，也可能是没抓到。
+
+## 桌面壳「设备」tab 拔线后型号/系统列显示 `—`（2026-07-24）
+
+`list_devices`（`desktop/src-tauri/src/commands.rs`）里型号来自 `adb devices -l`
+这行本身，系统版本来自 `getprop ro.build.version.release`——都只有设备当前在线
+（`state == "device"`）才查得到。`config/device_aliases.json` 只存 序列号→别名，
+不存这两个字段，于是设备一拔线（`state = absent`），这两列直接吐空字符串，界面上
+就是图里那样"未连接 + 型号/系统全是 —"，哪怕这台设备之前刚查到过。
+
+**修法**：新增 `config/device_info_cache.json`（序列号→`{model, os_version}`，
+gitignore，纯本机缓存不是真值来源）。每次 `adb_devices()` 查到非空的
+model/os_version 就顺手写回缓存；构造 `absent` 行时从缓存兜底填充，查不到就还是
+`—`（比如从没连过、或者是纯手动登记的序列号）。这个缓存只影响显示，不影响
+`is_default`/别名/是否可设默认这些真正的状态判断。
+
+## 固化脚本 `taptext`/`tapdesc`/`waitfor text` 是语言相关的（2026-07-27）
+
+`tools/adbkit.py` 的选择器只有 `resource-id`/`text`/`content-desc` 三种，`tapid`
+用第一种跨语言稳定，但 `taptext`/`tapdesc`/`waitfor text` 用的后两种大多直接来自
+App 的 `strings.xml` 本地化文案——固化脚本写死了固化当时设备所处语言的文案，设备
+切到别的语言后这些步骤直接找不到匹配，报错文案是"界面可能已变"，但实际根因是
+语言变了，容易误判成 UI 结构性变更。统计 `apps/MP3Cutter/flows/*.sh` 现状：`tapid`
+161 处（语言无关）vs `taptext`23 + `tapdesc`11 + `waitfor text`69 处（语言相关，
+其中 `waitfor text` 占大头，因为很多步骤判定的本来就是"看到某句本地化成功提示"）。
+
+**修法**：新增 `tools/lang_table.py`（从多语言 `strings.xml` 翻译包或 apk 反编译产物
+建「资源key→各语言译文」映射表）+ `tools/lang_helper.sh`（固化脚本 source 用的 `t()`
+查表小工具，`LANG_CODE` 未设置时原样直通、零风险）。用法见 flow-freeze skill「多语言」
+一节。**残留限制**：只解决"文案对不对"，不解决"目标语言下控件是否因为文案变长/变短
+导致布局挪位、或触发额外的语言相关引导页"——这类仍要真机验证，查表验证不能替代。
+
+## zip 文件名非 UTF-8 编码（GBK）→ `unzip`/Python `zipfile` 默认按 cp437 解出乱码
+
+某些国内工具（如翻译导出工具）打包的 zip，文件名用 GBK 而非 UTF-8 编码；ZIP 格式
+标准早期没规定文件名编码，`unzip`/Python `zipfile.namelist()` 默认按 cp437 解码，
+中文文件名/目录名解出来是乱码（`µûçµíê...`），`unzip -l`/命令行解压对着乱码目录名
+操作会直接报 `Illegal byte sequence` 失败。**修法**：Python 里按
+`name.encode('cp437').decode('gbk')` 修正文件名后再落盘（`tools/lang_table.py` 的
+`_extract_zip_to_tmp` 就是这么处理的），比指望 `unzip -O GBK`（macOS 系统自带 unzip
+版本不一定支持这个参数）更可控。
+
+## 设备切非中文语言，MP3Cutter 卡在 Google UMP 隐私同意弹窗（2026-07-27）
+
+设备语言切成韩语后真机冒烟卡在首屏隐私同意弹窗（Google UMP 风格）动不了。一开始怀疑是
+CMP 表单本身没进无障碍树（WebView 插屏那类经典盲区，见上面"WebView 插屏是 `--assert-gone`
+的盲区"一条）——真机 dump 排查发现**不是**：弹窗内容正常进树，按钮节点是
+`<node text="" content-desc="Consent" class="android.widget.Button" bounds="[99,1696][981,1823]" />`
+（`text` 属性是空的，文案全在 `content-desc` 上）。真正卡住的原因是 `config/ad_rules.json`
+的 `consent-agree` 规则原来只精确匹配中文 `desc=同意`/`text=同意`——这个 CMP SDK 的语言包
+没覆盖韩语，`content-desc` 退化成**英文** "Consent"（不是韩语翻译），中/韩都对不上，
+`sweep` 找不到按钮，清障死循环。
+
+**教训**：① 这条属于 `config/ad_rules.json`（跨 App 共享的清障规则库）的语言相关性问题，
+跟某个具体 flow 脚本里 `taptext`/`tapdesc` 的语言相关性是**同一类根因、不同层**——测任何
+App，只要设备不是中文，大概率会在这同一个 CMP 弹窗上卡住，不是 MP3Cutter 专属。
+② 排查这类"卡住"先别急着归因成 WebView 盲区，dump 一次看看节点到底进没进树，两种原因
+表现都是"点不动"，但修法完全不同（前者要换成本用坐标/`--assert-text` 兜底思路，后者只是
+选择器语言没覆盖全）。
+
+**修法**：`consent-agree` 规则追加英文兜底（`desc=Consent`/`text=Consent`），跟原有中文
+匹配项并列，命中任意一个即可：
+
+```json
+{"by": "desc", "value": "同意"},
+{"by": "text", "value": "同意"},
+{"by": "desc", "value": "Consent"},
+{"by": "text", "value": "Consent"}
+```
+
+**残留限制**：只覆盖了"中文 / CMP 语言包没覆盖时的英文兜底"这两种，如果某语言 CMP 有
+自己的本地化译文（比如日语真翻成了日语而不是退化成英文），这条规则还是接不住，出现再
+按同样方法（真机 dump 读 `content-desc`）补一条。

@@ -144,7 +144,10 @@ def cmd_ui(args):
     主循环探路阶段的每次 dump 因此自动预热缓存，以后这条路径固化成脚本时可直接 --from-cache 复用，
     不用固化那天再冷启动一次。
     --field <resource-id后缀>（可重复）：按 ET 解析直接取该控件的 text 属性，打印成
-    `FIELD:<name>=<value>` 一行——供固化脚本拼断言用。2026-07-03 踩过坑：固化脚本原来是
+    `FIELD:<name>=<value>` 一行——供固化脚本拼断言用。控件没匹配到时 value 是哨兵值
+    `<NOTFOUND>`，跟"匹配到了但 text 是空字符串"区分开，避免下游把两种不同语义都读成
+    空值（2026-07-23 RING-SET-01 真机验证暴露：铃声字段显示为空时，分不清是"当前确实
+    没设置"还是"没抓到"，遂加这个哨兵值）。2026-07-03 踩过坑：固化脚本原来是
     整份 XML 走 bash 管道 grep/sed/iconv 抠字段，播放中重绘偶发导致产出的字节在某些环节
     (推测是 shell 文本处理链路)劣化成非法 UTF-8，传到下一个 python 进程的 argv 变成 lone
     surrogate，写 evidence.csv 时 UnicodeEncodeError 直接崩脚本。给 --field 用 ET.parse
@@ -154,6 +157,7 @@ def cmd_ui(args):
     out = evid_dir(case, "ui") / f"{step}.xml"
     fields = getattr(args, "fields", None)
     values = {}
+    found = {}
     # --field 时最多重 dump 3 次：偶发 UI 重绘中间态会让某个控件的 text 带 lone surrogate
     # （见 gotchas.md「选中音频进编辑器会自动播放…」），与其直接吃 _clean 兜底出来的 "??"
     # 占位断言，不如先重新 dump 一次，大概率下一帧画面已经稳定、能拿到真实值。
@@ -168,14 +172,18 @@ def cmd_ui(args):
             nodes = []
             print(f"[ui] XML 解析失败，--field 全部留空：{e}", file=sys.stderr)
         values = {}
+        found = {}
         for want in fields:
             val = ""
+            hit = False
             for n in nodes:
                 rid = n.get("resource-id", "")
                 if rid == want or rid.endswith("/" + want):
                     val = n.get("text", "")
+                    hit = True
                     break
             values[want] = val
+            found[want] = hit
         if not any(_is_dirty(v) for v in values.values()):
             break
         if attempt < attempts - 1:
@@ -184,7 +192,13 @@ def cmd_ui(args):
         shutil.copyfile(out, _cache_path(args.cache_screen or step))
     if fields:
         for want in fields:
-            print(f"FIELD:{want}={_clean(values.get(want, ''))}")
+            # 控件没匹配到（screen/id 抓错、时序太早控件还没渲染）跟"匹配到了但 text 本来
+            # 就是空字符串"是两种不同语义，不能都吐同一个空值——否则下游没法判断"真的没有
+            # 这个信息"还是"没抓到"。找不到就吐 <NOTFOUND> 哨兵值，固化脚本按需分别处理。
+            if found.get(want):
+                print(f"FIELD:{want}={_clean(values.get(want, ''))}")
+            else:
+                print(f"FIELD:{want}=<NOTFOUND>")
     else:
         # 同时打印到 stdout，方便大脑直接读控件树
         print(out.read_text(errors="replace") if out.exists() else "[ui] dump 失败")
@@ -709,9 +723,24 @@ def cmd_tapdesc(args):
 
 
 def cmd_text(args):
+    """`input text` 打字受设备当前输入法状态摆布：联想式 IME（拼音等）会把原始按键拦截改写成乱码
+    （见 docs/gotchas.md 2026-07-21）。这个状态没法在打字前用 adb 可靠探测——2026-07-27 真机实测过：
+    Gboard 不接入标准 subtype 框架（`settings get secure selected_input_method_subtype` 恒为 -1），
+    `dumpsys input_method` 也没有能读到"当前语言"的字段；唯一能看出当前是拼音还是英文的地方是
+    软键盘空格键上的文案（拼音/English），而 `uiautomator dump` 只抓 App 自己的窗口，键盘是独立
+    系统悬浮窗，压根不在树里、截图肉眼看之外没有别的路子。所以只能退而求其次，在打完之后校验
+    结果：原文本是否原样出现在当前 UI 树的某个控件上。默认不开（怕跟已固化脚本里各自的
+    读回重试逻辑打架，见 flow_cut_edge02.sh/flow_split_core01.sh 等），新写的、且没有自带读回校验
+    的输入步骤建议加 --assert-typed。"""
     # 空格需转义成 %s
     t = args.value.replace(" ", "%s")
     print(shell(f"input text {shlex.quote(t)}").stdout)
+    if args.assert_typed:
+        nodes = list(_dump_tree())
+        if not _present_any(nodes, args.value, partial=False):
+            sys.exit(f"[text] 打完之后界面上找不到原文 {args.value!r}，疑似被输入法联想/转写打乱"
+                      f"（常见于设备当前输入法语言不是英文，如 Gboard 切到拼音）。请弹出软键盘看"
+                      f"空格键文案确认，切回不带联想的纯英文键盘后重试。")
 
 
 def cmd_key(args):
@@ -978,7 +1007,7 @@ def cmd_output_check(args):
     抓不住"文件生成了但是空壳/损坏"这类静默失败（BUG-CUT-EDGE-01 就是这样：文件名、日期都正常，
     _size=0/duration=NULL）。确实需要断言"应该是空文件"的场景用 --allow-empty 跳过这层检查。
     --expect-duration-ms <N>：进一步跟另一个独立来源量到的时长（比如编辑器选区、结果页显示）做
-    交叉核对，|实际-预期|<=--tolerance-ms（默认1000ms，容忍编码取整误差）才算一致，结论直接写进
+    交叉核对，|实际-预期|<=--tolerance-ms（默认100ms，容忍编码取整误差）才算一致，结论直接写进
     这行证据的断言里——不然"完整性通过"这种话只证明"文件不是空壳"，证明不了"时长对不对"。
     --expect-format <格式名>：跟另存为弹窗里读到的格式（如 format_text="MP3"）交叉核对 mime_type，
     防止"保存框显示MP3，落盘却是别的格式"这类静默错位测不出来。
@@ -1170,7 +1199,10 @@ def build_parser():
     s.add_argument("--patience", type=int, default=2, help="连续几轮无命中即收工（默认2，界面已干净时快速退出）")
     s.add_argument("--dry-run", action="store_true", help="只报命中不真点，用于核对规则")
     s.set_defaults(fn=cmd_sweep)
-    s = sub.add_parser("text"); s.add_argument("value"); s.set_defaults(fn=cmd_text)
+    s = sub.add_parser("text"); s.add_argument("value")
+    s.add_argument("--assert-typed", action="store_true",
+                    help="打完后校验原文是否原样出现在当前 UI 树里，不是就报错阻断（防输入法联想乱码，见 cmd_text 注释）")
+    s.set_defaults(fn=cmd_text)
     s = sub.add_parser("key"); s.add_argument("code"); s.set_defaults(fn=cmd_key)
     s = sub.add_parser("swipe")
     for a in ("x1", "y1", "x2", "y2"):
@@ -1200,8 +1232,8 @@ def build_parser():
     s.add_argument("--expect-duration-ms", type=int, default=None, dest="expect_duration_ms",
                     help="预期时长(ms)，通常来自另一独立来源（如编辑器选区、结果页显示）算出来的值，"
                          "跟 MediaStore 实测 duration 交叉核对，结论写进这行证据的断言")
-    s.add_argument("--tolerance-ms", type=int, default=1000, dest="tolerance_ms",
-                    help="上面那项的容忍误差(ms)，默认1000（容忍编码取整误差）")
+    s.add_argument("--tolerance-ms", type=int, default=100, dest="tolerance_ms",
+                    help="上面那项的容忍误差(ms)，默认100（容忍编码取整误差）")
     s.add_argument("--expect-format", dest="expect_format", default=None,
                     help="预期格式(如 MP3/WAV/AAC，通常来自另存为弹窗 format_text)，跟 mime_type 交叉核对")
     s.add_argument("--ffprobe", action="store_true",

@@ -7,6 +7,7 @@ config/active.json
 # —— 都是具体业务/本机数据，不属于「框架 + 最小示例」，代码缺文件时兜底空
 config/text_resources.json
 config/device_aliases.json
+config/device_info_cache.json
 evidence/*/
 !evidence/.gitkeep
 .dumpcache/
@@ -39,6 +40,8 @@ apps/*/flows/*
 apps/.trash/
 # 留存的多版本 APK 本体（本机测试资产，体积大，不入库）
 apps/*/apks/
+# 该 App 的多语言文案表（tools/lang_table.py 从翻译包/apk 生成，含该 App 实际业务文案，不入库）
+apps/*/lang/
 
 # ── 桌面壳构建产物 ──
 desktop/node_modules/

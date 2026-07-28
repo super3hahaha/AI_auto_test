@@ -67,6 +67,50 @@ $AK tapid take_save --timeout 8 --from-cache editor       # 直接读缓存算�
 - **哪些屏不要缓存**：内容会变的屏（如「选择音频」列表具体显示哪些文件）不影响——因为缓存本来就是当次 dump 的原样内容，读缓存和重新 dump 看到的是同一份数据，不存在"缓存版本旧"的问题。真正不该用 `--from-cache` 复用的，是**两次操作之间屏幕已经跳转/弹窗了**的情况——这种直接现场 `waitfor`/`ui` 重新 dump，不要传上一屏的 `screen_id`。
 - **残余风险**：同版本号内 App 偷偷调整了布局（没 bump 版本号的小改动/AB 实验/远程配置下发），缓存坐标可能跟当下实际布局对不上。概率低，出问题时表现为"点击后校验不符"，走已有的"脚本断了→回主循环重探→更新脚本"路径处理，不是新风险类别。详见 `decisions.md` #9。
 
+## 多语言：`taptext`/`tapdesc`/`waitfor text` 是语言相关的，切设备语言会断
+
+`resource-id`（`tapid`/`waitfor id`）跨语言稳定，但 `text`/`content-desc` 大多来自 App 的
+`strings.xml` 本地化文案——固化脚本写死中文（或固化时设备所处的任何语言），设备切到别的语言后
+这些选择器/判定点直接找不到，报"没找到...界面可能已变"（其实是语言变了，不是 UI 结构变了，
+但表现上跟 UI 变更报错一样，容易误判）。
+
+**如果有该 App 的多语言 `strings.xml` 翻译包**（人工导出的翻译 zip，或用 `lang-string-compare`
+skill 的 `extract_apk_strings.py` 直接从 apk 反编译出的同构产物）——`tools/lang_table.py` 能
+建一张「资源 key → 各语言译文」映射表，固化脚本运行时按目标语言把写死文案换算一遍，不用重新
+探路/重新写死每种语言的文案：
+
+```bash
+# 1) 建表（App 出新版翻译包时重建一次即可）
+python3 tools/lang_table.py build "<翻译包目录或zip>" \
+    --out apps/<slug>/lang/strings_table.json --default-alias en
+
+# 2) 固化脚本里 source 小工具，把写死文案包一层 t()
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/lang_helper.sh"
+TABLE="apps/<slug>/lang/strings_table.json"
+$AK taptext "$(t 音频裁剪)" --timeout 8
+$AK waitfor text "$(t 选择音频)" --timeout 8 --cache picker
+
+# 3) 回归时按需切语言（不传 LANG_CODE 完全等价于原来的行为，零风险）
+LANG_CODE=ja bash apps/<slug>/flows/flow_cut_save.sh <serial>
+```
+
+- `t()` 找不到 `--from`（`SRC_LANG`，默认 `zh-rCN`）语言下这段文案对应的 key，会非0退出报错——
+  说明这段文案根本不是 `strings.xml` 里的（比如广告 SDK 的 `content-desc`），或者
+  `SRC_LANG`/固化时用的语言选错了，需要人工核实，**不做静默兜底**。
+- `--to` 语言译文缺失（翻译包本身没补全那条）→ 回退用原文 + stderr 警告，不中断整条脚本——
+  这种情况多半那一步在目标语言下还是会失败，跟"脚本断了→回主循环重探"走同一套处理路径。
+- **`tapid`/`waitfor id` 这些本来就不受语言影响的步骤不用包 `t()`**，只包那些非用文案/描述定位
+  或判定不可的步骤——能用 id 就优先用 id，这是从源头减少语言依赖面，比查表更稳。
+- 新语言第一次接入必须真机验证过（切换设备语言 → `run_flow.py` 跑一遍确认 exit=0），不能只
+  凭 `lang_table.py resolve` 命令行跑通就当作固化完成——查表只保证"文案对不对"，控件在目标
+  语言 UI 下的布局/是否弹出额外的语言相关引导页仍需真机确认。
+- **语言相关性不止在 flow 脚本自己的选择器里，`config/ad_rules.json`（`sweep` 清障用的跨 App
+  共享规则库）里精确匹配某种语言文案的规则同样会失效**——实测切到韩语后卡在 Google UMP 隐私
+  同意弹窗，根因是 `consent-agree` 规则原来只认中文"同意"，而该弹窗的 `content-desc` 在
+  CMP 语言包没覆盖的语言下会退化成英文而不是目标语言（详见 `docs/gotchas.md` 对应条目）。
+  新语言第一次真机验证时，如果卡在某个跟被测 App 业务逻辑无关的系统级弹窗（同意/权限/更新
+  提示），先怀疑是不是 `ad_rules.json` 哪条规则语言没覆盖全，而不是先怀疑 flow 脚本本身。
+
 ## 跑固化脚本要用 `tools/run_flow.py`，别直接 `bash apps/<slug>/flows/xxx.sh`
 
 固化脚本回归提速的价值点也带来一个副作用：跑得快、跑得勤，`log.csv` 里"这次执行耗时多少"
@@ -145,6 +189,13 @@ CUT-CORE-01/MIX-CORE-01/SPLIT-CORE-01 都有重命名收尾这一步，新模块
 ## 写脚本的纪律（照抄范例即可）
 
 1. 全程选择器（`tapid`/`taptext`/`tapdesc`），**禁止硬坐标**；无 id/text/desc 才 `tap X Y` 兜底。
+   **UI 操作（点击/滑动/等待/输入）一律走 `adbkit.py` 的 CLI 子命令，禁止在 flow 脚本里裸调
+   `adb shell input`/未来接入的其他自动化框架（如 Appium client）去操作 UI**——这样以后
+   adbkit 内部要换/加执行引擎（现有 `shell`/`u2` 两个 dump 后端就是先例），只需要改
+   `adbkit.py` 一处实现，已固化的脚本一行不用改，迁移成本不随脚本数量增长（见
+   `docs/handoff-appium-integration.md` §2.1）。素材准备类的非 UI 操作（如 `adb push`
+   素材文件、`adb shell am broadcast` 触发媒体扫描）不受此限，直接调 `adb` 没问题——这条
+   纪律只管"操作 UI 控件"这部分。
 2. 每次导航点击配 `--timeout 8` + 下一屏 `waitfor`，别无脑长重试（治瞬时慢，不治 UI 变更）。
 3. 按 `--serial $S` 参数化，证据落 `evidence/<date>/<case>/<serial>/`，多设备并行不撞。
 4. 关键节点 `shot` 存证；成功判定用 `waitfor <成功文案>` / `output-check`，失败分支也截图待查——

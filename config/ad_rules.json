@@ -75,7 +75,9 @@
       "action": "tap_matched",
       "match": [
         {"by": "desc", "value": "同意"},
-        {"by": "text", "value": "同意"}
+        {"by": "text", "value": "同意"},
+        {"by": "desc", "value": "Consent"},
+        {"by": "text", "value": "Consent"}
       ]
     },
     {

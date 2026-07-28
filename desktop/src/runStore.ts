@@ -5,6 +5,10 @@ import { reactive } from "vue";
 import { api } from "./api";
 import { store } from "./store";
 
+// 语言选择器的「自动」哨兵值：不是一个真的 LANG_CODE，选它表示「执行前逐台设备现查系统当前
+// 语言、换算成该 App 语言表里的代号再注入」，而不是场景库里固定选好的一个值。
+export const AUTO_LANG = "__auto__";
+
 export type CellStatus =
   | "waiting"      // 等待中
   | "running"      // 运行中
@@ -144,6 +148,7 @@ export const runStore = reactive({
     title: string;
     apkPath?: string; // 选了某个留存版本时，跑用例前先在每台设备上强制重装这个 apk
     package?: string;
+    langCode?: string; // 场景库显式选的目标语言代号（如 ko）；不传=不切语言，走脚本固化时的原文
   }) {
     if (this.running) return;
     this.running = true;
@@ -180,6 +185,35 @@ export const runStore = reactive({
     this.pushEvent(
       `共 ${this.cells.length} 格待执行（${opts.serials.length} 设备 × ${opts.cases.length} 用例）`
     );
+    if (opts.langCode === AUTO_LANG) {
+      this.pushEvent("语言：自动（执行前逐台现查设备当前系统语言并换算成 LANG_CODE，见下方逐设备日志）");
+    } else if (opts.langCode) {
+      this.pushEvent(`语言：LANG_CODE=${opts.langCode}（固化脚本已接入 t() 查表的断言会按此换算，未接入的仍走原文）`);
+    }
+    // 语言选「自动」时按设备现查+缓存（同一设备多条用例只查一次系统语言，不重复调 adb）；
+    // 非自动模式直接原样透传场景库选定的固定值（空串=不注入）。
+    const resolvedLangBySerial: Record<string, string | undefined> = {};
+    const resolveLangFor = async (serial: string): Promise<string | undefined> => {
+      if (opts.langCode !== AUTO_LANG) return opts.langCode || undefined;
+      if (serial in resolvedLangBySerial) return resolvedLangBySerial[serial];
+      try {
+        const r = await api.resolveDeviceLangCode(opts.slug, serial);
+        resolvedLangBySerial[serial] = r.code || undefined;
+        const rawLabel = r.raw || "（查不到）";
+        this.pushEvent(
+          r.code && !r.fallback
+            ? `🌐 ${serial} 当前系统语言 ${rawLabel} → 自动注入 LANG_CODE=${r.code}`
+            : r.code && r.fallback
+            ? `⚠ ${serial} 当前系统语言 ${rawLabel} 不在语言表支持范围内，回退默认 LANG_CODE=${r.code}`
+            : `⚠ ${serial} 当前系统语言 ${rawLabel} 在语言表里无对应词条（且该 App 语言表未含 en 兜底），本设备不注入 LANG_CODE（按脚本原文断言）`,
+          r.code && !r.fallback ? "info" : "error"
+        );
+      } catch (e: any) {
+        resolvedLangBySerial[serial] = undefined;
+        this.pushEvent(`⚠ ${serial} 自动探测系统语言失败：${e}，不注入 LANG_CODE`, "error");
+      }
+      return resolvedLangBySerial[serial];
+    };
 
     if (opts.newBoard) {
       // new_run.py 内部会重建 board/summary 看板（本轮范围取 target.json.scope）；
@@ -237,8 +271,9 @@ export const runStore = reactive({
         this.pushEvent(`▶ ${s} / ${c.case_id} 开始（${this.brain ? "auto_repair" : "run_flow"}）`);
         const t0 = Date.now();
         const runner = opts.brain ? api.runFlowRepair : api.runFlow;
+        const lc = await resolveLangFor(s);
         try {
-          const code = await runner(opts.slug, c.case_id, c.script, s, (l) => {
+          const code = await runner(opts.slug, c.case_id, c.script, s, lc, (l) => {
             cell.lines.push(l);
             this.pushEvent(`[${s}/${c.case_id}] ${l}`, /失败|异常|✖|error|Error/.test(l) ? "error" : "info");
           });

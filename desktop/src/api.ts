@@ -189,18 +189,27 @@ export const api = {
   // Claude CLI 安装/登录状态（「脚本自愈」功能依赖它）
   checkClaudeCli: () => invoke<ClaudeCliStatus>("check_claude_cli"),
 
-  // 流式：返回 promise（resolve 退出码）；onLine 收每行日志
-  runFlow(slug: string, caseId: string, script: string, serial: string, onLine: (line: string) => void) {
+  // 流式：返回 promise（resolve 退出码）；onLine 收每行日志。langCode 不传/空串=不注入
+  // LANG_CODE，固化脚本里的 t() 走原文直通（未接过语言机制的脚本行为不变）。
+  runFlow(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;
-    return invoke<number>("run_flow", { appSlug: slug, caseId, script, serial, onEvent: ch });
+    return invoke<number>("run_flow", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, onEvent: ch });
   },
   // 「脚本自愈」执行（失败自动交 claude 诊断+改脚本重跑，至多 3 次）
-  runFlowRepair(slug: string, caseId: string, script: string, serial: string, onLine: (line: string) => void) {
+  runFlowRepair(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;
-    return invoke<number>("run_flow_repair", { appSlug: slug, caseId, script, serial, onEvent: ch });
+    return invoke<number>("run_flow_repair", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, onEvent: ch });
   },
+  // 某 App 的多语言文案表覆盖了哪些语言代号（apps/<slug>/lang/strings_table.json）；
+  // 该 App 还没建过语言表则返回空数组，场景库据此隐藏语言选择器。
+  listLangLocales: (slug: string) => invoke<string[]>("list_lang_locales", { appSlug: slug }),
+  // 语言选「自动」时，执行前逐台设备现查一次系统当前语言并换算成表里的代号；raw=adb 读到的
+  // 原始值（查不到是空串），code=最终采用值（换算不出来或查不到设备语言时回退默认 en，表里得真有
+  // en 这个 key，否则仍是 null），fallback=code 是不是靠这条 en 兜底给出的（而非真匹配到设备语言）。
+  resolveDeviceLangCode: (slug: string, serial: string) =>
+    invoke<{ raw: string; code: string | null; fallback: boolean }>("resolve_device_lang_code", { appSlug: slug, serial }),
   // 中止当前正在跑的 run（kill 其进程组）；返回是否有任务被中止
   abortRun: () => invoke<boolean>("abort_run"),
   newRun(slug: string, onLine: (line: string) => void) {

@@ -20,11 +20,15 @@ AI_auto_test/
 │   ├── service_account.json  # Google 服务账号密钥，sheets_sync 用（gitignore）
 │   ├── oauth_client.json     # OAuth 桌面客户端密钥，doc_report 用（gitignore）
 │   ├── oauth_token*.json     # OAuth token 缓存（gitignore，自动生成）
-│   └── ad_rules.json         # 通用广告/弹窗清障规则库（adbkit sweep 用）
+│   ├── ad_rules.json         # 通用广告/弹窗清障规则库（adbkit sweep 用）
+│   ├── device_aliases.json   # 序列号→别名登记（桌面壳「设备」tab 维护，gitignore）
+│   └── device_info_cache.json # 序列号→{model,os_version} 缓存，设备拔线后兜底显示用（gitignore，见 gotchas.md）
 ├── apps/                # ★ 每个被测 App 一套独立工作区（per-app）
 │   └── <slug>/               # 如 MP3Cutter/
 │       ├── target.json       # 该 App 配置（package/serial/version/sheet_id/doc_id/run_id…；gitignore）
 │       ├── flows/            # 该 App 的固化回归脚本（flow_*.sh，绑定该 App UI）；见 skill flow-freeze
+│       ├── lang/              # 该 App 的多语言文案表（strings_table.json，tools/lang_table.py build 生成）
+│       │   └── strings_table.json  # {资源key: {locale: 译文}}，供固化脚本按语言查表换算选择器文案
 │       ├── cases/            # 该 App 用例定义（YAML）；_TEMPLATE.yaml 字段模板
 │       ├── apks/             # 留存的多版本 APK 本体（<version>.apk，gitignore）；上传时复制，执行前选版本强制重装
 │       └── ledger/           # 该 App 本机执行产物（gitignore）
@@ -43,6 +47,10 @@ AI_auto_test/
 │   ├── _appctx.py       # ★ 多 App 上下文：解析活跃 App → 各路径（所有工具都 import 它）
 │   ├── _probe_skip.py   # 临时探针：跳过/关闭按钮出没时 dump 树，看它进不进无障碍树/选择器是什么
 │   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/db/sp/seed/logscan/sweep...），唯一碰 adb 的地方
+│   ├── lang_table.py    # 多语言 strings.xml 资源包(目录/zip，来源可以是翻译导出包，也可以是 lang-string-compare
+│   │                    #   的 extract_apk_strings.py 从 apk 反编译出的同构产物) → apps/<slug>/lang/strings_table.json；
+│   │                    #   固化脚本靠 resolve 子命令按语言查表换算选择器文案，解语言切换后 taptext/tapdesc 失效的问题
+│   ├── lang_helper.sh   # 固化脚本 source 用的 t() 小工具：按 LANG_CODE/SRC_LANG 查 lang_table.py，未设置时原样直通
 │   ├── init_target.py   # 探测包名/版本/主Activity/db_name/debuggable → 写 target.json；--atx-init 装/验 u2 后端
 │   ├── preflight.py     # 开跑前只读自检：设备在线/App装没装/素材是否推到设备/当前看板（零副作用，见上一轮问答）
 │   ├── compile_cases.py # cases/*.yaml → ledger/queue.csv（幂等，保留运行时状态）
@@ -63,7 +71,7 @@ AI_auto_test/
 │   │   ├── Setup.vue          # 首屏：选活跃 App / 配置 target.json，配置完才进主界面
 │   │   ├── Overview.vue       # 总览面板（overview-panel-prd.md）
 │   │   ├── Devices.vue        # 设备列表/选设备
-│   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
+│   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
 │   │   ├── RunMonitor.vue     # Runner 内嵌的运行监控子组件（流式日志/状态，不单独作为 tab）；数据源可为实时 runStore 或传入的 source 快照（执行记录复用）
 │   │   ├── RunHistory.vue     # 「执行记录」子tab：列出保存的执行台快照(run_records/)、按 id 切换、用 RunMonitor 只读渲染（makeRecordSource 包快照）
 │   │   ├── Evidence.vue       # 证据查看器（截图/ui dump/日志），MVP-1 首个落地面；左栏按 设备(可收起)→用例→attempt 三层分组(不同设备跑的用例不同)，设备名走 read_device_aliases 映射
@@ -81,7 +89,9 @@ AI_auto_test/
     ├── todo.md          # 未完成事项/已知待办
     ├── assets/          # 文档配图（dataflow.png/svg），非测试素材
     ├── decisions.md     # 非显然的架构选择与原因
-    └── gotchas.md       # 已知坑
+    ├── gotchas.md       # 已知坑
+    ├── handoff-parallel-multidevice.md  # 多设备并行执行设计（评审定稿，未动工）
+    └── handoff-appium-integration.md    # 引入 Appium 与 adb 能力分层并存的评审（结论：不建议）
 ```
 
 ## 数据流（一条用例的生命周期）

@@ -3,7 +3,7 @@ import { ref, reactive, computed, onMounted, onActivated, watch } from "vue";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { api, type FlowRow, type DeviceRow, type ApkInfo, type ApkVersionInfo } from "../api";
 import { store } from "../store";
-import { runStore } from "../runStore";
+import { runStore, AUTO_LANG } from "../runStore";
 import RunMonitor from "./RunMonitor.vue";
 import RunHistory from "./RunHistory.vue";
 
@@ -20,6 +20,36 @@ watch(subTab, (v) => { if (v === "history") historyRef.value?.reload(); });
 // ── 中栏：当前 App 的用例/固化脚本 ──
 const flows = ref<FlowRow[]>([]);
 const pickedCases = ref<string[]>([]); // 勾选的固化用例 case_id
+
+// ── 左栏：语言选择（LANG_CODE，显式指定，不做设备语言自动探测——见 2026-07-27 讨论）──
+// 空串 = 不注入 LANG_CODE，固化脚本里的 t() 走原文直通，跟接入语言机制前完全一样。
+// 可选项来自该 App 的 apps/<slug>/lang/strings_table.json 实际覆盖的语言代号，没建过表的
+// App 这里是空列表，选择器隐藏（不强迫每个 App 都配语言）。
+const LANG_LABELS: Record<string, string> = {
+  "zh-rCN": "简体中文", "zh-rTW": "繁体中文", en: "英语", ja: "日语", ko: "韩语",
+  fr: "法语", de: "德语", es: "西班牙语", it: "意大利语", pt: "葡萄牙语", ru: "俄语",
+  ar: "阿拉伯语", th: "泰语", vi: "越南语", in: "印尼语", ms: "马来语", tr: "土耳其语",
+  nl: "荷兰语", pl: "波兰语", cs: "捷克语", ro: "罗马尼亚语", uk: "乌克兰语", fa: "波斯语",
+};
+function langLabel(code: string) {
+  if (code === AUTO_LANG) return "自动（跟随设备当前系统语言）";
+  return LANG_LABELS[code] ? `${LANG_LABELS[code]}（${code}）` : code;
+}
+const langLocales = ref<string[]>([]);
+const langCodeBySlug = reactive<Record<string, string>>({}); // slug -> 上次选的语言，切 App 记住各自的选择
+// 默认「自动」——没手动选过的 App 默认让每台设备执行前现查自己的系统语言，而不是默认不切换。
+// 用 ?? 而非 ||：用户显式选"跟随脚本原文"存的是 ""，是有意义的值，不能被默认值顶掉。
+const langCode = computed({
+  get: () => (store.activeSlug ? langCodeBySlug[store.activeSlug] ?? AUTO_LANG : AUTO_LANG),
+  set: (v: string) => { if (store.activeSlug) langCodeBySlug[store.activeSlug] = v; },
+});
+async function loadLangLocales() {
+  langLocales.value = store.activeSlug ? await api.listLangLocales(store.activeSlug) : [];
+  // 该 App 语言表里已不含之前选的那个显式代号（比如换了张新表）→ 清掉，别悄悄拿着失效值去跑；
+  // "自动"/"跟随脚本原文" 两个哨兵值不受此清理影响（它们本来就不是表里的语言代号）。
+  const v = langCode.value;
+  if (v && v !== AUTO_LANG && !langLocales.value.includes(v)) langCode.value = "";
+}
 // ── 右栏：设备 + 看板 + 执行 ──
 const devices = ref<DeviceRow[]>([]);
 const pickedSerials = ref<string[]>([]);
@@ -128,7 +158,7 @@ async function loadDevices() {
 async function loadAll() {
   err.value = "";
   try {
-    await Promise.all([loadFlows(), loadDevices()]);
+    await Promise.all([loadFlows(), loadDevices(), loadLangLocales()]);
   } catch (e: any) {
     err.value = String(e);
   }
@@ -168,9 +198,10 @@ function launch(newBoard: boolean) {
       serials: [...pickedSerials.value],
       brain: brainMode.value,
       newBoard,
-      title: `${slug} · ${cases.length} 用例 × ${pickedSerials.value.length} 设备${ver ? ` · ${ver}` : ""}`,
+      title: `${slug} · ${cases.length} 用例 × ${pickedSerials.value.length} 设备${ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
       apkPath: apkPath && pkg ? apkPath : undefined,
       package: apkPath && pkg ? pkg : undefined,
+      langCode: langCode.value || undefined,
     })
     .then(() => loadFlows()); // 跑完刷新用例列表拿最新 last_result
 }
@@ -362,6 +393,29 @@ onActivated(() => { if (!runStore.running) loadAll(); });
                   <span class="muted app-version-size">{{ fmtSize(v.size) }}</span>
                 </div>
               </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 语言选择（LANG_CODE）：只在该 App 已建过 apps/<slug>/lang/strings_table.json 时才出现，
+             没建表的 App 这里不显示，不强迫每个 App 都配语言。选中的语言透传给 run_flow/run_flow_repair
+             注入 LANG_CODE 环境变量，接入了 tools/lang_helper.sh 的固化脚本据此查表换算断言文案；
+             未接入的老脚本不受影响（跟没有这项选择之前行为一致）。-->
+        <div class="card langbox" v-if="langLocales.length">
+          <div class="col-hd"><span>语言</span></div>
+          <div class="col-body lang-body">
+            <select class="lang-select" v-model="langCode">
+              <option :value="AUTO_LANG">自动（跟随设备当前系统语言）</option>
+              <option value="">跟随脚本原文（不切换 LANG_CODE）</option>
+              <option v-for="code in langLocales" :key="code" :value="code">{{ langLabel(code) }}</option>
+            </select>
+            <div class="muted lang-hint" v-if="langCode === AUTO_LANG">
+              执行前逐台设备现查系统当前语言并换算成表里的代号再注入 LANG_CODE；某台设备的语言在
+              语言表里没有对应词条时，那台不注入、仍按脚本原文断言（其它设备不受影响）。
+            </div>
+            <div class="muted lang-hint" v-else>
+              执行时注入 LANG_CODE={{ langCode || "（不注入）" }}；只影响已接入
+              <span class="mono">tools/lang_helper.sh</span> 的固化脚本，未接入的仍按固化时的原文断言。
             </div>
           </div>
         </div>
@@ -565,6 +619,10 @@ h2 { margin: 0; font-weight: 500; }
 .col { display: flex; flex-direction: column; min-height: 0; }
 .app-col { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .applist { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.langbox { flex-shrink: 0; }
+.lang-body { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; }
+.lang-select { padding: 6px 8px; font-size: 13px; border-radius: var(--radius); border: 0.5px solid var(--border); background: var(--surface-1); color: var(--text-primary); }
+.lang-hint { font-size: 11px; line-height: 1.5; }
 .case-col { flex: 1; min-width: 0; }
 .dev-col { width: 260px; flex-shrink: 0; display: flex; flex-direction: column; gap: 12px; }
 .col-hd { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 0.5px solid var(--border); font-size: 13px; font-weight: 500; }

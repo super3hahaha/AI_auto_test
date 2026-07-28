@@ -21,6 +21,10 @@ set -e
 S="$1"
 AK="python3 tools/adbkit.py --serial $S"
 CASE="CUT-CORE-01"   # 纯用例ID；证据路径里的设备段由 adbkit 按 --serial 自动加，别把 serial 掺进 --case
+# 多语言查表：LANG_CODE=ko bash apps/MP3Cutter/flows/flow_cut_save.sh <serial> 即可换语言跑；
+# 不传 LANG_CODE 时 t() 原样返回原文，行为与接入前完全一致。见 tools/lang_helper.sh。
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/lang_helper.sh"
+TABLE="apps/MP3Cutter/lang/strings_table.json"
 PKG="ringtone.maker.mp3.cutter.audio"   # 前台归属判断用：被全屏插屏广告/误触 BACK 弹回桌面时，据此把 App 重新拉回前台
 SRC="assets/mp3-sample-track.mp3"
 DEV_DST="/sdcard/Music/mp3-sample-track.mp3"
@@ -62,8 +66,9 @@ $AK focus 2>/dev/null | grep -q "$PKG" || { log "App 不在前台，重新拉起
 # dump_hierarchy 能看到 WebView 覆盖层里的 `关闭` 节点，sweep 规则直接点得到，盲点兜底不再需要；
 # 而那 8 连点里 y=15/40 落在状态栏区、两列自上而下快速点会被系统当成「下拉」手势把通知栏拉出来
 # 盖住页面（还有 AD_W 取物理尺寸 1440 而非 override 1080 导致 x 越界的 bug）。详见 gotchas.md。
+CUT_ENTRY="$(t 音频裁剪 mp3_cutter)"   # resource-id=ll_cut 真机核对确认是 mp3_cutter 这个 key（非 audio_cutter，两者zh-rCN撞车）
 for _ in $(seq 1 15); do
-  $AK waitfor text 音频裁剪 --timeout 1 >/dev/null 2>&1 && break
+  $AK waitfor text "$CUT_ENTRY" --timeout 1 >/dev/null 2>&1 && break
   # App 被广告任务/残留状态弹回桌面时 focus 不含包名——重新拉回前台，别停在桌面空转
   $AK focus 2>/dev/null | grep -q "$PKG" || { log "广告页把 App 弹出，重新拉起"; $AK launch >/dev/null 2>&1; sleep 3; }
   sweep --rounds 5 --interval 1.2 --patience 2
@@ -77,8 +82,10 @@ done
 # --assert-gone 兜一发原生广告标志（WebView 创意不进树，对其为盲区，仅作 belt-and-suspenders）。
 # --assert-timeout 6 给首页控件慢一拍出现留余量。
 $AK --case "$CASE" shot 01-home "App 首页正常显示（隐私同意弹窗已关、无插屏广告遮挡）" \
-  --assert-text 音频裁剪 --assert-gone 测试广告 --assert-timeout 6 >/dev/null; log "首页(已门控)"
-$AK taptext 音频裁剪 --timeout 8 >/dev/null
+  --assert-text "$CUT_ENTRY" --assert-gone 测试广告 --assert-timeout 6 >/dev/null; log "首页(已门控)"
+# 测试广告(--assert-gone)不查表：这是 AdMob 插屏的固定占位文案，不是 app 自身 strings.xml
+# 资源、不随设备语言变化，仅作 belt-and-suspenders，见脚本头注。
+$AK taptext "$CUT_ENTRY" --timeout 8 >/dev/null
 # 点「音频裁剪」后依次弹：文件访问(App内btn) → 通知权限(系统) → 音频权限(系统)，
 # 清数据后每次都会重新出现；顺序/是否出现可能随系统版本变化。
 # 文件访问是 App 内自定义按钮(id=btn)，不在通用库里，单独点；命中就点，没有就跳过。
@@ -86,7 +93,7 @@ $AK tapid btn --timeout 6 >/dev/null 2>&1 || true
 # 通知/音频这两个系统权限弹窗改交给 sweep（perm-allow 规则覆盖 allow/allow_all/foreground 变体，
 # 顺序无关、有几个点几个），比原来固定点两次 permission_allow_button 更稳，还顺带兜这一步的广告。
 sweep --rounds 5 --interval 0.6 --patience 2
-$AK waitfor text 选择音频 --timeout 8 --cache picker >/dev/null
+$AK waitfor text "$(t 选择音频)" --timeout 8 --cache picker >/dev/null
 $AK --case "$CASE" shot 02-picker "进入「选择音频」列表" >/dev/null; log "选择音频"
 
 # 2026-07-17 改为搜索定位：点搜索图标 → 输入文件名 → 点结果，比在长列表里翻找/裸猜第一项更稳。
@@ -161,7 +168,7 @@ $AK tapid btn_convert --timeout 8 >/dev/null
 # 转换本身也要几秒，这里多轮清障（interval 1s 留给广告倒计时/跳过按钮延迟出现，最长约 10s）：
 # 有广告就等它出跳过按钮点掉，没广告则连续 patience 轮无命中很快退，不会白等满 10s。
 sweep --rounds 10 --interval 1 --patience 3
-if $AK waitfor text 音频已保存 --timeout 15 >/dev/null 2>&1; then
+if $AK waitfor text "$(t 音频已保存)" --timeout 15 >/dev/null 2>&1; then
   # 结果页同样不能只说"已生成"——读结果页 info 控件的"大小｜时长"文本存进断言；
   # 再跑一次 output-check 用编辑器选区算出的预期时长做交叉核对，MediaStore 那行的
   # 断言会带精确 _size/duration + 是否跟预期一致的结论，而不是"完整性通过"这种空话。

@@ -9,7 +9,7 @@ use tauri::ipc::Channel;
 const GITHUB_REPO: &str = "super3hahaha/AI_auto_test";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 // 打包产物 .app 的名字跟随 tauri.conf.json 的 productName，装机路径固定在 /Applications 下
-const APP_NAME: &str = "AI 测试台";
+const APP_NAME: &str = "AI-Auto-Test";
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct UpdateInfo {

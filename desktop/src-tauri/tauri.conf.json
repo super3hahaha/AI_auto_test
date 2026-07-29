@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AI 测试台",
+  "productName": "AI-Auto-Test",
   "version": "1.0.0",
   "identifier": "com.aiautotest.desktop",
   "build": {

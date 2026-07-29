@@ -2,7 +2,7 @@
 """case_result —— 一条用例收工回写（队列 + 状态日志 + 证据链）。
 
 用法：
-  python3 tools/case_result.py <用例ID> <结果> <证据目录> "<一句话结论>" [--evi "步骤|类型|文件路径|断言|结果|关键标记" ...]
+  python3 tools/case_result.py <用例ID> <结果> <证据目录> "<一句话结论>" --serial <设备序列号> [--evi "步骤|类型|文件路径|断言|结果|关键标记" ...]
 结果 ∈ 通过/失败/阻塞/覆盖缺口/需复核。
 每条 --evi 必须自带"文件路径"字段，指向具体文件（screenshots/xxx.png、logs/xxx.txt、ui/xxx.xml），
 不能留空或写目录——否则人工核查时无法定位到证据实体。找不到具体文件就写"证据文件缺失"，别拿证据目录充数。
@@ -22,15 +22,17 @@ LOG = LEDGER / "log.csv"
 EVID = LEDGER / "evidence.csv"
 
 
-def detect_coverage():
+def detect_coverage(serial):
     """现查设备当前实际版本 + 是否 debuggable，拼出「历史覆盖情况」文案。
     不写死版本号——设备装的包随时可能换（release/debug 互换、升级/降级），
-    每次收工都应该反映"这次真的测的是什么"，而不是某次配置时的快照。"""
+    每次收工都应该反映"这次真的测的是什么"，而不是某次配置时的快照。
+    查的必须是本次判定对应的那台设备（serial 参数），不能退回 config 的默认设备——
+    多设备矩阵下否则会查错设备，版本/debuggable 文案跟实际执行的那台对不上。"""
     cfg = _load_cfg()
     pkg = cfg.get("package", "")
     if not pkg:
         return "未知（config 缺 package）"
-    base = ["adb"] + (["-s", cfg["serial"]] if cfg.get("serial") else [])
+    base = ["adb"] + (["-s", serial] if serial else [])
     ver = cfg.get("app_version", "")
     if not ver:
         r = subprocess.run(base + ["shell", "dumpsys", "package", pkg], capture_output=True, text=True)
@@ -54,12 +56,11 @@ def main():
                     help="证据行: 步骤|类型|文件路径|断言|结果|关键标记（关键标记：关键，供报告用 / 过程留痕，仅本地）")
     ap.add_argument("--coverage", default=None,
                     help="覆盖「历史覆盖情况」文案；不传则现查设备版本+debuggable 自动生成")
-    ap.add_argument("--serial", default=None,
-                    help="本次判定对应的执行设备；不传则读 target.json 的 serial。多设备矩阵下"
-                         "必传，判定才能落到 executions.csv 正确的 (用例, 设备) 行")
+    ap.add_argument("--serial", required=True,
+                    help="本次判定对应的执行设备，判定才能落到 executions.csv 正确的 (用例, 设备) 行")
     a = ap.parse_args()
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    serial = a.serial or _load_cfg().get("serial") or ""
+    serial = a.serial
 
     # 判定先落 executions（逐台真值），queue 的「当前状态/执行结果」再由聚合规则回写——
     # 矩阵跑「3 台 2 通过 1 失败」时 queue 概览显示「失败」，逐台明细看 executions/流水 tab 设备列。
@@ -69,7 +70,7 @@ def main():
 
     # 覆盖情况文案在拿锁前算好——detect_coverage 要调 adb（秒级），不能拿着账本锁等设备响应，
     # 否则并行跑的其它设备的毫秒级账本写全被堵住
-    coverage = a.coverage if a.coverage is not None else detect_coverage()
+    coverage = a.coverage if a.coverage is not None else detect_coverage(serial)
     with ledger_lock():
         q = list(csv.reader(open(Q, encoding="utf-8"))); h = q[0]
         ix = {c: h.index(c) for c in ["用例ID", "当前状态", "执行结果", "证据链接",

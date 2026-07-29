@@ -16,8 +16,8 @@
 每次重跑仍经 run_flow.py → 账本照常配对记时,不漏记(见 memory: 每次执行都要登记)。
 
 用法:
-  python3 tools/auto_repair.py <用例ID> <flow脚本路径> [<serial>]
-  (桌面壳 spawn 时设 AITEST_APP=<slug>;serial 不传则读活跃 App 的 target.json)
+  python3 tools/auto_repair.py <用例ID> <flow脚本路径> <serial>
+  (桌面壳 spawn 时设 AITEST_APP=<slug>;serial 必传,多设备并行下没有"默认设备"可退回)
 
 退出码:0=最终通过;2=判定App缺陷已停;3=判定脚本脆但claude未产生改动;
         4=claude无法判定/调用失败;5=自愈3次仍未通过;>0 其余为 run_flow 透传。
@@ -190,13 +190,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("case")
     ap.add_argument("script")
-    ap.add_argument("serial", nargs="?", default=None)
+    ap.add_argument("serial")
     a = ap.parse_args()
 
     cfg = load_cfg()
-    serial = a.serial or cfg.get("serial")
-    if not serial:
-        sys.exit("没有 serial:传参数或在 target.json 里配 serial")
+    serial = a.serial
     script_abs = REPO / a.script
     if not script_abs.exists():
         sys.exit(f"固化脚本不存在:{script_abs}")

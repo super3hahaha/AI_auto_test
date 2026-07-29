@@ -30,6 +30,10 @@ use tauri::{AppHandle, Manager};
 pub struct AppConfig {
     pub project_root: String,
     pub python: String,
+    // headless 调 claude CLI 用的模型（「脚本自愈」run_flow_repair + 收尾「问题登记」register_issue
+    // 共用同一个设置项）；""=跟随 claude CLI 自身默认，见 tools/auto_repair.py 的 AUTO_REPAIR_MODEL
+    // 与 tools/issue_register.py 的 ISSUE_REGISTER_MODEL。
+    pub claude_model: String,
     pub configured: bool, // 项目根是否已确认（含 config/target.example.json + tools/adbkit.py 的合法目录）
 }
 
@@ -65,6 +69,8 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
     let f = app_cfg_file(app);
     let mut root = String::new();
     let mut python = String::from("python3");
+    // 键缺失（老配置/从没存过）才落这个默认值；键存在且为 ""（用户显式选"跟随 CLI 默认"）要保留空串。
+    let mut claude_model = String::from("claude-sonnet-5");
     if let Ok(txt) = fs::read_to_string(&f) {
         if let Ok(v) = serde_json::from_str::<Value>(&txt) {
             root = v.get("project_root").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -72,6 +78,9 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
                 if !p.is_empty() {
                     python = p.to_string();
                 }
+            }
+            if let Some(m) = v.get("claude_model").and_then(|x| x.as_str()) {
+                claude_model = m.to_string();
             }
         }
     }
@@ -82,7 +91,7 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
         }
     }
     let configured = !root.is_empty() && is_project_root(Path::new(&root));
-    AppConfig { project_root: root, python, configured }
+    AppConfig { project_root: root, python, claude_model, configured }
 }
 
 #[tauri::command]
@@ -91,16 +100,24 @@ pub fn get_app_config(app: AppHandle) -> AppConfig {
 }
 
 #[tauri::command]
-pub fn set_app_config(app: AppHandle, project_root: String, python: String) -> Result<AppConfig, String> {
+pub fn set_app_config(
+    app: AppHandle,
+    project_root: String,
+    python: String,
+    claude_model: Option<String>,
+) -> Result<AppConfig, String> {
     let p = Path::new(&project_root);
     if !is_project_root(p) {
         return Err(format!(
             "该目录不像 AI_auto_test 项目根（缺 config/target.example.json 或 tools/adbkit.py）：{project_root}"
         ));
     }
+    // 不传 claude_model（旧调用点/仅改 root+python）时沿用已存的值，不覆盖成默认。
+    let model = claude_model.unwrap_or_else(|| load_app_config(&app).claude_model);
     let body = serde_json::json!({
         "project_root": project_root,
         "python": if python.is_empty() { "python3".into() } else { python },
+        "claude_model": model,
     });
     let f = app_cfg_file(&app);
     fs::write(&f, serde_json::to_string_pretty(&body).unwrap()).map_err(|e| e.to_string())?;
@@ -477,12 +494,16 @@ pub fn read_evidence(app: AppHandle, app_slug: String, run_id: String) -> Result
     Ok(out)
 }
 
-/// 读文本类证据（logs/ui/output-check）内容，前端内联展示。路径相对仓库根，与 App 无关。
+/// 读文本类证据（logs/ui/output-check/run-log）内容，前端内联展示。路径相对仓库根，与 App 无关。
+/// 必须按字节读 + lossy 解码，不能用 read_to_string：固化脚本流程日志（99-run-log）是原样落盘的
+/// 脚本输出，而 flow 在 LC_ALL=C 下跑 /bin/bash 3.2 时偶发会搅出坏字节（见 gotchas.md 的多字节 bug），
+/// read_to_string 会整条报 "stream did not contain valid UTF-8"、证据面板一个字都看不到。
 #[tauri::command]
 pub fn read_text_file(app: AppHandle, rel_path: String) -> Result<String, String> {
     let root = root_of(&app)?;
     let p = root.join(&rel_path);
-    fs::read_to_string(&p).map_err(|e| format!("读不到 {}: {e}", p.display()))
+    let bytes = fs::read(&p).map_err(|e| format!("读不到 {}: {e}", p.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -586,7 +607,6 @@ pub struct DeviceRow {
     pub state: String, // device/offline/unauthorized（adb 原值）或 absent（登记过但当前未插上）
     pub model: String,
     pub alias: String,
-    pub is_default: bool,
     pub os_version: String, // 安卓版本号，仅在线设备才查（getprop ro.build.version.release）
 }
 
@@ -649,7 +669,6 @@ fn getprop(serial: &str, prop: &str) -> String {
 
 fn adb_devices(
     root: &Path,
-    default_serial: &str,
     aliases: &HashMap<String, String>,
 ) -> Result<Vec<DeviceRow>, String> {
     let out = Command::new("adb").args(["devices", "-l"]).output();
@@ -695,7 +714,6 @@ fn adb_devices(
             cache_dirty = true;
         }
         devices.push(DeviceRow {
-            is_default: !default_serial.is_empty() && serial == default_serial,
             serial,
             state,
             model,
@@ -712,7 +730,6 @@ fn adb_devices(
         }
         let cached = cache.get(serial).cloned().unwrap_or_default();
         devices.push(DeviceRow {
-            is_default: !default_serial.is_empty() && serial == default_serial,
             serial: serial.clone(),
             state: "absent".to_string(),
             model: cached.model,
@@ -727,12 +744,10 @@ fn adb_devices(
 }
 
 #[tauri::command]
-pub fn list_devices(app: AppHandle, app_slug: String) -> Result<Vec<DeviceRow>, String> {
+pub fn list_devices(app: AppHandle, _app_slug: String) -> Result<Vec<DeviceRow>, String> {
     let root = root_of(&app)?;
-    let cfg = read_target(&root, &app_slug);
-    let default_serial = cfg.get("serial").and_then(|x| x.as_str()).unwrap_or("").to_string();
     let aliases = device_aliases(&root);
-    adb_devices(&root, &default_serial, &aliases)
+    adb_devices(&root, &aliases)
 }
 
 /// 读取序列号→别名映射本身（不走 adb，纯读 config/device_aliases.json）。
@@ -743,6 +758,18 @@ pub fn read_device_aliases(app: AppHandle) -> Result<Vec<KV>, String> {
     Ok(device_aliases(&root)
         .into_iter()
         .map(|(key, value)| KV { key, value })
+        .collect())
+}
+
+/// 读取序列号/ip:port → 型号缓存（不走 adb，纯读 config/device_info_cache.json）。
+/// 证据查看器等场景没有别名登记时，用型号兜底显示，避免无线设备直接露出 ip:port。
+#[tauri::command]
+pub fn read_device_model_cache(app: AppHandle) -> Result<Vec<KV>, String> {
+    let root = root_of(&app)?;
+    Ok(device_info_cache(&root)
+        .into_iter()
+        .filter(|(_, v)| !v.model.is_empty())
+        .map(|(key, v)| KV { key, value: v.model })
         .collect())
 }
 
@@ -930,19 +957,6 @@ pub fn delete_text_resource(app: AppHandle, key: String) -> Result<(), String> {
     let mut list = read_text_resources(&root);
     list.retain(|r| r.key != key);
     write_text_resources(&root, &list)
-}
-
-/// 设目标设备：写回 apps/<slug>/target.json 的 serial（app 允许写 config 的少数几处之一）
-#[tauri::command]
-pub fn set_target_serial(app: AppHandle, app_slug: String, serial: String) -> Result<(), String> {
-    let root = root_of(&app)?;
-    let p = app_root(&root, &app_slug).join("target.json");
-    let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
-    v["serial"] = Value::String(serial);
-    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
-        .map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// 设本轮范围：写回 apps/<slug>/target.json 的 scope（逗号拼接的用例ID）。
@@ -1343,6 +1357,9 @@ pub async fn run_flow_repair(
             args.push(serial);
         }
         let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        // 设置页选的自愈模型：auto_repair.py 用 os.environ.get("AUTO_REPAIR_MODEL", "claude-sonnet-5")，
+        // 这里显式设置（哪怕是空串="跟随 CLI 默认"）会覆盖它自己的默认值，见该文件顶部注释。
+        cmd.env("AUTO_REPAIR_MODEL", &cfg.claude_model);
         // auto_repair.py 转手调 run_flow.py 时 env=os.environ.copy()，同样会把这里注入的
         // LANG_CODE 一路透传下去，见 run_flow 里的注释。
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
@@ -1553,7 +1570,10 @@ pub async fn register_issue(
         }
         args.push("--status".to_string());
         args.push(status);
-        let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        // 与 run_flow_repair 同一个设置项：issue_register.py 用 ISSUE_REGISTER_MODEL 环境变量
+        // （默认 os.environ.get(..., "claude-sonnet-5")），显式设置（含空串）会覆盖其自身默认值。
+        cmd.env("ISSUE_REGISTER_MODEL", &cfg.claude_model);
         stream_child(cmd, on_event, None)
     })
     .await

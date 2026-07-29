@@ -22,8 +22,8 @@ headless claude 五选一(PASS/FAIL/BLOCKED/GAP/UNCERTAIN)」反而引入了新�
 docs/decisions.md #33 关于「失败判定」开关的追加条目）。
 
 用法：
-  python3 tools/judge_result.py <用例ID> [<serial>] --status pass|healed|fail|app_defect|needs_human
-  (桌面壳 spawn 时设 AITEST_APP=<slug>；serial 不传则读活跃 App 的 target.json)
+  python3 tools/judge_result.py <用例ID> <serial> --status pass|healed|fail|app_defect|needs_human
+  (桌面壳 spawn 时设 AITEST_APP=<slug>；serial 必传，多设备并行下没有"默认设备"可退回)
 
 退出码：透传 case_result.py 的退出码（0=已落库）。
 不含 compile/sync/doc —— 桌面壳跑完全部用例后统一收尾刷新。
@@ -53,15 +53,13 @@ NOTE_MAP = {
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("case")
-    ap.add_argument("serial", nargs="?", default=None)
+    ap.add_argument("serial")
     ap.add_argument("--status", required=True, choices=list(RESULT_MAP),
                     help="桌面壳 runStore.ts 算出的 CellStatus 终态")
     a = ap.parse_args()
 
     cfg = load_cfg()
-    serial = a.serial or cfg.get("serial")
-    if not serial:
-        sys.exit("没有 serial：传参数或在 target.json 配 serial")
+    serial = a.serial
 
     base, attempt_dir = newest_attempt_dir(cfg, a.case, serial)
     evidence_dir = attempt_dir or base
@@ -71,7 +69,7 @@ def main():
     note = NOTE_MAP[a.status]
     r = subprocess.run(
         # --serial 必传：多设备并行下判定要落到 executions.csv 的 (用例, 本设备) 行，
-        # 不传会退回 target.json 的默认 serial，矩阵跑时判定会串台
+        # 没有"默认设备"可退回，串台了就没法归因到具体哪台
         [sys.executable, "tools/case_result.py", a.case, result_cn, evidence_rel, note,
          "--serial", serial],
         cwd=str(REPO),

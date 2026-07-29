@@ -208,6 +208,14 @@ CUT-CORE-01/MIX-CORE-01/SPLIT-CORE-01 都有重命名收尾这一步，新模块
    素材文件、`adb shell am broadcast` 触发媒体扫描）不受此限，直接调 `adb` 没问题——这条
    纪律只管"操作 UI 控件"这部分。
 2. 每次导航点击配 `--timeout 8` + 下一屏 `waitfor`，别无脑长重试（治瞬时慢，不治 UI 变更）。
+   **要拿控件几何自己算坐标时（canvas 自绘、无 resource-id 的波形/自绘进度条那类），用
+   `adbkit.py bounds <by> <值> [--child N] [--from-cache <step>]` 取 `BOUNDS/CENTER/SIZE/
+   PARENT_BOUNDS`，禁止在 bash 里 `grep`/`sed` 抠 `ui` 吐出来的 XML**——两个 dump 后端排版
+   不同（u2 缩进多行 / shell 整份单行），按行 grep 的写法换个后端就会抠到别的节点的 bounds，
+   坐标点飞了还长得像 App 的 bug（2026-07-29 SPLIT-CORE-02 真机踩过，见 `docs/gotchas.md`）。
+   算完坐标**再做一次几何自检**（bounds 非退化 + 落在父容器内 + 点击点落在目标控件内），
+   不成立就 `FAILED=1` 并把该步 `--result 失败`，别指望下游的数值反推替你发现坐标算错——
+   那会把脚本自身的缺陷报成 App 缺陷。
 3. 按 `--serial $S` 参数化，证据落 `evidence/<date>/<case>/<serial>/`，多设备并行不撞。
 4. 关键节点 `shot` 存证；成功判定用 `waitfor <成功文案>` / `output-check`，失败分支也截图待查——
    失败判定标准（`FAILED` 标记 + exit 码绑定，不豁免已知缺陷）见下方专门章节，**必须照此实现**。
@@ -239,6 +247,21 @@ CUT-CORE-01/MIX-CORE-01/SPLIT-CORE-01 都有重命名收尾这一步，新模块
    重命名的那个），必然误判。**改法**：一次 `output-check --n <够用的数量> --allow-empty`
    拉出多条记录，脚本自己按文件名精确 `grep` 出对应行分别核对 `_size`/`duration`，不依赖
    "最新"语义——`flow_split_core01.sh` 的 `validate_row` 函数是范例，可直接照抄。
+
+10. **判定点不能是"不再操作一次就永远不会出现的元素"，某一步找不到控件时先 `focus` 再怀疑 id**
+    （2026-07-29 `RING-LIB-01` 连吃两个，详见 `docs/gotchas.md` 同日两条）：
+    - 被动 `waitfor <成功标志>` 型判定点，如果**自固化以来一次都没成功过**，第一嫌疑是判定点选错/
+      漏了一步操作（该用例是"下载完成后行内不自动展开，得再点一次 `btn_arrow`"），不是被测功能坏了。
+      别先加 timeout / 加 sweep 轮次——先抓一份当前屏 dump 跟操作前那份**按 resource-id 计数做差**，
+      看清这一步到底把界面变成了什么，再决定是"等"还是"点"。
+    - 状态判据优先选**状态迁移类控件**（`iv_download` → `iv_favorite`），别拿**动作控件**
+      （展开箭头）当"完成"的判据——动作控件可能在进行中就渲染出来了。
+    - 点进二级页可能弹插屏广告，而清障的终极兜底是无条件 `KEYCODE_BACK`（`scope=AdActivity` 只保证
+      按键前是广告页，dump 那 2s 里广告自己关掉，BACK 就落到 App 页面上，能一路把 App 退到桌面）。
+      这类步骤别裸 `waitfor`，照抄 `flow_ring_lib.sh` 的 `enter_album()`：**显式 sweep → 查 `focus`
+      是否还在包内（不在就 `launch` 重进）→ `waitfor` 长一点 → 还没进就回上一页重点一次**，最多 3 轮。
+    - 提前退出的失败分支也要走统一收尾（`flow_ring_lib.sh` 抽了个 `finish()`：logscan + 按 `FAILED`
+      定 exit 码），别在早退分支里裸 `exit 1` 把崩溃扫描跳过去。
 
 ## 失败判定标准（硬规则，2026-07-22 起）
 
@@ -279,4 +302,12 @@ duration 不符）用 `|| true` 吞掉 output-check 的非0退出码，只 log �
    裸调用（不在 `if`/`&&`/`||` 里）会被直接杀脚本、跳过后续证据收集——调用处记得配 `|| true`，
    判定完全交给校验函数写的局部结果变量 + 全局 `FAILED`，不依赖函数的 shell 退出码。
 
-背景决策详情见 `docs/decisions.md` #33、#34。
+6. **`log` 的文案会进证据，按"给未来复盘的人看"来写**（2026-07-29 起）。`run_flow.py` 把脚本
+   整份输出 tee 成本次 attempt 的 `logs/99-run-log.txt` 并登记成一条证据行，其中命中
+   `严重异常|校验未通过|不一致|✖|未见|异常退出|命中崩溃|FAILED=[1-9]` 的行会被摘进该证据的
+   「断言」列、并在桌面壳证据面板标红定位（见 `docs/decisions.md` #41）。所以校验点失败时
+   `log` 那一行要**直接说清根因**（"什么值 ≠ 什么预期，为什么，跳过了哪一步"），别写成
+   "校验失败，见上"——那句话就是复盘时能看到的全部。这些关键词是前后端共用的口径，写失败
+   文案时用上其中一个（惯例是「严重异常：」开头写根因、`✖` 开头写单点校验不通过）。
+
+背景决策详情见 `docs/decisions.md` #33、#34、#41。

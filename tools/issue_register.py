@@ -23,8 +23,8 @@ claude 读本次证据、把一条结构化问题写进 issues.csv。
 再次触发。UNCERTAIN/超时/claude 不可用记「[未完成]」，不算终审，允许之后重试同一 attempt。
 
 用法：
-  python3 tools/issue_register.py <用例ID> [<serial>] --status fail|app_defect|needs_human
-  （桌面壳 spawn 时设 AITEST_APP=<slug>；serial 不传则读活跃 App 的 target.json）
+  python3 tools/issue_register.py <用例ID> <serial> --status fail|app_defect|needs_human
+  （桌面壳 spawn 时设 AITEST_APP=<slug>；serial 必传，多设备并行下没有"默认设备"可退回）
 退出码：0=已登记 / 已跳过（去重命中）/ 判无需登记；2=UNCERTAIN 或需人工；4=claude 不可用/调用失败；
         3=claude 声称已登记但 issues.csv 无实际改动。
 """
@@ -214,14 +214,12 @@ def diag_oneline(text):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("case")
-    ap.add_argument("serial", nargs="?", default=None)
+    ap.add_argument("serial")
     ap.add_argument("--status", required=True, choices=list(PREFIX))
     a = ap.parse_args()
 
     cfg = load_cfg()
-    serial = a.serial or cfg.get("serial")
-    if not serial:
-        sys.exit("没有 serial：传参数或在 target.json 配 serial")
+    serial = a.serial
 
     prefix, prefix_why = PREFIX[a.status]
     base, attempt_dir = newest_attempt_dir(cfg, a.case, serial)

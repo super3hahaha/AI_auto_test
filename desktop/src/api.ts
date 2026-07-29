@@ -7,6 +7,7 @@ import type { RunRecord, RunRecordMeta } from "./runStore";
 export interface AppConfig {
   project_root: string;
   python: string;
+  claude_model: string; // "脚本自愈"调 claude 用的模型；"" = 跟随 claude CLI 自身默认
   configured: boolean;
 }
 export interface AppInfo {
@@ -73,7 +74,6 @@ export interface DeviceRow {
   state: string;
   model: string;
   alias: string;
-  is_default: boolean;
   os_version: string;
 }
 export interface KV {
@@ -135,8 +135,8 @@ export interface ClaudeCliStatus {
 export const api = {
   // app 自身配置（项目根 + python）——与被测 App 无关
   getAppConfig: () => invoke<AppConfig>("get_app_config"),
-  setAppConfig: (project_root: string, python: string) =>
-    invoke<AppConfig>("set_app_config", { projectRoot: project_root, python }),
+  setAppConfig: (project_root: string, python: string, claude_model?: string) =>
+    invoke<AppConfig>("set_app_config", { projectRoot: project_root, python, claudeModel: claude_model }),
 
   // App 注册表 / 活跃 App
   listApps: () => invoke<AppInfo[]>("list_apps"),
@@ -155,8 +155,9 @@ export const api = {
   listDevices: (slug: string) => invoke<DeviceRow[]>("list_devices", { appSlug: slug }),
   // 序列号→别名映射（纯读 config/device_aliases.json，不依赖设备在线）；证据按设备分组显示友好名用
   readDeviceAliases: () => invoke<KV[]>("read_device_aliases"),
-  setTargetSerial: (slug: string, serial: string) =>
-    invoke<void>("set_target_serial", { appSlug: slug, serial }),
+  // 序列号/ip:port→型号缓存（纯读 config/device_info_cache.json）；没有别名登记时兜底显示型号，
+  // 避免无线设备（serial 形如 192.168.x.x:5555）直接露出 ip:port
+  readDeviceModelCache: () => invoke<KV[]>("read_device_model_cache"),
   setTargetScope: (slug: string, scope: string) =>
     invoke<void>("set_target_scope", { appSlug: slug, scope }),
   setTargetDumpBackend: (slug: string, dumpBackend: string) =>

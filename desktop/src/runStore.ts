@@ -69,6 +69,8 @@ export interface RunRecord {
   meta: RunRecordMeta;
   cells: RunCell[];  // 终态快照（recording 恒 false）
   events: RunEvent[];
+  caseOrder?: string[]; // 列顺序＝用例库（queue.csv）原始顺序，见 caseIds() 用法说明；
+                        // 早于这个字段加入前存的旧记录没有，读取端要有兜底
 }
 
 // RunMonitor 的数据源抽象：既能是实时 runStore，也能是一份只读快照（见 makeRecordSource）。
@@ -119,6 +121,9 @@ export const runStore = reactive({
   brain: false,
   startedAt: 0,
   cells: [] as RunCell[],
+  caseOrder: [] as string[], // 执行台列顺序＝用例库（queue.csv）原始顺序；start() 时定住，
+                             // 不能从 cells 数组反推（显式分派下各设备拿到的子集不同，反推顺序
+                             // 会被"哪台设备先在 cells 里出现某用例"带偏，见 caseIds()）
   events: [] as RunEvent[],
   selectedKey: "" as string, // 选中的格子 key（serial|caseId）；空=看全部事件
   issueTotal: 0, // 本轮登记问题清单的固定分母（开始登记时定住，串行处理不再跟着涨）
@@ -141,7 +146,7 @@ export const runStore = reactive({
     return [...new Set(this.cells.map((c) => c.serial))];
   },
   caseIds(): string[] {
-    return [...new Set(this.cells.map((c) => c.caseId))];
+    return this.caseOrder;
   },
   doneCount(): number {
     return this.cells.filter((c) => c.status !== "waiting" && c.status !== "running" && !c.recording).length;
@@ -196,6 +201,13 @@ export const runStore = reactive({
           issueSkip: false,
         });
       }
+    }
+    // 列顺序＝用例库（queue.csv）原始顺序，即 opts.cases 本身的顺序（Runner.vue 按 frozen 顺序
+    // 过滤出来的）；只保留这轮真正分到格子的用例，不能直接用 opts.cases 全量（显式分派下有些
+    // 用例可能被整行取消，勾选了但没落任何设备）。
+    {
+      const assignedCaseIds = new Set(this.cells.map((c) => c.caseId));
+      this.caseOrder = opts.cases.map((c) => c.case_id).filter((cid) => assignedCaseIds.has(cid));
     }
     this.events = [];
     this.pushEvent(
@@ -421,6 +433,7 @@ export const runStore = reactive({
       },
       cells: cells.map((c) => ({ ...c, recording: false })), // 终态快照，recording 归零
       events: events.map((e) => ({ ...e })),
+      caseOrder: [...this.caseOrder],
     };
     try {
       await api.saveRunRecord(snap.slug, record);
@@ -595,7 +608,9 @@ export function makeRecordSource(record: RunRecord): MonitorSource {
       return [...new Set(this.cells.map((c) => c.serial))];
     },
     caseIds(): string[] {
-      return [...new Set(this.cells.map((c) => c.caseId))];
+      // 优先用存档时定住的库序；caseOrder 字段加入前存的旧记录没有，兜底退回旧的
+      // "按 cells 出现顺序去重"（显式分派下可能跟库序不完全一致，但只影响历史旧记录）
+      return record.caseOrder ?? [...new Set(this.cells.map((c) => c.caseId))];
     },
     doneCount(): number {
       return this.cells.length; // 记录都是终态，全部算完成

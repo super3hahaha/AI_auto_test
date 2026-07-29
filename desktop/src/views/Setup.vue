@@ -9,6 +9,35 @@ const python = ref("python3");
 const err = ref("");
 const saving = ref(false);
 
+// ── headless 调 claude 用的模型（「脚本自愈」+ 收尾「问题登记」共用；存 app_config.json 的
+// claude_model；""=跟随 claude CLI 自身默认）──
+const MODEL_OPTIONS = [
+  { value: "claude-sonnet-5", label: "Sonnet 5（推荐 · 默认）" },
+  { value: "claude-opus-5", label: "Opus 5（更强，更慢更贵）" },
+  { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5（更快更省）" },
+  { value: "", label: "跟随 CLI 默认设置" },
+];
+const model = ref("claude-sonnet-5");
+const modelSaving = ref(false);
+const modelSaved = ref(false);
+let modelSavedTimer: ReturnType<typeof setTimeout> | undefined;
+
+async function saveModel() {
+  if (!root.value) return; // 项目根还没配好时先不落盘，避免 set_app_config 校验失败
+  modelSaving.value = true;
+  try {
+    const c = await api.setAppConfig(root.value.trim(), python.value.trim(), model.value);
+    store.cfg = c;
+    modelSaved.value = true;
+    clearTimeout(modelSavedTimer);
+    modelSavedTimer = setTimeout(() => (modelSaved.value = false), 2000);
+  } catch (e: any) {
+    err.value = String(e);
+  } finally {
+    modelSaving.value = false;
+  }
+}
+
 // ── Claude CLI 状态（「脚本自愈」功能依赖它已装 + 已登录）──
 const cli = ref<ClaudeCliStatus | null>(null);
 const cliLoading = ref(false);
@@ -28,6 +57,7 @@ onMounted(() => {
   if (store.cfg) {
     root.value = store.cfg.project_root;
     python.value = store.cfg.python || "python3";
+    model.value = store.cfg.claude_model || "claude-sonnet-5";
   }
   refreshCli();
 });
@@ -87,8 +117,21 @@ async function save() {
     <div class="cli-block">
       <h3>Claude CLI</h3>
       <p class="muted cli-sub">
-        App 通过本机 Claude CLI 调用模型（用例失败时「脚本自愈」由 claude 接管）。这里展示当前 CLI 的安装与登录状态。
+        App 通过本机 Claude CLI 调用模型（用例失败时「脚本自愈」、执行收尾「问题登记」都由 claude 接管）。
+        这里展示当前 CLI 的安装与登录状态，以及这两处 headless 调用用哪个模型。
       </p>
+
+      <div class="field model-field">
+        <label>headless 调用模型</label>
+        <div class="model-row">
+          <select v-model="model" @change="saveModel">
+            <option v-for="o in MODEL_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+          </select>
+          <span v-if="modelSaving" class="muted sm">保存中…</span>
+          <span v-else-if="modelSaved" class="muted sm">已保存</span>
+        </div>
+        <span class="hint muted">用于「脚本自愈」诊断改脚本 + 收尾「问题登记」写 issues.csv；不影响你在终端/编辑器里手动用的 claude 会话。</span>
+      </div>
 
       <div v-if="cliLoading && !cli" class="cli-banner neutral">
         <span class="cli-icon">⏳</span>
@@ -168,6 +211,17 @@ h2 {
   display: flex;
   flex-direction: column;
   gap: 6px;
+}
+.model-field {
+  margin: 0 0 20px;
+}
+.model-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.model-row select {
+  max-width: 260px;
 }
 label {
   font-size: 13px;

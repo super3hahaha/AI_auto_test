@@ -89,11 +89,18 @@ $AK taptext "$CUT_ENTRY" --timeout 8 >/dev/null
 # 点「音频裁剪」后依次弹：文件访问(App内btn) → 通知权限(系统) → 音频权限(系统)，
 # 清数据后每次都会重新出现；顺序/是否出现可能随系统版本变化。
 # 文件访问是 App 内自定义按钮(id=btn)，不在通用库里，单独点；命中就点，没有就跳过。
-$AK tapid btn --timeout 6 >/dev/null 2>&1 || true
-# 通知/音频这两个系统权限弹窗改交给 sweep（perm-allow 规则覆盖 allow/allow_all/foreground 变体，
-# 顺序无关、有几个点几个），比原来固定点两次 permission_allow_button 更稳，还顺带兜这一步的广告。
-sweep --rounds 5 --interval 0.6 --patience 2
-$AK waitfor text "$(t 选择音频)" --timeout 8 --cache picker >/dev/null
+# 2026-07-29：原来只兜一轮 sweep+单次8s等待，实测某些设备权限弹窗节奏更慢/更多轮，单轮不够
+# 会直接超时（真机复现）。改成多轮兜底（每轮补点一次文件访问按钮+sweep+短等一次），命中就跳出；
+# 不改变判定本身——循环耗尽后最后再等一次，找不到仍如实交给下面的失败路径。
+PICKER_FOUND=0
+for _ in 1 2 3; do
+  $AK tapid btn --timeout 2 >/dev/null 2>&1 || true
+  # 通知/音频这两个系统权限弹窗改交给 sweep（perm-allow 规则覆盖 allow/allow_all/foreground 变体，
+  # 顺序无关、有几个点几个），比原来固定点两次 permission_allow_button 更稳，还顺带兜这一步的广告。
+  sweep --rounds 5 --interval 0.6 --patience 2
+  $AK waitfor text "$(t 选择音频)" --timeout 4 --cache picker >/dev/null 2>&1 && { PICKER_FOUND=1; break; }
+done
+[ "$PICKER_FOUND" = "1" ] || $AK waitfor text "$(t 选择音频)" --timeout 4 --cache picker >/dev/null
 $AK --case "$CASE" shot 02-picker "进入「选择音频」列表" >/dev/null; log "选择音频"
 
 # 2026-07-17 改为搜索定位：点搜索图标 → 输入文件名 → 点结果，比在长列表里翻找/裸猜第一项更稳。

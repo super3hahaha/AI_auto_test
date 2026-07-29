@@ -12,6 +12,7 @@
 - **坐标随分辨率变**：`tap X Y` 是绝对坐标，换设备/分辨率要重算。优先用 `ui` 拿到控件 bounds 再算中心点。
 - **`screencap` 对视频区可能全黑**（测视频播放器时）：视频常渲染在硬件 overlay / `SurfaceView`，`screencap` 读不到、返回黑块，**DRM 内容永远黑帧**。此时 `framediff` 帧差整个失效（播没播都是黑图）。用前先让视频在播、`screencap` 一张看视频区黑不黑；全黑就退回 `dumpsys SurfaceFlinger --latency`/`gfxinfo` 看帧推进，或人工目视。详见 `docs/evidence-video-playback.md`。
 - **media_session 未必发**（测视频播放器时）：自研/H5/WebView 播放器可能根本不发 MediaSession，`playback --session` 取不到 → "推进"轴改走 UI 进度条文案两次采样递增（归 `screenshots`），别丢掉推进轴。先在被测播放器上验一次取不取得到。
+- **小米/红米(MIUI)设备 ADB 模拟点击可能被系统整体拒绝**：`adb shell input tap/text/swipe` 发出去无报错、`ui dump` 也能正常拿到 bounds，但 App 完全收不到事件——UI 卡在原页面不动，看起来像"App 不响应/脚本失效"。真实原因是 MIUI 的安全限制：`logcat` 里会看到 `InputDispatcher: Permission denied: injecting event from pid X uid 2000 to window ... owned by uid <app_uid>`（2000=shell）。修复：手机上开启 设置→更多设置→开发者选项→**"USB调试(安全设置)"**（USB debugging (Security settings)，部分 ROM 需先登录小米账号联网验证）。这是设备侧手动开关，无法用 ADB 命令绕开（也正是它存在的意义），跑之前先确认这台 MIUI 设备该开关已开。判断优先级：先看 `adb -s <serial> logcat -d | grep "Permission denied: injecting"`，命中就是这个坑，别去怀疑脚本逻辑或 App bug。
 
 ## 三招确认包是否 debuggable（换包必查，决定 oracle 深度）
 
@@ -480,7 +481,7 @@ system <key>`（本例是 ringtone/alarm_alert/notification_sound）：系统层
 gitignore，纯本机缓存不是真值来源）。每次 `adb_devices()` 查到非空的
 model/os_version 就顺手写回缓存；构造 `absent` 行时从缓存兜底填充，查不到就还是
 `—`（比如从没连过、或者是纯手动登记的序列号）。这个缓存只影响显示，不影响
-`is_default`/别名/是否可设默认这些真正的状态判断。
+别名/在线状态这些真正的状态判断。
 
 ## 固化脚本 `taptext`/`tapdesc`/`waitfor text` 是语言相关的（2026-07-27）
 
@@ -497,6 +498,22 @@ App 的 `strings.xml` 本地化文案——固化脚本写死了固化当时设�
 查表小工具，`LANG_CODE` 未设置时原样直通、零风险）。用法见 flow-freeze skill「多语言」
 一节。**残留限制**：只解决"文案对不对"，不解决"目标语言下控件是否因为文案变长/变短
 导致布局挪位、或触发额外的语言相关引导页"——这类仍要真机验证，查表验证不能替代。
+
+## 无线设备 chip/分组标题显示成端口号 `5555`（2026-07-29）
+
+无线连接的设备 `serial` 是 `ip:port` 形式（如 `192.168.209.207:5555`），三处「没别名时的兜底显示」都栽在这上面：
+- `Runner.vue` 的 `chipLabel()` 兜底用 `serial.slice(-4)`——USB 序列号截尾 4 位还算能认，但 ip:port 截尾 4 位正好把端口号 `5555` 截出来，型号信息完全丢了。
+- `Evidence.vue` 的 `deviceLabel()` 兜底直接用整个 `serial`——没做任何截断，直接把 `192.168.209.207:5555` 糊在分组标题上。
+- `RunMonitor.vue`（执行监控矩阵，含「执行记录」回放复用的同一套渲染）压根没做别名/型号解析，设备面板标题栏、失败用例摘要 chip 都是直接 `{{ s }}`/`{{ fc.serial }}` 裸打印。
+
+`DeviceRow`/证据面板其实都已经能拿到 `model` 字段（[[project-multidevice-parallel-design]] 落地时顺带加的 `config/device_info_cache.json` 缓存，见上一条 gotcha），只是三处兜底优先级/资源没排对。
+
+**修法**：统一优先级改成 **别名 > 型号 > 原始兜底**（`d?.alias || d?.model || serial.slice(-4)`，或 `aliasMap[serial] || modelMap[serial] || serial`）。新增了 `read_device_model_cache` 命令（纯读 `config/device_info_cache.json`，不走 adb，不影响设备在线判断），`Evidence.vue`/`RunMonitor.vue` 各自 `onMounted` 里读一份 `aliasMap`+`modelMap` 做兜底；`RunMonitor.vue` 因为原来完全没读过别名/型号数据，是三处里改动量最大的一处（新增 import api + onMounted）。**注意**：这个缓存是「最后一次在线时查到的值」，从没连过的设备型号仍会是空，最终兜底还是原始 serial/端口号——不是万能的，只是覆盖了"曾经连过"这个绝大多数场景。
+
+**Evidence.vue 专属的第二层坑**：修完上面那版之后，无线设备在证据面板仍然显示成 `192.168.209.239_5555` 这种半吊子文本（下划线不是冒号）——因为 `serialOf(r)` 是从**证据文件路径**里抠出来的 serial 段，而路径段是 `tools/adbkit.py` 的 `evid_dir()` 用 `_safe(SERIAL)` 清洗过的（`re.sub(r"[^A-Za-z0-9._-]", "_", s)`，冒号换成下划线，见 `adbkit.py:313`），跟 `aliasMap`/`modelMap` 的 key（原始 adb serial，带冒号）字符串对不上，`Record` 查找直接落空。**修法**：`Evidence.vue` 里镜像同一条清洗规则加了 `sanitizeSerial()`，`buildLookup()` 把 aliases/型号两张表都按「原始 key + 清洗后 key」各建一份索引，两种形态都能查到。**教训**：任何"序列号当文件名/路径段用"的地方都可能被清洗过，凡是要拿路径里抠出来的 serial 去反查别的表（别名、型号、在线状态……），都得先确认两边是不是同一种清洗规则，不能想当然按原始 serial 直接查。
+
+**RunMonitor.vue 专属的第三层坑：日志正文里的 serial 不是模板字段，是文本内容本身**。矩阵/摘要那层是模板插值（`{{ s }}`）能直接换 `deviceLabel()`；但右栏「实时过程」的每一行日志文本，是固化脚本（`tools/flow_media.sh` 约定的 `log(){ echo "[$S] $*"; }`）自己拼好之后原样透传上来的字符串（如 `"[192.168.209.207:5555] 已重推固定素材并触发媒体扫描"`），$S 就是原始 adb serial——这个字符串是**执行时生成的日志内容**，不是渲染时才决定怎么显示的字段，模板层面没有"要不要显示别名"这个可插手的点。子标题「格日志：`${serial}/${caseId}`」同理，来自 `M.selectedKey`（`serial|caseId` 拼出来的 key），也不是模板字段。
+**修法**：只能在渲染前对已知 serial 做字符串替换——`knownSerials`（本轮 `serials()` ∪ 别名表/型号表 key）逐个在文本里 `includes` 命中就 `split/join` 替换成 `deviceLabel()`（`labelizeText()`），`shownLines` 计算属性和 `selectedKeyLabel` 都过一遍这层。**残留限制**：只替换"已知是本轮设备"的 serial 字符串，日志正文里其它偶然出现的数字/IP（比如断言文案里贴的接口地址）不会被误伤，但也意味着如果日志里出现了本轮没连接过、纯手动登记的历史 serial，不会被替换。
 
 ## zip 文件名非 UTF-8 编码（GBK）→ `unzip`/Python `zipfile` 默认按 cp437 解出乱码
 
@@ -785,3 +802,243 @@ strings.xml 里没有这两句的字面值，反查会直接报"找不到 key"�
 - 排查方法：怀疑某条固化脚本有类似脱钩时，搜 `grep -B5 'shot .*--used-dump' apps/*/flows/flow_*.sh`
   看紧邻的 `shot` 调用前后有没有独立的数值校验函数/if 分支且没把结果传回 `--result`——用这个
   模式快速定位，不用逐条脚本通读。
+
+## attempt 目录名只有 `HHMMSS` 没有日期：证据查看器按名字排序会跨天错序（2026-07-29）
+
+- 现象：证据查看器左侧同一「设备 → 用例」下展开多个 attempt 时，今天 09:29/09:40/09:48/09:53
+  那四次（最新）被排在昨天 20:01/19:57/18:11 那批之后，用户看到的顺序不是"最新在最前"。
+- 根因：证据路径是 `evidence/<app>/<ver>/<runId>/<caseId>/<serial>/<attempt>/...`，**日期只在
+  `runId`（`YYYYMMDD-HHMM`）里，attempt 段是纯 `HHMMSS`**。而 `runId` 是**批次开始时刻**，一个
+  批次可以跨午夜（`20260728-1650` 这个批次里就同时有 `165525` 和次日的 `092932`），所以既不能
+  拿 attempt 名字直接排，也不能拿 runId 的日期去补 attempt 的日期。
+- 修法：[desktop/src/views/Evidence.vue](../desktop/src/views/Evidence.vue) `splitByAttempt` 改为
+  按组内**最新 `采集时间`**（evidence.csv 的 `YYYY-MM-DD HH:MM`，字典序即时间序）倒序，attempt
+  名字只作两边都拿不到时间时的兜底；attempt 头部顺带显示 `MM-DD HH:MM`，跨天顺序肉眼可核。
+- 附带坑：evidence.csv 里存在列错位的脏行（正文含逗号，`采集时间` 那格能读出
+  `duration=35187` 这种），所以取时间必须用 `/^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/` 过一遍再比，
+  不能裸 `String` 比大小——脏值字典序会盖掉真时间。
+
+## 两个 dump 后端的 XML 排版不同：固化脚本按行 grep 抠 bounds 会抠到状态栏（2026-07-29）
+
+- 现象：SPLIT-CORE-02 在 oppo a31（`dump_backend=shell`）上"删错段"——应删中间段，实际删掉第 3 段。
+  证据 `06-middle-selected` 那条断言写的坐标是 `(477,28)`，同一台设备前一次跑（`181458` 那次）
+  写的是 `(280,488)`，同一个公式在同一台设备上算出两个完全不同的坐标。
+- 根因：**`_dump_xml_to` 两个后端产物只是「字段/层级同构」，排版不同**——
+  u2(`dump_hierarchy`) 是缩进多行、一节点一行；shell(`uiautomator dump`) 是整份 XML 挤在一行。
+  脚本原来用 `ui` 拿整份 XML 再
+  `grep -A1 '<父控件 id>' | tail -1 | sed 's/.*bounds="\[..\]".*/../'` 抠波形 View 的 bounds：
+  u2 下 `-A1` 拿到的正是下一行那个子节点，侥幸算对；shell 下 `-A1` 拿到的是**整个文件**，
+  `sed` 的贪婪 `.*` 抠到的是最后一个 `bounds`（状态栏 `[0,0][720,56]`），于是 `MID_Y=(0+56)/2=28`、
+  `MID_X` 按屏宽 720 而非波形宽 360 算 → tap 落在状态栏上。
+- 为什么表现成"App 删错段"：分割完成后**默认选中态就是最后一段**，tap 没点中任何段时选中态不变，
+  删除删掉的就是第 3 段。所以"坐标解析错"的失败长相和"App 选中逻辑有 bug"一模一样，
+  只看 07 那步的时长反推校验会把根因指向 App，必须回头核 06 那步的坐标数值。
+- 修法（两层）：
+  1. `tools/adbkit.py` 新增 `bounds <by> <value> [--child N] [--index N] [--from/--from-cache]`
+     子命令，统一走 ET 解析打印 `BOUNDS=/CENTER=/SIZE=/PARENT_BOUNDS=`（机器可读）。**canvas 自绘、
+     没有 resource-id 的控件（波形、进度条自绘层）一律用它按「父控件 id + 第几个子节点」取几何，
+     不要在 bash 里 grep/sed 抠 XML。** 配合 `ui <step>` 顺手种的 `.dumpcache/<step>` 用
+     `--from-cache <step>`，算坐标用的就是落进证据目录那一份 XML，不多 dump 一次也不会读串。
+  2. 脚本里坐标算完先做**几何自检**：波形 bounds 非退化 + 落在父容器内 + 点击点落在波形内，
+     任一不成立就 `FAILED=1` 且把那步 `--result 失败`——别只靠下游的时长反推兜底（那条校验会把
+     脚本自身的坐标错误报成 App 缺陷，误导排查方向）。
+- 顺带修：`_dump_xml_to`（`ui` 子命令用的那条）以前自己另起一条裸 `uiautomator dump /sdcard/uidump.xml`
+  调用，绕过了 `_dump_tree_shell` 里那套「null root node 重试 + 先删设备旧文件防拉到陈旧快照」
+  的硬化（见上文同名条目）。现在两条路统一走 `_dump_xml_shell()`，硬化只写一处。
+
+## `fs::read_to_string` 读证据文本会被一个坏字节整条废掉（2026-07-29，`commands.rs read_text_file`）
+
+给「固化脚本流程日志落库成 `99-run-log` 证据」（decisions #41）接线时发现的：桌面壳读文本证据用的是
+`fs::read_to_string`，遇到非 UTF-8 字节直接 `Err`，前端显示成「读不到 …: stream did not contain valid
+UTF-8」——**整份日志一个字都看不到**，而不是坏的那一处显示成 �。流程日志正是最容易带坏字节的证据：
+它是脚本输出原样落盘，而 flow 在 `LC_ALL=C` 下跑 /bin/bash 3.2 偶发会搅出非法字节（见上文多字节 bug 条目）。
+
+修法：`fs::read` + `String::from_utf8_lossy`，跟 `stream_child`/`pump` 那条一个道理。**通用教训**：
+凡是读「外部进程原样落盘的文本」——日志、dump、logcat——一律按字节读 + lossy 解码；`read_to_string` /
+Python `text=True` / `BufRead::lines()` 这类"假定合法 UTF-8"的读法只配自己生成的纯 ASCII 文件。
+同一条链路上现在三处都是字节口径：`run_flow.py` 的 tee（`sys.stdout.buffer` + 二进制管道）、
+`adbkit attach`（`stdin.buffer.read()` + `write_bytes`）、Rust `read_text_file`（lossy）。
+
+## `adb shell content query --where "col='值'"` 的单引号会被设备端 sh 吃掉，SQL 报错又被 `2>/dev/null` 吞掉（2026-07-29，`flow_split_core01/02.sh` → `tools/flow_media.sh`）
+
+- 现象：`ffprobe_check()` 每次都打印「产物 ffprobe 交叉核对：查不到 `<名>.mp3` 的 `_data` 路径，跳过」，
+  2026-07-23 起多轮 `run_records` 里都是这句——**这条「绕开 MediaStore duration 字段失真」的交叉校验
+  自固化以来一次都没真正执行过**。同一次运行里 `validate_row` 用 `output-check --n 3` 的批量输出按
+  `_display_name=<名>.mp3,` grep 得到该记录，说明文件确实在 MediaStore 里，不是产物没落地。
+- 根因是**两层 shell 解析 + 吞 stderr**，两个坑叠在一起才伪装成"文件不存在"：
+  1. `adb shell <cmd...>` 不是把 argv 直接交给设备端程序——adb 把 argv **用空格拼成一整条命令字符串**
+     丢给**设备端 `sh`** 再解析一次。宿主机 bash 早就把 `--where "_display_name='foo.mp3'"` 的外层双引号
+     剥掉了，设备端 sh 接着把剩下那对单引号也当自己的引号剥掉，`content` 最终收到裸词
+     `_display_name=foo.mp3`，SQL 把 `foo.mp3` 当成**列名**：
+     `SQLiteException: no such column: foo.mp3 … SELECT _data FROM audio WHERE (_display_name=foo.mp3)`
+  2. 原代码 `2>/dev/null` 把这句 provider 报错吞了，于是只剩下自己编的那句"查不到 _data，跳过"。
+     **查询报错和查询无结果长得一模一样**，日志里看不出区别，坑就这么藏了 6 天。
+- 修法：**双层引号**——外层双引号留给设备端 sh 剥，里层单引号才活到 SQL：
+
+  ```bash
+  # ✗ 错：单引号被设备端 sh 吃掉 → SQLiteException
+  adb -s "$S" shell content query --uri "$URI" --projection _data --where "_display_name='$N'"
+  # ✓ 对：外层双引号给设备端 sh，单引号留给 SQL
+  adb -s "$S" shell content query --uri "$URI" --projection _data --where "\"_display_name='$N'\""
+  ```
+
+  真机（oppo a31）实测：错写法 → `SQLiteException: no such column`；对写法 → `Row: 0 _data=/storage/…`。
+  另一种同样可行的写法是把整条命令当**一个**参数传：`adb -s "$S" shell "content query … --where \"_display_name='$N'\""`。
+  **同理 `--sort "_id DESC"`** 带空格，也必须双层引号包住，否则 `DESC` 会被当成另一个参数。
+- 通用教训（比这个 bug 本身重要）：
+  1. **凡是往 `adb shell` 里传带引号/空格/`$`/`*` 的参数，就要按「宿主机 shell + 设备端 sh 各剥一层」
+     数引号**，不能按普通本地命令的直觉写。写完必须在真机上跑一次看有没有报错，别只看"有没有输出"。
+  2. **别把诊断用的 stderr 丢进 `/dev/null`。** 校验函数的异常分支要把外部命令的原始返回带进日志
+     （本次改成 `2>&1` 一起收下 + 截断 3 行塞进 `MS_QUERY_RAW` 打出来），否则"链路坏了"会伪装成
+     "被测对象就是这样"。
+  3. **同名函数抄多份必然一起烂。** `ffprobe_check()` 在 `flow_split_core01.sh`/`flow_split_core02.sh`
+     各一份，两份带着同一个 bug。已抽到 `tools/flow_media.sh`（source 型 bash 工具，同 `lang_helper.sh`），
+     两个脚本改为 `source .../tools/flow_media.sh`。
+- 顺带修掉的两个相关问题：
+  1. **静默跳过 = 校验缺失，不能长得像通过**（`.claude/skills/flow-freeze/SKILL.md` 判定纪律）。原版
+     4 个异常分支一律 `log 跳过; return 0`。现按性质分档：**查不到 `_data` / `pull` 失败 / ffprobe 读不出
+     时长 → `FAILED=1`**（调用点都是在 MediaStore 已查到该记录且 `_size>0` 之后才调的，这三种都是真问题：
+     查询链路坏了 / 产物没真正落地 / 产物是坏文件）；**只有"宿主机没装 ffprobe"不判失败**——那是协作者
+     本机环境缺失、不是被测产物的缺陷，升级成失败会让所有没装 ffmpeg 的人整轮全红把真失败淹掉，改为打
+     醒目 `⚠⚠ 【未执行】` 警告（stdout+stderr 各一份）+ 落一条「需复核」证据行留痕。
+  2. **结论只在终端 stdout 里 = 事后查不到。** 这条校验原来不落任何证据文件，"跑没跑过、结论是什么"
+     翻不出来（这是它能藏这么久的另一半原因）。现在每次核对都用 `adbkit attach` 落
+     `logs/ffprobe-<产物名>.txt` + 登记证据行（带 `--result 通过/失败/需复核`），证据面板上缺了一眼看得出。
+- 另一个真机上真实存在的坑，顺手一起防了：**App 清数据/删文件后 MediaStore 常留下同名失效旧行**
+  （`_data` 指向已删除的文件；排查时这台设备上就有一堆）。按文件名查 `_data` 必须
+  `--sort "_id DESC"` 取最新一条，否则 `head -1` 可能拿到旧行、`pull` 必然失败。
+- 附带修：`ffprobe_check` 现在校验不过会 `return 1`，脚本头部有 `set -e`，**调用处必须配 `|| true`**，
+  否则会被当场杀掉、跳过后续证据收集（`SKILL.md` 判定纪律第 5 条附带坑）。顺手发现 `core01` 里
+  `[ "$RENAME1_OK" = 1 ] && validate_row …` 这种写法同样有隐患——条件不成立时整条 AND-OR 列表返回 1，
+  `set -e` 下一样会杀脚本，已改成 `{ [ … ] && validate_row …; } || true`。
+
+## 「下载完成后自动展开操作行」是错的：不点箭头永远等不到，被动 `waitfor` 把脚本缺步误报成功能失败（2026-07-29，`RING-LIB-01`）
+
+- 现象：`flow_ring_lib.sh` 点完 `iv_download` 后 `waitfor id tv_ringtone --timeout 30` 必然超时，
+  判「下载疑似失败」；但 `04-fail.png` 和当场补抓的 UI dump 都显示这一行**已经下载完成了**。
+- 真机 dump 对照（下载前 `03-album.xml` vs 下载后 `live_check.xml`，同屏）：
+  | | `iv_download` | `iv_favorite` | `btn_arrow` |
+  |---|---|---|---|
+  | 下载前 | 8（每条铃声行一个） | 0 | 0 |
+  | 下载完成后 | 7 | 1（第 0 行） | 1（第 0 行） |
+  下载完成的表现是**该行右侧 `ll_right` 里 `iv_download` 换成 `iv_favorite` + 多出折叠箭头
+  `btn_arrow`**；`tv_ringtone/tv_alarm/tv_notification/tv_contact/tv_more` 五项操作行**要再点一次
+  `btn_arrow` 才展开**，不是下载完自动铺开。旧脚本从没点过这个箭头，等的是一个不点就不会出现的元素。
+- 教训（比这个控件本身重要）：**固化脚本里"等一个只有再操作一次才会出现的元素"= 缺步，不是缺耐心。**
+  超时后不要先加 timeout / 加 sweep 轮次（本轮自愈前两次就是这么白跑的），先抓一份当前屏 dump 跟
+  操作前那份**按 resource-id 计数做差**，看清"这一步到底把界面变成了什么"，再决定是等还是点。
+  被动 `waitfor` 型判定点如果一次都没成功过，要怀疑的是判定点选错，不是被测功能坏了。
+- 判定点选 `iv_favorite` 而不是 `btn_arrow` 当"下载完成"的状态判据：两者同时出现，但
+  `iv_download → iv_favorite` 是**状态迁移**（语义=这条已下载），`btn_arrow` 只是展开动作的落点，
+  拿动作控件当完成判据，将来 App 若在下载中就先渲染箭头就会误判通过。
+- 顺带（同一处踩到 `SKILL.md` 判定纪律的两条）：
+  1. 新加的 `tapid btn_arrow` 是裸调用，`set -e` 下点不到会当场杀脚本、跳过失败截图 + `logscan` +
+     `FAILED` 收尾——必须 `if ! …; then log; FAILED=1; fi` 捕获。
+  2. 失败 `log` 文案要带 `✖`/`严重异常`/`校验未通过` 这类共用关键词，否则不会被摘进证据「断言」列
+     （原来那句"操作行文案断言未全部命中"一个关键词都没命中，证据面板上不会标红）。
+- 展开后那五项文案断言（`电话铃声/闹钟铃声/通知提示音/联系人/更多`，`t()` 查表在 en 下解析为
+  `Ringtone/Alarm/Notification/Contacts/More`）**自固化以来一次都没真正执行过**——之前每轮都卡在
+  前面的 `waitfor` 就退出了。2026-07-29 11:40 修完后真机跑通（`run_flow` exit=0，112s，
+  attempt `114055`，`04-downloaded.png` 可见 ♡+▲ 与展开的五项），这条断言才第一次真正生效。
+
+## 点专辑卡必弹 AdMob 插屏 + 清障的 `keyevent-back` 兜底会把 App 退到桌面（2026-07-29，`RING-LIB-01`）
+
+- 现象：`waitfor id tv_category_title --timeout 8` 超时判失败，事后 `focus` 却显示前台是
+  `com.oppo.launcher`——**App 整个被退到桌面了**，于是后面每一步都找不到控件，连着两轮被误诊成
+  "专辑头控件 id 又改名了"。
+- 两个原因叠在一起：
+  1. **点专辑卡后必弹 AdMob 插屏**：`tapid tv_name`（专辑卡）→ 前台立刻变
+     `com.google.android.gms.ads.AdActivity`，实测**连续 10s 都不消失**（逐秒查 `focus` 确认）。
+     8s 超时根本等不到详情页，跟 CDN 慢/控件改名都没关系。
+  2. **清障的终极兜底是无条件 `KEYCODE_BACK`**（`config/ad_rules.json` 的 `ad-admob-close`
+     最后一条 match，`scope=AdActivity` 才生效）。但 `_sweep_loop` 是「每轮先读 `focus` → 再
+     dump（~2s）→ 才按键」，这 2s 里插屏可能已自行关闭，BACK 就落到 App 页面上：详情页被弹回
+     列表、再一发退首页、再一发退出 App。**scope 只保证"按键那一刻之前"是广告页，不保证按下时还是。**
+- 修法（`flow_ring_lib.sh` 的 `enter_album()`，可照抄到别的"点进二级页会弹插屏"的脚本）：点完卡片
+  别裸 `waitfor`，改成最多 3 轮的「**显式 `sweep` 清插屏 → 查 `focus` 是否还在包内（不在就
+  `launch` 重进）→ `waitfor id <详情页头> --timeout 12` → 还没进就回列表重点一次卡片**」，
+  3 轮都不成才判失败。关键是**把"被 BACK 退出前台"当成预期内的一种状态去恢复**，而不是让它
+  伪装成"控件不存在"。
+- 排查口诀：固化脚本某一步突然找不到控件，**先 `adbkit focus` 看前台是谁**（是不是广告页/桌面/
+  别的 App），再去怀疑 id 变了。这一步 1 秒，能省掉一整轮"改 id / 加 timeout"的白跑。
+- 超时基线：全屏插屏时长不可控，本脚本把原来一律 `--timeout 8` 的等待抬到 **10s**（详情页头那处
+  给到 12s，因为实测广告本身就 >10s，要留余量）。2026-07-29 11:47 复跑（attempt `114704`，147s，
+  exit=0）**两条兜底路径都真机触发过并自愈成功**：①清障的 BACK 把 App 退到桌面 → 脚本检测到前台
+  不在包内、`launch` 重进后正常进详情页；②首次点 `btn_arrow` 后 10s 没展开 → 补点一次成功展开。
+  即"加时间"只是降低触发概率，**真正兜住的是"检测到偏离就恢复"这套写法**，两者要一起上。
+
+## `logscan` 把 ColorOS 的 `D View: [ANR Warning]` 当崩溃命中，慢设备上无脑判失败（2026-07-29，框架级）
+
+- 现象：`RING-LIB-01` 跑完 `logscan run` 报「21 条命中」，逐条看全是
+  `D View : [ANR Warning]onMeasure time too long, this =…CoordinatorLayout…time =448 ms`。
+  固化脚本统一用 `grep -qE '，[1-9][0-9]* 条命中' && FAILED=1` 判崩溃，**这些噪音会让所有脚本
+  在慢设备（oppo a31）上随机变红，真崩溃反而被淹没**。
+- 根因：`cmd_logscan` 的关键词表里有裸 `"ANR"`，而 ColorOS 的 View 布局耗时 debug 日志正好带
+  `[ANR Warning]` 字样——D 级、每次滑列表刷一堆，跟 ANR 毫无关系。
+- 修法：`tools/adbkit.py cmd_logscan` 加 `EXCL = ("[ANR Warning]",)` 排除。真 ANR 是
+  system_server 的 `ANR in <pkg>`（且按 `--pid` 过滤时本来就抓不到），排掉这条 D 级噪音不削弱
+  崩溃检出能力。
+- 通用教训：**崩溃扫描的关键词表要按"这条日志的级别+来源"卡，不能只按字符串子串**。裸关键词
+  在不同 ROM 上迟早撞上厂商自己的 debug 日志，撞上了就是"整轮全红"或"真问题被淹"。
+
+## BUG-MERGE-FMT-01 排查复盘：三次反转，最终是「广告没清」，附带发现并修复一个框架级 HOME 误伤（2026-07-29）
+
+排查这条"点「下一个」后合并编辑页有时不出内容"的问题，中间经历了两次错误结论，记录下来是因为
+**每一次错误结论当时都有真机证据支撑，但证据不够全就下结论会一次次跑偏**——这条复盘本身比结论
+更值得读。
+
+**第一版结论（错）**：logcat 里看到 `ActivityManager` 收到 `from uid 1000 and from pid 1280`
+（system_server）发起的 `HOME` intent，把它当成了"ColorOS 私有的界面假死看门狗，静默把无响应
+App 踢回桌面"。
+
+**第二版结论（部分对，但没找全）**：细查发现这个 HOME intent 前一刻，logcat 稳定能看到
+`D/AndroidRuntime: Calling main entry com.android.commands.input.Input` +
+`I/Input: injectKeyEvent: KeyEvent{...KEYCODE_HOME...}`——即**这个 HOME 键是被主动按下的，不是
+系统自己判定的**。追到 `tools/adbkit.py` 的 `_dump_xml_shell()`：`uiautomator dump` 连续 3 次
+返回 `ERROR`/`null root node` 时会自动按 HOME"自愈"，这一按恰好把前台 App 挤下去。当时用
+纯 `screencap`（不触发这段自愈逻辑）连续观察 90 秒，页面完整渲染且全程无异常，于是下结论
+"MERGE-FMT-01 大概率是假阳性，合并页本身没问题"——**这一半是对的（合并页本身确实没问题），
+但没有解释清楚 uiautomator dump 为什么会在这个页面连续失败，只归因于笼统的"抽风"就停止深挖**。
+
+**最终结论（真）**：再跑一次真机复现，这次失败截图里看到的不是桌面、也不是卡死画面，而是一个
+**App 自己的展示广告**（`com.google.android.gms.ads.AdActivity`，界面是"关闭广告并继续打开…"
++ 一叠 Trip.com 商品卡）整页盖住了合并编辑页。`config/ad_rules.json` 的 `ad-admob-close` 规则
+`scope` 本来就卡住 `AdActivity`，现场 `sweep` 一下（命中 `id=close-button`）广告立刻消失，
+合并编辑页原样正常显示（标题/6 文件列表/总时长/合并按钮一个不少）。**真正的根因只是
+`flow_merge_fmt.sh` 在点「下一个」之后，没有像脚本里别的跳转点（进模块、点合并）那样补一次
+`sweep`**——广告一挡，`waitfor` 自然等不到标题文案而超时；uiautomator dump 连续失败也是同一个
+原因：广告是 WebView/原生混合内容，dump 这类内容本来就比普通 App 页面更容易拿不到无障碍树。
+
+**两处代码改动（都已落地）**：
+1. `flow_merge_fmt.sh`：`tapid next_tv` 后补一句 `sweep --rounds 5 --interval 0.6 --patience 2`，
+   跟模块入口/结果页保持同一套写法。
+2. `tools/adbkit.py` 的 `_dump_xml_shell()`：HOME 键自愈本身是合理的（`SPLIT-CORE-01` 真机验证过
+   确实有用），问题是原来按完 HOME 就完事、没有"回去"这一步，导致万一真的被 HOME 误伤，调用方
+   后续判断全部基于一个已经不在前台的 App。已改成：仍保留 HOME 恢复手段，但按完立刻
+   `am start -n <pkg>/<main_activity>` 把同一个 App 带回前台（HOME 不会杀掉任务/回退栈，
+   重新 start 会带着原有状态回来，不是从头重启，同类恢复见 `RING-LIB-01` 那条"BACK 退桌面→
+   launch 重进后正常进详情页"）；原地重试次数从 4 次拉到 6 次、间隔拉长，降低真正触发 HOME
+   这一步的概率。**这是框架级改动，影响所有用例的 dump 调用，不限于 MERGE-FMT-01。**
+- **排查方法论教训**：`dumpsys window`/`pidof` 只能看"前台是谁、进程活没活"，看不出"前台窗口
+  上到底盖没盖着别的东西"——这次决定性的信息始终是**截图**，前两版分析都只顾着看 logcat 时序，
+  直到真正去看失败那一刻的**画面内容**才找到根因。以后同类"页面不出内容"的排查，第一步应该是
+  先拿一张失败瞬间的截图（哪怕手动截，比先扎进 logcat 更快定位）。
+- `BUG-MERGE-FMT-01` 应重新核实登记：不是 App 缺陷，是脚本缺一步 `sweep`，问题清单里对应记录
+  需要撤销/改判。
+
+## 执行台多设备"逐格分派"下，用例列顺序会跟着设备错开，不再等于用例库顺序（2026-07-29，`runStore.ts`）
+
+`RunMonitor.vue` 每台设备面板都用同一份全局 `caseIds` 列表 `v-for`，靠 `v-if="M.cell(s, cid)"` 挑出
+该设备真正分到的格子——这意味着**列顺序必须是全体设备共用的一份定序**，任何一台设备的展示顺序
+都是这份定序的子序列。旧实现 `caseIds() { return [...new Set(cells.map(c=>c.caseId))]; }` 是从
+`cells`（`serial → caseId` 顺序 push 的扁平数组）里"第一次出现"反推这份定序——矩阵模式（每台设备
+跑全部勾选用例）下凑巧成立，因为第一台设备的 cells 已经按库序包含了全部用例；但只要有一台用例
+被"逐格勾设备 chips"做了不同设备分到不同子集的**显式分派**，"首次出现顺序"就会被"哪台设备在
+`cells` 里排第一个 且 恰好带了哪些用例"带偏，导致后出现的设备把只分给自己的用例挤到列表末尾，
+乱序看起来像是跟"勾选顺序"或别的什么因素有关，其实跟勾选顺序无关，根源是这个反推法本身不稳定。
+
+修复：`start()` 时直接从 `opts.cases`（Runner.vue 已经是按 `frozen`/库序过滤出来的)算一次
+`caseOrder`（只保留这轮真被分到格子的用例，keep 库序），定住存进 `runStore.caseOrder`，
+`caseIds()` 直接返回它，不再从 `cells` 反推。执行记录快照（`RunRecord`）也要带上这份
+`caseOrder` 一起存盘，`makeRecordSource()` 回放时优先用它；旧记录没有这个字段时兜底退回旧的
+反推逻辑（这些历史记录本来就可能是错的，没法回溯修正，只能兜底不崩）。

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref, reactive, computed, watch, nextTick } from "vue";
+import { ref, reactive, computed, watch, nextTick, onMounted } from "vue";
 import { runStore, labelOf, type CellStatus, type IssueState, type MonitorSource } from "../runStore";
+import { api } from "../api";
 
 defineOptions({ name: "RunMonitor" });
 
@@ -32,6 +33,44 @@ const eventsBox = ref<HTMLElement | null>(null);
 const serials = computed(() => M.serials());
 const caseIds = computed(() => M.caseIds());
 const hasRun = computed(() => M.cells.length > 0);
+
+// 序列号→别名/型号：矩阵/失败摘要里的 serial 无线连接时是 ip:port，没有这层兜底会直接露出端口号
+// （同 Evidence.vue/Runner.vue 的坑，见 docs/gotchas.md）。别名优先，没有就退回型号，再没有才原样显示。
+const aliasMap = ref<Record<string, string>>({});
+const modelMap = ref<Record<string, string>>({});
+function deviceLabel(serial: string): string {
+  return aliasMap.value[serial] || modelMap.value[serial] || serial;
+}
+// 实时过程日志的行文本是 run_flow.py/adbkit 里的固化脚本自己 log() 出来的（形如 "[$S] xxx"），
+// $S 就是原始 adb serial（带冒号），不是模板插值拼出来的字段，没法直接换成 deviceLabel(serial)
+// ——只能在渲染前对已知 serial 做一次字符串替换。已知 serial 集合=本轮涉及的 serials ∪ 别名/型号
+// 表的 key，命中才替换，避免误伤日志正文里凑巧出现的数字串。
+const knownSerials = computed(() => {
+  const set = new Set<string>(serials.value);
+  Object.keys(aliasMap.value).forEach((k) => set.add(k));
+  Object.keys(modelMap.value).forEach((k) => set.add(k));
+  return [...set];
+});
+function labelizeText(text: string): string {
+  let out = text;
+  for (const s of knownSerials.value) {
+    if (out.includes(s)) {
+      const label = deviceLabel(s);
+      if (label !== s) out = out.split(s).join(label);
+    }
+  }
+  return out;
+}
+onMounted(async () => {
+  try {
+    const kvs = await api.readDeviceAliases();
+    aliasMap.value = Object.fromEntries(kvs.map((k) => [k.key, k.value]));
+  } catch { /* 别名读不到无妨，退化为显示型号/serial */ }
+  try {
+    const kvs = await api.readDeviceModelCache();
+    modelMap.value = Object.fromEntries(kvs.map((k) => [k.key, k.value]));
+  } catch { /* 型号缓存读不到无妨，退化为显示 serial */ }
+});
 
 // 设备面板折叠态（按 serial 记，默认展开；纯 UI 态，不放 runStore）
 const collapsedMap = reactive<Record<string, boolean>>({});
@@ -129,12 +168,20 @@ const publishPhase = computed(() => {
   return null;
 });
 
-// 右栏「实时过程」：选中某格 → 只看该格日志；否则看全部运行事件
-const shownLines = computed(() =>
-  M.selectedKey
+// 右栏「实时过程」：选中某格 → 只看该格日志；否则看全部运行事件（都过一遍 labelizeText 把行里的原始 serial 换成别名/型号）
+const shownLines = computed(() => {
+  const raw = M.selectedKey
     ? (M.cells.find((c) => M.key(c.serial, c.caseId) === M.selectedKey)?.lines || []).map((t) => ({ text: t, level: "info" as const }))
-    : M.events
-);
+    : M.events;
+  return raw.map((e) => ({ ...e, text: labelizeText(e.text) }));
+});
+// 「格日志：<serial> / <caseId>」子标题——selectedKey 的 serial 段也要走别名/型号，不能露 ip:port
+const selectedKeyLabel = computed(() => {
+  if (!M.selectedKey) return "";
+  const i = M.selectedKey.indexOf("|");
+  if (i < 0) return M.selectedKey;
+  return `${deviceLabel(M.selectedKey.slice(0, i))} / ${M.selectedKey.slice(i + 1)}`;
+});
 
 function pillClass(s: CellStatus) {
   return {
@@ -221,7 +268,7 @@ watch(
             <span class="fail-summary-t">⚠ 失败用例摘要（{{ failedCells.length }}）</span>
             <span v-for="fc in failedCells" :key="M.key(fc.serial, fc.caseId)" class="fail-chip-wrap">
               <button class="fail-chip mono" @click="pickCell(fc.serial, fc.caseId)">
-                {{ fc.serial }} · {{ fc.caseId }}
+                {{ deviceLabel(fc.serial) }} · {{ fc.caseId }}
                 <span v-if="showIssuePill(fc.issue)" class="issue-pill" :class="fc.issue">{{ issueLabel(fc.issue) }}</span>
               </button>
               <button
@@ -237,7 +284,7 @@ watch(
             <div v-for="s in serials" :key="s" class="device-panel">
               <div class="device-hd" @click="toggleDevice(s)">
                 <span class="chevron">{{ isCollapsed(s) ? "▸" : "▾" }}</span>
-                <span class="mono dev-serial">{{ s }}</span>
+                <span class="mono dev-serial" :title="s">{{ deviceLabel(s) }}</span>
                 <!-- 分母 = 该设备在 plan 里实际分到的格数（显式分派下各台不同，不能用全局用例数） -->
                 <span class="muted dev-prog">{{ doneCountOf(s) }}/{{ cellsOf(s).length }} 完成</span>
                 <span v-if="countsOf(s).ok" class="dev-ok">通过 {{ countsOf(s).ok }}</span>
@@ -287,7 +334,7 @@ watch(
             <span class="conn" :class="{ live: M.running }">{{ M.running ? "实时连接正常" : "空闲" }}</span>
           </div>
           <div class="right-sub muted">
-            {{ M.selectedKey ? `格日志：${M.selectedKey.replace("|", " / ")}` : "全部运行事件" }}
+            {{ M.selectedKey ? `格日志：${selectedKeyLabel}` : "全部运行事件" }}
             <button v-if="M.selectedKey" class="link" @click="M.selectedKey = ''">看全部</button>
           </div>
           <div ref="eventsBox" class="events">

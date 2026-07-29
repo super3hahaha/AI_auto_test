@@ -19,7 +19,7 @@ pub fn run() {
             commands::list_flows,
             commands::list_devices,
             commands::read_device_aliases,
-            commands::set_target_serial,
+            commands::read_device_model_cache,
             commands::set_target_scope,
             commands::set_target_dump_backend,
             commands::upsert_device_alias,

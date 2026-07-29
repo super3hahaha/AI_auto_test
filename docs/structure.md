@@ -51,11 +51,14 @@ AI_auto_test/
 │   │                    #   含 ledger_lock() 账本进程间锁（可重入 flock，所有账本 CSV 写点必须包它）
 │   ├── exec_ledger.py   # ★ executions.csv 读写 + (run_id,用例,serial) upsert + 聚合回 queue + 旧表补「执行设备」列
 │   ├── _probe_skip.py   # 临时探针：跳过/关闭按钮出没时 dump 树，看它进不进无障碍树/选择器是什么
-│   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/db/sp/seed/logscan/sweep...），唯一碰 adb 的地方
+│   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/bounds/db/sp/seed/logscan/sweep...），唯一碰 adb 的地方
+│   │                    #   bounds 子命令：按 id/text/desc（可 --child N 取第N个子节点）打印 BOUNDS/CENTER/SIZE，
+│   │                    #   给固化脚本现算坐标用——canvas 自绘无 id 的控件只能这么定位，禁止在 bash 里 grep XML
 │   ├── lang_table.py    # 多语言 strings.xml 资源包(目录/zip，来源可以是翻译导出包，也可以是 lang-string-compare
 │   │                    #   的 extract_apk_strings.py 从 apk 反编译出的同构产物) → apps/<slug>/lang/strings_table.json；
 │   │                    #   固化脚本靠 resolve 子命令按语言查表换算选择器文案，解语言切换后 taptext/tapdesc 失效的问题
 │   ├── lang_helper.sh   # 固化脚本 source 用的 t() 小工具：按 LANG_CODE/SRC_LANG 查 lang_table.py，未设置时原样直通
+│   ├── flow_media.sh    # 固化脚本 source 用的产物交叉核对：ms_query_data(按名查 MediaStore _data) + ffprobe_check(pull 回宿主机用 ffprobe 读真实时长，跟 duration 字段对，绕开字段失真)。原来在 flow_split_core01/02 各抄一份、两份同一个 --where 转义 bug，2026-07-29 抽出统一维护
 │   ├── init_target.py   # 探测包名/版本/主Activity/db_name/debuggable → 写 target.json；--atx-init 装/验 u2 后端
 │   ├── preflight.py     # 开跑前只读自检：设备在线/App装没装/素材是否推到设备/当前看板（零副作用，见上一轮问答）
 │   ├── compile_cases.py # cases/*.yaml → ledger/queue.csv（幂等，保留运行时状态）
@@ -63,7 +66,7 @@ AI_auto_test/
 │   ├── case_issue.py    # 结构化登记一条问题到 issues.csv（csv.writer 转义 + 按问题ID upsert + ID 格式校验）；替代手写 CSV
 │   ├── issue_register.py # 桌面收尾自动登记问题：读证据→headless claude 写描述字段+查重→调 case_issue.py（前缀由终态确定性映射，见 decisions #35）
 │   ├── judge_result.py  # 把执行台一格终态确定性映射进账本（pass→通过/fail→失败/app_defect·needs_human→需复核）
-│   ├── run_flow.py      # 固化脚本统一执行入口（自动计时 + attempt 隔离）
+│   ├── run_flow.py      # 固化脚本统一执行入口（自动计时 + attempt 隔离 + 流程日志 tee 落库成 99-run-log 证据，见 decisions #41）
 │   ├── auto_repair.py   # ★「大脑Claude」自愈：run_flow 失败→claude诊断→只改导航/健壮性→重跑(≤3次)
 │   ├── new_run.py       # 开一轮新回归（建看板 + 生成 run_id + 归档重置）
 │   ├── sheets_sync.py   # ledger → Google Sheets（单向覆盖，服务账号，瞬时5xx自动重试）；桌面执行台每轮收尾自动调
@@ -79,7 +82,7 @@ AI_auto_test/
 │   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38；多设备时用例行尾设备chips逐格分派，见decisions #39)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
 │   │   ├── RunMonitor.vue     # Runner 内嵌的运行监控子组件（流式日志/状态，不单独作为 tab）；数据源可为实时 runStore 或传入的 source 快照（执行记录复用）
 │   │   ├── RunHistory.vue     # 「执行记录」子tab：列出保存的执行台快照(run_records/)、按 id 切换、用 RunMonitor 只读渲染（makeRecordSource 包快照）
-│   │   ├── Evidence.vue       # 证据查看器（截图/ui dump/日志），MVP-1 首个落地面；左栏按 设备(可收起)→用例→attempt 三层分组(不同设备跑的用例不同)，设备名走 read_device_aliases 映射
+│   │   ├── Evidence.vue       # 证据查看器（截图/ui dump/日志），MVP-1 首个落地面；左栏按 设备(可收起)→用例→attempt 三层分组(不同设备跑的用例不同)，设备名走 read_device_aliases 映射；文本证据逐行渲染+关键行标红/定位(与 run_flow.KEY_LINE_RE 同口径)
 │   │   ├── Boards.vue         # 看板视图，点条目可跳到 Evidence
 │   │   └── Cleanup.vue        # 「清理」：扫描随使用堆积的历史文件(证据/APK/记录归档/缓存回收站/构建缓存五类)，按类别结构化列出(名称/大小/时间/受保护)，勾选后移进系统废纸篓(非硬删除)。后端 scan_cleanup + move_to_trash(trash crate)；开发构建缓存在只装打包 app 的机器上扫不到(if p.exists)天然隐身
 │   ├── src/{api.ts,store.ts,runStore.ts}  # Tauri invoke 封装 / 全局状态 / 执行态状态

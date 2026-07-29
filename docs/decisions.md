@@ -308,3 +308,31 @@
 - **时机的选择（问过用户）**：给了三个候选——①跑用例时预先勾选（登记前拦截，尚未开始登记的可跳过）；②登记中途可中断（杀正在跑的 `issue_register.py` 子进程）；③登记完成后可撤销（从 `issues.csv` 删记录）。**用户选①**：这是唯一不需要碰正在跑的 python 子进程生命周期、也不需要碰已落盘 CSV 回滚的方案，风险最小、和现有"串行收尾"架构最贴合。
 - **决定**：`RunCell` 加 `issueSkip: boolean`（默认 `false`），`runStore.toggleIssueSkip(serial, caseId)` 允许用户随时切换——但只在 `cell.issue === "none"`（收尾流程还没跑到这一格）时生效，一旦进了 `registering/registered/manual` 就定型、切换不再有效（不做"撤销已登记"，不在这次范围内）。因为格子一旦跑完（`status` 变成 `fail`/`needs_human` 等）就可以切换，不需要等到整轮收尾开始——调试时用例一失败就能立刻点掉，不用等全部跑完。`registerIssues()` 里把 `targets` 拆成 `toSkip`/`toRegister` 两份，`toSkip` 直接同步定型成新状态 `issue: "skipped"`（不调用 `issue_register.py`），`issueTotal`（登记分母）只算 `toRegister.length`，不把跳过的算进去，避免头部进度显示被跳过的凑进分母。
 - **UI**：`RunMonitor.vue` 失败摘要 chip 和用例卡片上，`issue === "none"` 时显示一个「登记/不登记」切换小按钮（`canToggleSkip`），点它不冒泡到卡片本身的选中/日志联动（`@click.stop`）。case-card 从 `<button>` 改成 `<div role="button">`——嵌套按钮在 HTML 里非法，且切换按钮需要独立可点。`skipped` 状态复用 `issue-pill` 展示（灰底"已跳过"），和 `manual`（待人工）一样常驻显示，不像 `registered` 那样自动隐藏——用户手动选的、和默认路径不一样的结果，值得留痕方便回头确认当时为什么没登记。
+
+## 41. 固化脚本流程日志落库成证据（`99-run-log`），失败根因不再只活在「实时过程」栏（2026-07-29）
+
+- **背景**：固化脚本自己 `log` 出来的判定过程/根因（如 SPLIT-CORE-01 的「严重异常：结果页显示的是设备上历史遗留的分割产物而非本次导出，跳过重命名」）只经 stdout 流到桌面壳「实时过程」那一栏，**跑完/换页/换批次就没了**——「证据」tab 里只有截图 + 那一句 `shot` 断言，看图完全看不出为什么判失败，回头复盘只能重跑。
+- **决定**：`run_flow.py` 对固化脚本的输出做 **tee**——一路原样逐行写回自己的 stdout（Rust `pump` 逐行泵、`auto_repair` 逐行透传，实时性和行为全不变），一路攒在内存，收尾调 `adbkit attach` 落成本 attempt 的 `logs/99-run-log.txt` 并登记进 `evidence.csv`。**不在 run_flow 里自己拼 evidence 路径**：证据目录分层/attempt 段/登记格式只有 adbkit 一处规则（`evid_dir` + `_append_evidence`），两处各写一遍必然漂移。
+- **`adbkit attach` 新子命令**：把现成文本（`--from` 文件或 stdin）落进证据目录并登记，`--sub/--ext/--etype/--note/--result` 可配。给「不是 adbkit 自己采的、但同样该进证据链」的产物留的通用口子，目前唯一调用方是 run_flow。
+- **断言列带关键行摘要**：`_key_lines()` 按 `KEY_LINE_RE`（`严重异常|校验未通过|不一致|✖|未见|异常退出|命中崩溃|FAILED=[1-9]`）从日志里摘出关键行拼进证据「断言」列（截断 600 字），**不用点开文件**、证据面板扫一眼列表就能看到根因。结果列按 exit code 判（脚本内部 FAILED 与 exit 绑定，见 #34）：`exit=0`→通过，否则失败；SIGTERM 中止路径也登记（结果记「需复核」、备注「被用户中止」），跑到一半的日志同样留档。
+- **全程按字节，不解码**：tee 用 `sys.stdout.buffer` + `Popen` 二进制管道，attach 用 `stdin.buffer.read()`/`write_bytes`，Rust 侧 `read_text_file` 从 `fs::read_to_string` 改成 `fs::read` + `from_utf8_lossy`。原因是 flow 在 `LC_ALL=C` 下跑 /bin/bash 3.2 偶发会搅出坏字节（见 gotchas「多字节 bug」）——任何一环走文本模式解码，都会把跑完的用例冤判失败（Python 抛 `UnicodeDecodeError`）或让整份日志在面板上读不出来（Rust 报 "stream did not contain valid UTF-8"）。
+- **证据面板配套**：`Evidence.vue` 文本证据从整块 `<pre>` 改成**逐行渲染**，命中同一套关键行正则的行标红，切到该条证据时自动滚到第一条关键行，meta 行给一个「⚠ 关键行 n/N · 定位下一条」按钮循环跳转——几百行日志里那一句根因否则根本找不到。**前端正则与 `run_flow.py` 的 `KEY_LINE_RE` 是同一套口径，改一处要同步另一处。**
+- **已知边界**：`auto_repair.py`（自愈模式）自己 print 的 claude 诊断输出不在 run_flow 的 tee 范围内，不进证据；它每次重跑经 run_flow 各是一个 attempt，所以每次重跑各留一条 `99-run-log`。
+
+## 42. 设置页加「headless 调用模型」选择器，`AppConfig` 新增 `claude_model` 一个字段管两处调用（2026-07-29）
+
+- **背景**：桌面壳里会 headless 调 `claude` CLI 的地方其实有两处，不止「脚本自愈」——`run_flow_repair`→`tools/auto_repair.py`（诊断改脚本，读 `AUTO_REPAIR_MODEL` 环境变量，默认 `claude-sonnet-5`）和收尾「问题登记」`register_issue`→`tools/issue_register.py`（写 issues.csv，读 `ISSUE_REGISTER_MODEL`，同样默认 `claude-sonnet-5`）。这两个 env var 早就支持覆盖，但桌面壳从没设置过，用户想要的"能在设置页选模型"缺个入口。
+- **决定**：不给两处分别配置——`AppConfig` 只加一个 `claude_model: String` 字段（存 `app_config.json`），`run_flow_repair`/`register_issue` 两个 Rust 命令 spawn 子进程时都显式 `cmd.env(...)` 注入（分别对应各自的环境变量名）。**显式设置这一步很关键**：Python 侧是 `os.environ.get(KEY, "claude-sonnet-5")`，若 Rust 不设这个 env，两个工具各退回各自写死的默认值，桌面壳配置形同虚设；显式设置后哪怕值是空串（用户选"跟随 CLI 默认"）也会覆盖掉 Python 自己的默认，因为 `os.environ.get` 只要键存在就不看 default。
+- **空串的语义**：`claude_model=""` 不是"没配"，是用户显式选的"跟随 claude CLI 自身默认模型"这一档（对应 auto_repair.py/issue_register.py 注释里"传空串则不加 `--model`"）。`load_app_config` 里区分"JSON 键缺失"（老配置/首次用，落 `claude-sonnet-5` 默认）和"键存在但是空串"（保留空串）——不能偷懒用 `unwrap_or_default()`，那样会把用户显式选的"跟随默认"这一档在下次读盘时错当成"没配"又冲回 `claude-sonnet-5`。
+- **`set_app_config` 的 `claude_model` 参数设成 `Option<String>`**：因为老代码点「保存并进入」主按钮时只传 root+python 两个值（不碰模型），若这里也强制要求传值、前端漏传就会传空字符串把用户已选的模型悄悄冲掉。`None` 时读旧配置里已存的值原样写回，不覆盖。
+
+## 43. 删掉「设为默认设备」，`target.json` 的 `serial` 不再兼具"默认执行设备"语义（2026-07-29）
+
+- **背景**：桌面壳「设备」tab 有个「设为默认」按钮，写回 `apps/<slug>/target.json` 的 `serial` 字段；`run_flow.py`/`auto_repair.py`/`judge_result.py`/`case_result.py`/`issue_register.py`/`adbkit.py` 在命令行没传 `--serial`/位置参数时都会退回读这个字段当默认设备。#39 落地多设备并行后，这个"默认设备"就是个隐患：矩阵跑（同一用例多台设备各跑一份）时，任何一个调用点漏传 `--serial` 会悄悄退回 `target.json` 里那个可能早就过期/不在线的序列号，执行明细表 `executions.csv` 的 `(用例, 设备)` 行会写错设备，`judge_result.py` 里已经踩过这个坑并留了注释（"不传会退回 target.json 的默认 serial，矩阵跑时判定会串台"）。既然桌面壳的执行台/主循环现在都是显式传 serial，这个"默认设备"概念纯粹是历史遗留的单设备时代产物，留着只会增加串台风险，没有正面价值。
+- **决定**：整个删掉"默认设备"这个概念，不是加校验/加警告，是删掉写入口和所有兜底读取——
+  - 桌面壳：`Devices.vue` 去掉「设为默认/当前默认」按钮和说明文案；`commands.rs` 删 `set_target_serial` 命令、`DeviceRow.is_default` 字段、`adb_devices()`/`list_devices` 里算 `is_default` 的逻辑；`lib.rs` 去掉命令注册；`Runner.vue` 首次进页面自动选中的设备从"找 is_default，没有则退回第一台在线"改成直接"选第一台在线"（纯 UX 兜底，不读任何持久化配置）。
+  - `run_flow.py`/`auto_repair.py`/`judge_result.py`/`issue_register.py`：`serial` 从可选位置参数（`nargs="?"` + 退回 `cfg.get("serial")`）改成必传位置参数，不传直接被 argparse 拦掉，不再有"退回配置默认值"这条路。
+  - `case_result.py`：`--serial` 从可选（默认退回 `cfg.get("serial")`）改成 `required=True`；连带修了 `detect_coverage()`——原来查 `cfg["serial"]`（可能是过期的默认设备）,现在查的是本次判定真正传入的那台 `serial`，否则"历史覆盖情况"文案会对不上实际执行的设备。
+  - `adbkit.py`：模块级 `SERIAL` 不再读 `CFG.get("serial", "")`，改成默认空串，只认 `--serial` 显式传入。**这里不是"改成必传"**——`adbkit.py` 同时服务主循环逐屏探索模式（`docs/RUNBOOK.md` 里 `python3 tools/adbkit.py --case <ID> ui <step>` 这类不带 `--serial` 的手动调用），单设备在线时省掉 `--serial` 让 adb 原生行为兜底（只有一台在线，`adb` 不加 `-s` 自动就选中它）是合理且常用的交互方式，跟"退回配置里存的默认设备"是两件不同的事——去掉的只是后者。
+  - `preflight.py`：原来"设备"自检直接拿 `cfg.get("serial")` 当目标去比对是否在线；改成先列出全部在线设备，`--serial` 可选传入指定用哪台跑 #2/#3（App/素材）检查，只有一台在线时自动选它，多台在线又没传 `--serial` 就明确报"跑不出来，需要指定"而不是静默退回一个可能不对的设备。
+- **教训**：一个"没传就退回配置默认值"的兜底，在单设备时代是省事的便利，多设备并行落地后就变成沉默的错误来源——`judge_result.py` 那条注释其实已经预警过，但预警留在注释里、代码路径没删，后续任何一个新加的调用点还是可能漏传 `--serial` 踩回这个坑。真正根治的办法不是到处加"记得传 serial"的提醒，是让缺 serial 直接报错（argparse 必传参数/`required=True`），把"忘传"从"悄悄跑错设备"变成"当场跑不起来"。

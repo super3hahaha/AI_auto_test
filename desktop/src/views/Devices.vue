@@ -35,17 +35,6 @@ function statePill(state: string) {
   return "pill-warning";
 }
 
-async function setDefault(serial: string) {
-  msg.value = "";
-  try {
-    await api.setTargetSerial(store.activeSlug, serial);
-    msg.value = `已设为默认目标设备（写入 ${store.activeSlug} 的 target.serial）：${serial}`;
-    await load();
-  } catch (e: any) {
-    err.value = String(e);
-  }
-}
-
 // 别名编辑（增/改）
 const editingSerial = ref<string | null>(null);
 const editAlias = ref("");
@@ -140,7 +129,7 @@ onMounted(load);
       <button @click="exportDevices">导出</button>
       <button @click="importDevices">导入</button>
     </div>
-    <p class="muted">选一台设为默认目标（写回当前 App 的 <span class="mono">target.serial</span>），执行台与主循环默认用它。别名登记存在 <span class="mono">config/device_aliases.json</span>，跨 App 共享。</p>
+    <p class="muted">执行台里逐次显式指定要跑的设备，这里只管理设备别名登记。别名登记存在 <span class="mono">config/device_aliases.json</span>，跨 App 共享。</p>
 
     <div v-if="showAdd" class="card add-form">
       <input v-model="newSerial" placeholder="序列号（adb devices 可查）" class="mono" />
@@ -180,8 +169,6 @@ onMounted(load);
           <td>{{ d.model || "—" }}</td>
           <td>{{ d.os_version ? `Android ${d.os_version}` : "—" }}</td>
           <td class="right">
-            <span v-if="d.is_default" class="pill pill-accent">当前默认</span>
-            <button v-else-if="d.state === 'device'" @click="setDefault(d.serial)">设为默认</button>
             <button class="mini danger" @click="removeDevice(d)">删除</button>
           </td>
         </tr>

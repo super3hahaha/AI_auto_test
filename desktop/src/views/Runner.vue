@@ -79,10 +79,11 @@ function toggleRowDev(caseId: string, serial: string) {
 function resetRowDevs(caseId: string) {
   delete rowSerials[caseId];
 }
-// chips 显示文本：优先设备别名，退回 serial 尾 4 位（完整 serial 放 title 悬停可见）
+// chips 显示文本：优先设备别名，其次型号（无线设备 serial 是 ip:port，截尾 4 位会变成端口号 5555，
+// 没意义，所以型号优先于截尾兜底），最后才退回 serial 尾 4 位（完整 serial 放 title 悬停可见）
 function chipLabel(serial: string) {
   const d = devices.value.find((x) => x.serial === serial);
-  return d?.alias || serial.slice(-4);
+  return d?.alias || d?.model || serial.slice(-4);
 }
 function chipTitle(serial: string) {
   const d = devices.value.find((x) => x.serial === serial);
@@ -211,8 +212,8 @@ async function loadDevices() {
   const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
   pickedSerials.value = pickedSerials.value.filter((s) => online.has(s));
   if (!pickedSerials.value.length) {
-    const def = devices.value.find((d) => d.is_default) || devices.value.find((d) => d.state === "device");
-    if (def) pickedSerials.value = [def.serial];
+    const first = devices.value.find((d) => d.state === "device");
+    if (first) pickedSerials.value = [first.serial];
   }
 }
 

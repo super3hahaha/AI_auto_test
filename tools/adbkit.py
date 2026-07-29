@@ -26,7 +26,7 @@ CFG = load_cfg()       # 当前活跃 App 的 apps/<slug>/target.json（AITEST_A
 PKG = CFG["package"]
 MAIN_ACTIVITY = CFG.get("main_activity", "")
 DB = CFG.get("db_name", "")
-SERIAL = CFG.get("serial", "")
+SERIAL = ""  # 只认 --serial（多设备并行下没有"默认设备"；不传时留空，单设备在线场景下 adb 自动选中那台）
 EVID_ROOT = ROOT / CFG.get("evidence_root", "evidence")
 EVID_LEDGER = LEDGER / "evidence.csv"  # 采证即登记的账本（每次采集自动追加一行）；LEDGER=apps/<slug>/ledger
 APP = CFG.get("app_slug") or CFG.get("app_name") or PKG.split(".")[-1]  # 证据目录用的简称，跟展示用 app_name 分开（见 gotchas.md）
@@ -370,21 +370,75 @@ def _dump_tree(cache_screen=None):
 
 
 def _dump_tree_shell(cache_screen=None):
+    try:
+        return _nodes_from(_dump_xml_shell(cache_screen))
+    except ET.ParseError:
+        sys.exit("[dump] UI 树解析失败（dump 可能为空或界面在动画中）。稍后重试或先 `ui` 观察。")
+
+
+def _dump_xml_shell(cache_screen=None):
+    """shell 后端 dump 一次 UI 树到 host 端临时文件，返回该路径（不解析）。
+    _dump_tree_shell / _dump_root / _dump_xml_to 都走这里，别再各写一份 dump 调用——
+    下面那套「null root node」重试+旧文件防陈旧的硬化只写在这一处（历史上 _dump_xml_to
+    自己另起了一条裸 `uiautomator dump` 调用，绕过了全部硬化，2026-07-29 合并到本函数）。"""
     # 临时文件按 serial 隔离，支持多设备并行。
     dev = f"/sdcard/_sel_{_safe(SERIAL)}.xml"
     tmp = _scratch("sel.xml")
     if os.path.exists(tmp):
         os.remove(tmp)
-    shell(f"uiautomator dump {dev}")
-    adb("pull", dev, tmp)
-    if not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+    # 【2026-07-29 真机复现的严重坑】`uiautomator dump` 偶发返回
+    # "ERROR: null root node returned by UiTestAutomationBridge."——这不是 dump 卡住/
+    # 抛异常，是 returncode=0、失败信息只在 stderr 里，旧代码完全没检查这个调用的结果。
+    # 更致命的是：dump 失败时设备上 {dev} 这个路径大概率还留着上一次成功 dump 的旧文件，
+    # 紧接着的 `adb pull` 照样能把这份"旧快照"拉下来、文件非空，下面的存在性/非空检查
+    # 完全看不出问题——上层 waitfor/assert-text/tapid 就会拿着几秒/几十秒前的界面状态
+    # 去判断"现在"在不在屏，广告刚关那一下最容易踩中（真机复现：SPLIT-CORE-01 卡在
+    # 首页断言死活不过，但截图明明看着首页干净、「音频分割」清晰可见——根因就是这里，
+    # 断言用的是拉到的陈旧 dump，不是当下的真实画面）。
+    # 【2026-07-29 修正：HOME 键自愈曾经的副作用是"踢走了根本没坏的前台 App"，
+    # 修法不是去掉 HOME，是让按完 HOME 之后必须紧接着把 App 带回前台，不能把调用方
+    # 晾在桌面上】最初复现时试过 adb kill-server/唤醒屏幕都没用，只有按一次 HOME 键
+    # 能让下一次 dump 恢复正常，于是加了"重试到第3次仍失败就按 HOME"这一手；但
+    # MERGE-FMT-01 真机排查发现，HOME 会把当下仍在正常运行、只是恰好被 uiautomator
+    # 抽风 miss 掉无障碍树的前台 App 直接踢下桌面，且原来的代码按完 HOME 就完事、
+    # 没有任何"回去"的动作——调用方（`waitfor`/`tapid` 等）后续所有判断都基于一个
+    # 已经不在前台的 App，看起来就像"App 卡死/崩溃"（决定性验证：同样的操作，只要不
+    # 触发这段 HOME 恢复、纯用不依赖 uiautomator 的 screencap 观察，App 全程正常渲染，
+    # 连续 90 秒无异常）。
+    # 现在的策略：仍保留 HOME 恢复手段（应对 SPLIT-CORE-01 那类真实卡住的 dump 服务），
+    # 但按完 HOME 立刻 `am start` 把同一个 App 带回前台——HOME 只是把任务切到后台、
+    # 不会杀掉进程/回退栈，紧接着重新 start 会把原有任务原样带回前台、恢复到 HOME 前
+    # 那一屏，不是从头重启（同类恢复见 docs/gotchas.md RING-LIB-01「BACK 退到桌面→
+    # launch 重进后正常进详情页」，已真机验证过任务回退栈不会丢）。同时把原地重试的
+    # 次数和间隔也拉长，减少真正要触发 HOME 这一步的概率。
+    last_err = ""
+    ATTEMPTS = 6
+    HOME_RECOVER_AT = 3  # 第 4 次（0-indexed=3）仍失败才动用 HOME+带回前台，不要一失败就按
+    for attempt in range(ATTEMPTS):
+        shell(f"rm -f {dev}")
+        r = shell(f"uiautomator dump {dev}")
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        if "ERROR" not in out and "null root node" not in out:
+            break
+        last_err = out or f"exit={r.returncode}"
+        if attempt == HOME_RECOVER_AT:
+            adb("shell", "input keyevent KEYCODE_HOME")
+            time.sleep(0.5)
+            if MAIN_ACTIVITY:
+                shell(f"am start -n {PKG}/{MAIN_ACTIVITY}")
+            else:
+                shell(f"monkey -p {PKG} -c android.intent.category.LAUNCHER 1")
+            time.sleep(1.0)
+        else:
+            time.sleep(0.6)
+    else:
+        sys.exit(f"[dump] uiautomator dump 连续 {ATTEMPTS} 次失败（serial={SERIAL or '默认'}）：{last_err}")
+    pr = adb("pull", dev, tmp, capture=True)
+    if pr.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
         sys.exit(f"[dump] 拉取 UI 树失败（serial={SERIAL or '默认'}）。设备在线吗？先 `adb devices` 确认。")
     if cache_screen:
         shutil.copyfile(tmp, _cache_path(cache_screen))
-    try:
-        return _nodes_from(tmp)
-    except ET.ParseError:
-        sys.exit("[dump] UI 树解析失败（dump 可能为空或界面在动画中）。稍后重试或先 `ui` 观察。")
+    return tmp
 
 
 def _u2_dump_xml(retries=2):
@@ -412,14 +466,35 @@ def _u2_dump_xml(retries=2):
 
 def _dump_xml_to(path):
     """按当前后端把 UI 树 dump 成 XML 文件落到 path——给 cmd_ui 用（它要把 XML 存进证据目录 + 打印全树，
-    需要的是原始 XML 文件而非节点迭代器，所以不复用 _dump_tree）。两后端产物同构。"""
+    需要的是原始 XML 文件而非节点迭代器，所以不复用 _dump_tree）。两后端产物同构。
+    ⚠️ 两后端产物「同构」只指字段和层级，**排版不同**：u2(dump_hierarchy) 是缩进多行、
+    一节点一行；shell(uiautomator dump) 是整份挤在一行。任何消费这份 XML 的代码都必须走
+    XML 解析（ET / `bounds` 子命令），不能按行 grep/sed —— 见 cmd_bounds 的 docstring 和
+    docs/gotchas.md 2026-07-29 条目。"""
     path = pathlib.Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     if DUMP_BACKEND == "u2":
         path.write_text(_u2_dump_xml(), encoding="utf-8")
     else:
-        shell("uiautomator dump /sdcard/uidump.xml")
-        adb("pull", "/sdcard/uidump.xml", str(path))
+        shutil.copyfile(_dump_xml_shell(), path)
+
+
+def _dump_root(cache_screen=None):
+    """同 _dump_tree，但返回 XML 根元素（保留父子结构）。
+    _dump_tree 返回的是扁平节点迭代器，拿不到「谁是谁的子节点」——canvas 自绘、没有
+    resource-id 的控件只能靠「父控件 id + 第几个子节点」定位，那条路必须用这个。"""
+    if DUMP_BACKEND == "u2":
+        xml = _u2_dump_xml()
+        if cache_screen:
+            _cache_path(cache_screen).write_text(xml, encoding="utf-8")
+        try:
+            return ET.fromstring(xml)
+        except ET.ParseError:
+            sys.exit("[dump] UI 树解析失败（dump 可能为空或界面在动画中）。稍后重试或先 `ui` 观察。")
+    try:
+        return ET.parse(_dump_xml_shell(cache_screen)).getroot()
+    except ET.ParseError:
+        sys.exit("[dump] UI 树解析失败（dump 可能为空或界面在动画中）。稍后重试或先 `ui` 观察。")
 
 
 def _dump_tree_u2(cache_screen=None):
@@ -562,6 +637,80 @@ def cmd_find(args):
                      from_cache=args.from_cache)
     for i, (c, v, b) in enumerate(hits):
         print(f"  [{i}] {args.by}={v}  center={c}  bounds={b}")
+
+
+def _bounds_tuple(el):
+    m = _BOUNDS.search(el.get("bounds") or "")
+    return tuple(map(int, m.groups())) if m else None
+
+
+def cmd_bounds(args):
+    """打印控件（或它第 N 个子节点）的 bounds/center，机器可读，供固化脚本现算坐标。
+
+    为什么要有这条命令：canvas 自绘的控件没有 resource-id（MP3Cutter 音频分割页的波形就是
+    这样——三段波形+分割线全画在 audio_container 下唯一一个匿名 android.view.View 里），
+    find/tapid 那条链路只吃扁平节点列表，够不着「按父 id + 第几个子节点」这种定位方式。
+
+    【别再在 bash 里 grep/sed 抠 XML】固化脚本以前是自己 `ui` 拿整份 XML 再
+    `grep -A1 '<父控件id>' | tail -1 | sed 's/.*bounds="\\[..\\]".*/../'`，这只在
+    「一节点一行」的排版下成立，而两个 dump 后端排版不一样（见 _dump_xml_to）：
+      - u2：缩进多行 → grep -A1 拿到的正是下一行那个子节点，侥幸算对；
+      - shell：整份 XML 就一行 → grep -A1 拿到整个文件，sed 的贪婪 `.*` 抠到的是
+        **最后一个** bounds（状态栏 [0,0][W,56]），坐标算出来点在状态栏上。
+    2026-07-29 SPLIT-CORE-02 在 shell 后端真机上就这么翻车：点选中间段的 tap 落到状态栏、
+    没点中任何段，选中态还是第2次分割后默认选中的最后一段，于是删掉了第3段（详见
+    docs/gotchas.md）。本命令统一走 ET 解析，与后端/排版无关。
+
+    输出（每行一个 KEY=值，值内以空格分隔，bash 可直接 read）：
+      BOUNDS=l t r b / CENTER=cx cy / SIZE=w h，带 --child 时额外 PARENT_BOUNDS=l t r b
+    """
+    start = time.monotonic()
+    attr = {"id": "resource-id", "text": "text", "desc": "content-desc"}[args.by]
+    src = args.from_xml
+    if args.from_cache and not src:
+        cp = _cache_path(args.from_cache)
+        if cp.exists():
+            src = str(cp)
+    while True:
+        if src:
+            try:
+                root = ET.parse(src).getroot()
+            except (ET.ParseError, OSError) as e:
+                sys.exit(f"[bounds] 读取 {src} 失败：{e}")
+        else:
+            root = _dump_root(cache_screen=args.from_cache)
+        hits = []
+        for n in root.iter("node"):
+            v = n.get(attr, "")
+            ok = (args.value in v) if args.partial else (v == args.value or v.endswith("/" + args.value))
+            if v and ok:
+                hits.append(n)
+        if hits:
+            break
+        if src or args.timeout <= 0 or time.monotonic() - start >= args.timeout:
+            sys.exit(f"[bounds] 没找到 {args.by}={args.value!r}（partial={args.partial}）。"
+                     "界面可能已变，先跑 `ui` 重新观察。")
+        time.sleep(args.interval)
+    if args.index >= len(hits):
+        sys.exit(f"[bounds] {args.by}={args.value!r} 只有 {len(hits)} 个匹配，index={args.index} 越界。")
+    el = hits[args.index]
+    parent_b = None
+    if args.child is not None:
+        kids = [k for k in el if k.tag == "node"]
+        if args.child >= len(kids):
+            sys.exit(f"[bounds] {args.by}={args.value!r} 只有 {len(kids)} 个子节点，"
+                     f"--child {args.child} 越界（界面结构变了？先跑 `ui` 看树）。")
+        parent_b = _bounds_tuple(el)
+        el = kids[args.child]
+    b = _bounds_tuple(el)
+    if not b:
+        sys.exit(f"[bounds] 命中的节点没有可解析的 bounds 属性：{el.get('bounds')!r}")
+    l, t, r, bo = b
+    print(f"BOUNDS={l} {t} {r} {bo}")
+    print(f"CENTER={(l + r) // 2} {(t + bo) // 2}")
+    print(f"SIZE={r - l} {bo - t}")
+    if parent_b:
+        print("PARENT_BOUNDS={} {} {} {}".format(*parent_b))
 
 
 def _tap_selector(by, args):
@@ -927,8 +1076,14 @@ def cmd_logscan(args):
         r = adb("logcat", "-d", capture=True)
         scope = "全局(App未运行,退化)"
     KW = ("FATAL", "ANR", "AndroidRuntime", "SQLiteException", "NativeCrash")
+    # 噪音排除：OPPO/ColorOS 的 `D View: [ANR Warning]onMeasure/onLayout time too long` 是 ROM
+    # 自带的布局耗时 debug 日志（D 级、每次滑列表都刷一堆），不是 ANR。带 "ANR" 关键词直接命中，
+    # 会让所有固化脚本的 `logscan 命中 → FAILED=1` 在慢设备上无脑变红，把真崩溃淹掉
+    # （2026-07-29 oppo a31 RING-LIB-01 真机踩到：21 条命中全是这个）。
+    EXCL = ("[ANR Warning]",)
     hits = [ln for ln in r.stdout.splitlines()
-            if any(k in ln for k in KW) and (pid or PKG in ln)]
+            if any(k in ln for k in KW) and not any(x in ln for x in EXCL)
+            and (pid or PKG in ln)]
     out.write_text("\n".join(hits))
     print(f"[logscan] {scope}，{len(hits)} 条命中 → {out}")
     _append_evidence(case, args.label, "logs", out,
@@ -1188,10 +1343,29 @@ def cmd_alarm(args):
     print(r.stdout)
 
 
+def cmd_attach(args):
+    """把一份现成的文本（--from 文件 或 stdin）落进本 attempt 的证据目录并登记成证据行。
+
+    给「不是 adbkit 自己采的、但同样该进证据链」的产物用——目前唯一调用方是 run_flow.py，
+    把固化脚本整份流程日志（桌面壳「实时过程」里那些 log 行）落成 logs/99-run-log.txt。
+    没有这一步，失败根因（脚本里 log 出来的「严重异常：…」这类）只活在当次运行窗口里，
+    跑完/换页就没了，「证据」tab 只剩截图+断言，看不出为什么判失败。
+    落哪个目录、attempt 段怎么分、evidence.csv 怎么写，全走 adbkit 这套（evid_dir +
+    _append_evidence），调用方不要自己拼 evidence 路径，免得两处规则漂移。
+    按字节读写，不解码——flow 脚本在 LC_ALL=C 下把 UTF-8 当不透明字节透传，偶发坏字节
+    走文本模式会抛 UnicodeDecodeError（同 run_flow tee / Rust pump 的教训）。"""
+    case = need_case(args)
+    data = pathlib.Path(args.src).read_bytes() if args.src else sys.stdin.buffer.read()
+    out = evid_dir(case, args.sub) / f"{args.name}.{args.ext}"
+    out.write_bytes(data)
+    print(f"[attach] {len(data)} 字节 → {out}")
+    _append_evidence(case, args.name, args.etype, out, assertion=args.note, result=args.result)
+
+
 def build_parser():
     p = argparse.ArgumentParser(description="adbkit —— ADB 封装工具层")
     p.add_argument("--case", help="当前用例 ID，证据归到该用例目录")
-    p.add_argument("--serial", help="目标设备序列号，覆盖 config.serial（多设备并行时按次指定）")
+    p.add_argument("--serial", help="目标设备序列号（多设备/矩阵跑必传；单设备在线时可省，adb 自动选中那台）")
     p.add_argument("--dump-backend", dest="dump_backend", choices=["shell", "u2"], default=None,
                    help="UI dump 后端，覆盖 target.json 的 dump_backend：shell(纯adb,零依赖) / u2(uiautomator2,需装atx,快约4倍)")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1244,6 +1418,21 @@ def build_parser():
     s.add_argument("--from", dest="from_xml", default=None, help="从已有 UI dump(xml) 定位")
     s.add_argument("--from-cache", dest="from_cache", default=None, help="按 screen_id 查 .dumpcache 定位")
     s.set_defaults(fn=cmd_find)
+    s = sub.add_parser("bounds", help="打印控件(或其第N个子节点)的 bounds/center，机器可读，供固化脚本现算坐标")
+    s.add_argument("by", choices=["id", "text", "desc"])
+    s.add_argument("value")
+    s.add_argument("--index", type=int, default=0, help="多个匹配时取第几个(默认0)")
+    s.add_argument("--child", type=int, default=None,
+                   help="取命中节点的第N个子节点的 bounds（0起）。canvas 自绘、没有 resource-id 的控件"
+                        "（如波形 View）只能这么定位；同时额外打印 PARENT_BOUNDS 供调用方做包含性校验")
+    s.add_argument("--partial", action="store_true")
+    s.add_argument("--from", dest="from_xml", default=None, help="从已有 UI dump(xml) 定位，省去重新 dump")
+    s.add_argument("--from-cache", dest="from_cache", default=None,
+                   help="按 screen_id 查 .dumpcache；命中则免 dump（配合 `ui <step>` 顺手种的缓存，"
+                        "保证算坐标用的就是落进证据目录那一份 XML），未命中则活 dump 并写入该槽")
+    s.add_argument("--timeout", type=float, default=0.0, help="找不到时轮询等待秒数(默认0=单次)")
+    s.add_argument("--interval", type=float, default=0.5, help="轮询间隔秒(默认0.5)")
+    s.set_defaults(fn=cmd_bounds)
     s = sub.add_parser("waitfor")
     s.add_argument("by", choices=["id", "text", "desc"])
     s.add_argument("value")
@@ -1326,13 +1515,22 @@ def build_parser():
                          "传此参数会自动触发ffprobe pull，不需要另加--ffprobe")
     s.set_defaults(fn=cmd_output_check)
     s = sub.add_parser("alarm"); s.add_argument("label"); s.set_defaults(fn=cmd_alarm)
+    s = sub.add_parser("attach", help="把现成文本(--from 文件/stdin)落进本 attempt 证据目录并登记证据行")
+    s.add_argument("name", help="步骤名，同时用作文件名（如 99-run-log）")
+    s.add_argument("--from", dest="src", default=None, help="来源文件；不传则读 stdin")
+    s.add_argument("--sub", default="logs", help="证据子目录（screenshots/logs/ui，默认 logs）")
+    s.add_argument("--ext", default="txt", help="文件后缀，默认 txt")
+    s.add_argument("--etype", default="logs", help="证据类型列，默认 logs")
+    s.add_argument("--note", default="", help="写进证据断言列的一句话说明")
+    s.add_argument("--result", default="", help="结果列判定词（通过/失败/阻塞/覆盖缺口/需复核）")
+    s.set_defaults(fn=cmd_attach)
     return p
 
 
 if __name__ == "__main__":
     args = build_parser().parse_args()
     if getattr(args, "serial", None):
-        SERIAL = args.serial  # 覆盖 config.serial
+        SERIAL = args.serial
     if getattr(args, "dump_backend", None):
         DUMP_BACKEND = args.dump_backend  # 覆盖 config.dump_backend
     args.fn(args)

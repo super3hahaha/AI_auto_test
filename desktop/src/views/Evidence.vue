@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, reactive, computed, onMounted, onUnmounted, watch } from "vue";
+import { ref, reactive, computed, onMounted, onUnmounted, watch, nextTick } from "vue";
 import { api, fileSrc, type EvidenceRow } from "../api";
 import { store } from "../store";
 import { openUrl } from "@tauri-apps/plugin-opener";
@@ -76,10 +76,28 @@ function segs(r: EvidenceRow): { serial: string; attempt: string } {
 const attemptOf = (r: EvidenceRow) => segs(r).attempt;
 const serialOf = (r: EvidenceRow) => segs(r).serial;
 
+// 证据路径里的 serial 段是 tools/adbkit.py `_safe()` 清洗过的文件名片段（冒号等特殊字符换成
+// 下划线，如 "192.168.209.239:5555" → "192.168.209.239_5555"），而 aliases/型号缓存的 key
+// 是原始 adb serial（带冒号）——两边不清洗成同一种形态就永远查不到，无线设备退化显示成
+// "ip_port" 这种半吊子文本。这里镜像同一条清洗规则，把两张表都按"清洗后 key"多建一份索引。
+function sanitizeSerial(s: string): string {
+  return s.replace(/[^A-Za-z0-9._-]/g, "_");
+}
+function buildLookup(kvs: { key: string; value: string }[]): Record<string, string> {
+  const m: Record<string, string> = {};
+  for (const { key, value } of kvs) {
+    m[key] = value;
+    m[sanitizeSerial(key)] = value;
+  }
+  return m;
+}
 // 序列号→别名映射（config/device_aliases.json），把 serial 显示成友好名
 const aliasMap = ref<Record<string, string>>({});
+// 序列号/ip:port→型号缓存（config/device_info_cache.json），别名没登记时兜底显示型号，
+// 避免无线设备（serial 形如 192.168.x.x:5555）直接露出 ip:port
+const modelMap = ref<Record<string, string>>({});
 const deviceLabel = (serial: string) =>
-  serial === "-" ? "(未知设备)" : aliasMap.value[serial] || serial;
+  serial === "-" ? "(未知设备)" : aliasMap.value[serial] || modelMap.value[serial] || serial;
 
 // 设备分组的收起状态：记住被收起的 serial（默认全展开）
 const collapsedDevices = reactive(new Set<string>());
@@ -88,20 +106,38 @@ function toggleDevice(serial: string) {
   else collapsedDevices.add(serial);
 }
 
+// 组内最新采集时间（"YYYY-MM-DD HH:MM"，字典序即时间序）。列错位的脏行/空值直接忽略。
+const TS_RE = /^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}/;
+function latestTs(list: EvidenceRow[]): string {
+  let best = "";
+  for (const r of list) {
+    const t = (r.collected_at || "").trim();
+    if (TS_RE.test(t) && t > best) best = t;
+  }
+  return best;
+}
+
 // 按 attempt 拆分子分组——同一设备上同一用例可能重复执行多次
-function splitByAttempt(list: EvidenceRow[]): [string, EvidenceRow[]][] {
+function splitByAttempt(list: EvidenceRow[]): { attempt: string; ts: string; rows: EvidenceRow[] }[] {
   const m = new Map<string, EvidenceRow[]>();
   for (const r of list) {
     const key = attemptOf(r) || "-";
     if (!m.has(key)) m.set(key, []);
     m.get(key)!.push(r);
   }
-  // attempt 倒序：最新一次执行排在最前（"-" 兜底键排最后）
-  return [...m.entries()].sort((a, b) => {
-    if (a[0] === "-") return 1;
-    if (b[0] === "-") return -1;
-    return b[0].localeCompare(a[0]);
+  const groups = [...m.entries()].map(([attempt, rows]) => ({ attempt, rows, ts: latestTs(rows) }));
+  // 最新一次执行排在最前。attempt 目录名只有 HHMMSS 没有日期，按名字排会跨天错序
+  // （今天 09:29 那次会被排到昨天 20:01 之后），所以优先按采集时间倒序，
+  // 两边都拿不到时间时才退回目录名；"-"（旧布局无 attempt 段）恒排最后。
+  groups.sort((a, b) => {
+    if (a.attempt === "-") return 1;
+    if (b.attempt === "-") return -1;
+    if (a.ts && b.ts) return a.ts === b.ts ? b.attempt.localeCompare(a.attempt) : b.ts.localeCompare(a.ts);
+    if (a.ts) return -1;
+    if (b.ts) return 1;
+    return b.attempt.localeCompare(a.attempt);
   });
+  return groups;
 }
 
 // 侧栏三层树：设备(最外) → 用例 → attempt。不同设备跑的用例不一样，故用例挂在各自设备下。
@@ -150,6 +186,46 @@ function ensureSelection() {
 
 const current = computed(() => items.value[Math.min(currentIndex.value, items.value.length - 1)]);
 
+// ── 文本证据（主要是 run_flow.py 登记的 99-run-log 整份流程日志）的关键行定位 ──
+// 固化脚本 log 出来的失败根因（「严重异常：…」这类）以前只在执行台「实时过程」那一栏、跑完就没了；
+// 现在整份日志作为一条 logs 证据落库，这里负责把它渲染成逐行、把关键行标红并自动滚过去——
+// 否则几百行日志里那一句根因根本找不到。正则与 tools/run_flow.py 的 KEY_LINE_RE 同一套口径（改一处记得同步）。
+const KEY_LINE_RE = /严重异常|校验未通过|不一致|✖|未见|异常退出|命中崩溃|FAILED=[1-9]/;
+const textBox = ref<HTMLElement | null>(null);
+const hlLine = ref(-1);
+const keyCursor = ref(0);
+let hlTimer: number | undefined;
+
+const textLines = computed(() => {
+  const c = current.value;
+  if (!c || c.is_image) return [];
+  return (textCache.value[c.path] ?? "").split("\n");
+});
+const keyLines = computed(() =>
+  textLines.value.reduce<number[]>((acc, l, i) => (KEY_LINE_RE.test(l) ? (acc.push(i), acc) : acc), [])
+);
+const keyLineSet = computed(() => new Set(keyLines.value));
+
+// 定位到第 n 条关键行（越界回绕），高亮 2.2s 后褪掉
+function jumpToKey(n: number) {
+  const list = keyLines.value;
+  if (!list.length) return;
+  keyCursor.value = ((n % list.length) + list.length) % list.length;
+  const line = list[keyCursor.value];
+  hlLine.value = line;
+  nextTick(() => {
+    textBox.value?.querySelector(`[data-line="${line}"]`)?.scrollIntoView({ block: "center", behavior: "smooth" });
+  });
+  if (hlTimer) window.clearTimeout(hlTimer);
+  hlTimer = window.setTimeout(() => { hlLine.value = -1; }, 2200);
+}
+// 换证据/内容读到后自动停在第一条关键行（没有关键行就停在开头，不动）
+watch(textLines, () => {
+  hlLine.value = -1;
+  keyCursor.value = 0;
+  if (keyLines.value.length) jumpToKey(0);
+});
+
 function pickFirst() {
   currentIndex.value = 0;
 }
@@ -187,9 +263,15 @@ onMounted(async () => {
   if (!store.runs.length) await store.loadRuns();
   try {
     const kvs = await api.readDeviceAliases();
-    aliasMap.value = Object.fromEntries(kvs.map((k) => [k.key, k.value]));
+    aliasMap.value = buildLookup(kvs);
   } catch {
-    /* 别名读不到无妨，退化为显示 serial */
+    /* 别名读不到无妨，退化为显示型号/serial */
+  }
+  try {
+    const kvs = await api.readDeviceModelCache();
+    modelMap.value = buildLookup(kvs);
+  } catch {
+    /* 型号缓存读不到无妨，退化为显示 serial */
   }
   window.addEventListener("keydown", onKey);
   await loadEvidence();
@@ -244,10 +326,14 @@ const selRun = computed(() => store.selectedRun());
                   </button>
                 </div>
                 <template v-if="isExpanded(dev.serial, cs.caseId)">
-                  <template v-for="[attempt, group] in cs.attempts" :key="attempt">
-                    <div class="attempt-hd muted">attempt {{ attempt }} · {{ group.length }} 项</div>
+                  <template v-for="g in cs.attempts" :key="g.attempt">
+                    <div class="attempt-hd muted">
+                      attempt {{ g.attempt }}
+                      <span v-if="g.ts">· {{ g.ts.slice(5) }}</span>
+                      · {{ g.rows.length }} 项
+                    </div>
                     <div
-                      v-for="r in group"
+                      v-for="r in g.rows"
                       :key="items.indexOf(r)"
                       class="evi-item"
                       :class="{ on: items.indexOf(r) === currentIndex }"
@@ -278,7 +364,16 @@ const selRun = computed(() => store.selectedRun());
         <div class="stage card">
           <template v-if="current">
             <img v-if="current.is_image" :src="fileSrc(current.abs_path)" class="shot" />
-            <pre v-else class="text mono">{{ textCache[current.path] ?? "读取中…" }}</pre>
+            <div v-else-if="textCache[current.path] === undefined" class="text mono muted">读取中…</div>
+            <div v-else ref="textBox" class="text mono">
+              <div
+                v-for="(ln, i) in textLines"
+                :key="i"
+                class="tline"
+                :class="{ key: keyLineSet.has(i), hl: i === hlLine }"
+                :data-line="i"
+              >{{ ln }}</div>
+            </div>
             <button v-if="items.length > 1" class="navbtn left" @click="step(-1)">‹</button>
             <button v-if="items.length > 1" class="navbtn right" @click="step(1)">›</button>
             <div class="counter">← → 方向键切换 · {{ currentIndex + 1 }} / {{ items.length }}</div>
@@ -299,6 +394,10 @@ const selRun = computed(() => store.selectedRun());
             <span class="etype muted">{{ current.etype }}</span>
             <span class="muted device" v-if="serialOf(current)">📱 {{ deviceLabel(serialOf(current)) }}</span>
             <span class="muted attempt" v-if="attemptOf(current)">attempt {{ attemptOf(current) }}</span>
+            <!-- 文本证据（流程日志）里的关键行：点一次跳下一条，日志几百行时靠它找根因 -->
+            <button v-if="keyLines.length" class="keybtn" @click="jumpToKey(keyCursor + 1)">
+              ⚠ 关键行 {{ keyCursor + 1 }}/{{ keyLines.length }} · 定位下一条
+            </button>
             <span class="muted time">{{ current.collected_at }}</span>
           </div>
           <div class="assertion">断言：{{ current.assertion || "（无）" }}</div>
@@ -362,6 +461,12 @@ const selRun = computed(() => store.selectedRun());
 .stage { flex: 1; min-height: 220px; display: flex; align-items: center; justify-content: center; position: relative; overflow: hidden; }
 .shot { max-width: 100%; max-height: 100%; object-fit: contain; }
 .text { max-width: 100%; max-height: 100%; overflow: auto; padding: 16px; font-size: 12px; white-space: pre-wrap; word-break: break-all; align-self: stretch; margin: 0; }
+/* 逐行渲染（而非整块 pre）：流程日志要能按行标红/滚动定位 */
+.tline { min-height: 1.5em; line-height: 1.5; padding: 0 3px; border-radius: 3px; }
+.tline.key { color: var(--text-danger); background: var(--bg-danger); }
+.tline.hl { outline: 1px solid var(--text-danger); outline-offset: -1px; }
+.keybtn { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 0.5px solid var(--text-danger); color: var(--text-danger); background: transparent; cursor: pointer; }
+.keybtn:hover { background: var(--bg-danger); }
 .navbtn { position: absolute; top: 50%; transform: translateY(-50%); width: 30px; height: 30px; border-radius: 50%; background: var(--surface-1); font-size: 18px; line-height: 1; padding: 0; display: flex; align-items: center; justify-content: center; }
 .navbtn.left { left: 10px; }
 .navbtn.right { right: 10px; }

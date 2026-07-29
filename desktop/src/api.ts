@@ -163,7 +163,10 @@ export const api = {
     invoke<EvidenceRow[]>("read_evidence", { appSlug: slug, runId }),
   readTextFile: (relPath: string) => invoke<string>("read_text_file", { relPath }),
   listFlows: (slug: string) => invoke<FlowRow[]>("list_flows", { appSlug: slug }),
-  listDevices: (slug: string) => invoke<DeviceRow[]>("list_devices", { appSlug: slug }),
+  // force=true 才无条件重查安卓版本号（每台一次 adb getprop，无线设备 85~300ms）。默认走缓存优先，
+  // 供执行台这类「顺带刷新」的高频调用方用；设备页的显式「刷新」按钮传 true。
+  listDevices: (slug: string, force = false) =>
+    invoke<DeviceRow[]>("list_devices", { appSlug: slug, force }),
   // 序列号→别名映射（纯读 config/device_aliases.json，不依赖设备在线）；证据按设备分组显示友好名用
   readDeviceAliases: () => invoke<KV[]>("read_device_aliases"),
   // 序列号/ip:port→型号缓存（纯读 config/device_info_cache.json）；没有别名登记时兜底显示型号，
@@ -215,17 +218,18 @@ export const api = {
   applyUpdate: (savePath: string) => invoke<void>("apply_update", { savePath }),
 
   // 流式：返回 promise（resolve 退出码）；onLine 收每行日志。langCode 不传/空串=不注入
-  // LANG_CODE，固化脚本里的 t() 走原文直通（未接过语言机制的脚本行为不变）。
-  runFlow(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, onLine: (line: string) => void) {
+  // LANG_CODE，固化脚本里的 t() 走原文直通（未接过语言机制的脚本行为不变）。followDevice=true
+  // 时给子进程注入 AITEST_FOLLOW_DEVICE=1，让证据版本段现查设备真实安装版本（见「跟随设备」）。
+  runFlow(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, followDevice: boolean, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;
-    return invoke<number>("run_flow", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, onEvent: ch });
+    return invoke<number>("run_flow", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, followDevice, onEvent: ch });
   },
   // 「脚本自愈」执行（失败自动交 claude 诊断+改脚本重跑，至多 3 次）
-  runFlowRepair(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, onLine: (line: string) => void) {
+  runFlowRepair(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, followDevice: boolean, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;
-    return invoke<number>("run_flow_repair", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, onEvent: ch });
+    return invoke<number>("run_flow_repair", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, followDevice, onEvent: ch });
   },
   // 某 App 的多语言文案表覆盖了哪些语言代号（apps/<slug>/lang/strings_table.json）；
   // 该 App 还没建过语言表则返回空数组，场景库据此隐藏语言选择器。

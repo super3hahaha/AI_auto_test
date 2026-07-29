@@ -15,7 +15,7 @@ serial 必传（多设备并行下没有"默认设备"，落 executions.csv 靠�
 """
 import csv, json, os, re, subprocess, sys, argparse, datetime, pathlib, time, signal
 
-from _appctx import REPO, LEDGER, load_cfg as _load_cfg, ledger_lock  # 多 App 路径解析
+from _appctx import REPO, LEDGER, load_cfg as _load_cfg, ledger_lock, probe_installed_version  # 多 App 路径解析
 import exec_ledger  # (run_id, 用例, serial) 执行明细表——多设备并行的逐台真值
 ROOT = REPO
 LOG = LEDGER / "log.csv"
@@ -174,7 +174,13 @@ def main():
     # 证据链接(current_link) 用 run_id 段（无则退回今天日期，兼容旧机器）；停在 serial 层、不含 attempt，
     # 这样它作为前缀能覆盖本 run 该用例的所有 attempt（doc_report 按此前缀筛"本轮"证据）。
     run_seg = cfg.get('run_id') or end_dt.strftime('%Y%m%d')
-    evidence = f"evidence/{app_slug}/{cfg.get('app_version','')}/{run_seg}/{a.case}/{serial}"
+    # 版本段：跟随设备模式（env AITEST_FOLLOW_DEVICE=1）不装机，target.json 里注册时写的
+    # app_version 未必是这台设备真实在跑的版本，现查一次；否则沿用老逻辑直读 config。
+    # 与 adbkit.app_version() 共用 _appctx.probe_installed_version，两处不会分岔。
+    app_ver = cfg.get('app_version', '')
+    if os.environ.get("AITEST_FOLLOW_DEVICE") == "1":
+        app_ver = probe_installed_version(cfg.get("package", ""), serial) or app_ver or "unknown"
+    evidence = f"evidence/{app_slug}/{app_ver}/{run_seg}/{a.case}/{serial}"
 
     if rc == 0:
         note = f"固化脚本正常退出，耗时约{elapsed:.0f}秒"

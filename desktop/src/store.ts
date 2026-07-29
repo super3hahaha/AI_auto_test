@@ -10,6 +10,13 @@ export const store = reactive({
   selectedRunId: "" as string, // 证据查看器锚定的批次
   loadingRuns: false,
   err: "" as string,
+  // 执行台/执行记录的用例卡片点「↗」→ 跳到证据页并定位到该格第一项证据的一次性请求。
+  // 放全局 store 而不是走组件 emit 链：发起方 RunMonitor 嵌在 Runner 里，跟 App.vue 的视图切换
+  // 隔着两层（Boards 那种只隔一层的才用 emit）。App.vue 监听它切视图，Evidence 挂载后消费掉置空。
+  // attempt = 从该格日志的证据路径里抓到的 attempt 段（HHMMSS），用来精确对准「这一次执行」；
+  // startedAt = 这一格开跑的毫秒时间戳，attempt 抓不到时（脚本没产出任何证据）按时间就近配。
+  // 两者都为空/都配不上 → Evidence 退回最新一次并提示。
+  evidenceJump: null as { serial: string; caseId: string; startedAt: number; attempt: string } | null,
 
   async loadConfig() {
     this.cfg = await api.getAppConfig();
@@ -79,6 +86,16 @@ export const store = reactive({
     } finally {
       this.loadingRuns = false;
     }
+  },
+
+  // 发起一次「去证据页看这一格」的跳转。runId 是这一格所属的轮次（实时轮次或历史执行记录里
+  // 记的那一轮）：证据页锚在 selectedRunId 上，先把批次切过去，Evidence 挂载时才读得到对的那份
+  // evidence.csv（后端 evidence_file_for 会按 run_id 去 archive/ 里找归档批次）。runId 传空或
+  // 不在批次列表里（早于 RunRecordMeta.runId 字段存的旧执行记录就是空）→ 保持当前批次不动，
+  // 由 Evidence 侧在找不到目标时给提示，而不是悄悄切到一个不相干的轮次。
+  requestEvidence(serial: string, caseId: string, runId?: string, startedAt = 0, attempt = "") {
+    if (runId && this.runs.some((r) => r.run_id === runId)) this.selectedRunId = runId;
+    this.evidenceJump = { serial, caseId, startedAt, attempt };
   },
 
   selectedRun(): RunRow | undefined {

@@ -9,7 +9,7 @@
 活跃 App 来源优先级：环境变量 AITEST_APP > config/active.json 的 active > apps/ 下唯一子目录。
 桌面壳按左栏选中的 App spawn 工具时设 AITEST_APP；命令行手动跑则靠 active.json。
 """
-import contextlib, fcntl, json, os, pathlib, sys
+import contextlib, fcntl, json, os, pathlib, re, subprocess, sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 APPS = REPO / "apps"
@@ -81,6 +81,25 @@ def ledger_lock():
             fcntl.flock(_LOCK_FH, fcntl.LOCK_UN)
             _LOCK_FH.close()
             _LOCK_FH = None
+
+
+def probe_installed_version(pkg, serial=""):
+    """adb 现查某台设备上 pkg 已装的 versionName；查不到/adb 异常返回 None。
+
+    桌面壳「跟随设备」执行模式（不装机，直接用设备上已装的 App 回归）用它现查证据该落哪个
+    版本目录——不装机时 target.json 里注册时写的 app_version 未必是设备上真实在跑的版本
+    （尤其多设备场景下，各台可能装的版本还不一样）。adbkit.app_version()（决定证据实际落盘
+    目录）与 run_flow.py（决定 executions.csv「证据链接」列的文本）共用这一份实现，避免
+    两处各写一遍导致"文件夹在哪"和"账本记的链接指哪"分岔。"""
+    if not pkg:
+        return None
+    try:
+        args = ["adb"] + (["-s", serial] if serial else []) + ["shell", "dumpsys", "package", pkg]
+        out = subprocess.run(args, capture_output=True, text=True, timeout=10).stdout
+    except Exception:
+        return None
+    m = re.search(r"versionName=(\S+)", out or "")
+    return m.group(1) if m else None
 
 
 TEXT_RESOURCES_FILE = GLOBAL_CONFIG / "text_resources.json"  # 桌面壳「资源库」文本资源登记，跨 App 共享

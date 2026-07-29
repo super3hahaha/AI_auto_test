@@ -21,7 +21,7 @@ Appium 想解决的问题（更强的控件定位、更丰富的手势、更快�
 | 后端 | 实现 | 依赖 | 速度 |
 |---|---|---|---|
 | `shell`（默认） | `adb shell uiautomator dump` | 纯 adb，零额外依赖 | 基线 |
-| `u2`（opt-in） | `uiautomator2` Python 库 `dump_hierarchy()` | 设备装 **atx-agent 常驻组件 + 两个 apk**（`u2.connect()` 首次自动装） | 实测快约 4×（~118ms vs ~510ms） |
+| `u2`（opt-in） | `uiautomator2` Python 库 `dump_hierarchy()` | 设备装 **atx-agent 常驻组件 + 两个 apk**（`u2.connect()` 首次自动装） | 单次 dump 快约 4×（~118ms vs ~510ms），整轮端到端实测约 2×（30min → 15min） |
 
 `u2` 这个库和 Appium 的 **UiAutomator2 driver 系出同源**：两者都基于 Android 官方
 `UiAutomator2` test framework，在设备上跑一个**常驻自动化 server**（u2 是 atx-agent，

@@ -1042,3 +1042,105 @@ App 踢回桌面"。
 `caseIds()` 直接返回它，不再从 `cells` 反推。执行记录快照（`RunRecord`）也要带上这份
 `caseOrder` 一起存盘，`makeRecordSource()` 回放时优先用它；旧记录没有这个字段时兜底退回旧的
 反推逻辑（这些历史记录本来就可能是错的，没法回溯修正，只能兜底不崩）。
+
+## Tauri 同步 `#[tauri::command] pub fn` 跑在主线程上，前端 `Promise.all` 是假并发（2026-07-29）
+
+Tauri 里**不带 `async` 的 command 在主线程执行**（带 `async` 的才走 `async_runtime` 线程池）。两个后果：
+
+1. 命令体里任何阻塞等待（起 adb/python 子进程、慢文件 IO）都会占住主线程，窗口事件循环停摆——
+   表现是"点不动/拖不动/切 tab 一顿"，而不只是数据晚到。
+2. 前端 `await Promise.all([a(), b(), c()])` 里如果这几个 invoke 打的都是同步 command，
+   它们在 Rust 侧仍然**排队串行**执行，总耗时是相加的，`Promise.all` 一点并发都没买到。
+
+本仓 50 个 command 里只有 9 个是 async，多数是纯读小 json/csv（几毫秒，无所谓）。判据是**命令体里
+会不会起子进程或等网络**：会，就必须 `pub async fn` + `tauri::async_runtime::spawn_blocking`
+（本仓既有写法，见 `run_flow`/`sync_sheets`/`list_devices`）。`Runner.vue` 的 `loadAll()` 曾经
+四个 invoke 全是同步 command，其中 `list_devices` 要串行 getprop 4 台设备（~850ms），
+就是靠这条修的（见 `decisions.md` #45）。
+
+## Vue 模板里 `@click="fn"` 会把事件对象当第一个实参传进去（2026-07-29）
+
+给已有函数加可选参数时的隐藏坑。`load()` 加了 `force = false` 之后：
+
+- `@click="load"` → 实参是 `MouseEvent`（truthy）→ **意外走了 force 路径**，而且看不出来。
+- `watch(src, load)` → 实参是 `newValue` → 同样意外 force（这个被 `vue-tsc` 拦下了，
+  `@click` 那个**不会**报错，模板里的类型检查兜不住）。
+- `onMounted(load)` → 无实参，恰好没事。
+
+所以凡是"函数签名加了可选参数、而它被当回调直接传引用"的地方，一律改成显式 arrow
+（`@click="load(true)"` / `() => load()`），别依赖 `vue-tsc` 报错来发现。
+
+## 证据页「第一项」不能用 `items[0]`：CSV 是正序、侧栏 attempt 分组是倒序（2026-07-29）
+
+`evidence.csv` 是追加写的流水（同一用例重跑多次就有多组 attempt，**最老在前**），而 `Evidence.vue`
+侧栏的 attempt 分组按采集时间**倒序**排（最新那次在最上面，见 `splitByAttempt`）。两边方向相反，
+所以「定位到第一项证据」写成 `currentIndex = 0` 是错的——会停在**最老那次执行**的第一条：
+
+- 舞台上是几小时前那轮的截图（实测 CONV-CORE-01 一轮里跑过 3 次：14:22 / 15:06 / 17:51，
+  取下标 0 拿到的是 14:22 那次，而侧栏最上面显示的是 17:51 那组）；
+- 侧栏高亮也跑到下面那一组去，看着像"选中的和显示的不是一个"。
+
+改成 `firstIndex(attIdx)`：从 `deviceGroups` 里取 `cases.attempts[attIdx].rows[0]`（默认第 0 组 = 侧栏
+最上面那组），再 `items.indexOf()` 换成下标。卡片「↗」跳转和侧栏点选用例（`pickFirst()`）都要走它。
+
+**更进一步：卡片「↗」要配到「这一次执行」的那组 attempt，不是"最新一次"。** attempt 段是**该格
+`run_flow` 启动时刻的 HHMMSS**（`tools/run_flow.py`），逐格各不相同——实测一轮里 4 格分别是
+`175125 / 175351 / 175534 / 180715`，而执行记录 id（`20260729-175125`，整轮 `startedAt` 派生）只等于
+**第一格**。所以整轮的 run_id / 记录 id 都不能用来配 attempt。
+
+配对键**直接从该格日志里抓**，不要靠时间戳猜：固化脚本每次采证都会打出证据文件全路径
+（`[ui] 已保存 …/evidence/<slug>/<ver>/<run_id>/<case>/<serial>/<attempt>/ui/xx.xml`），run_id 与
+attempt 两段都在里面，加上用例、serial 就是四段全齐。`RunCell.lines` 本来就随执行记录一起存盘，
+所以历史旧记录同样配得准——**实测本机 15 条记录 98 格全部精确命中**，其中 34 格是 `meta.runId`
+字段加入前存的（光看 meta 根本不知道属于哪一轮，靠日志路径里的 run_id 救回来）。正则要用
+caseId + 媒体目录名双锚定，别只匹配六位数字（日志正文里的时间/字节数会误中）。
+
+只有"脚本刚起来就崩、一条证据都没产出"时日志里没有路径可抓，才退回按该格开跑时刻
+（`RunCell.startedAt`，新加字段）就近配：**不能要求 HHMMSS 严格相等**，`run_flow` 取的是 python 进程
+起来之后的时刻、前端记的是 invoke 之前，差几百毫秒、跨秒边界差 1~2s 是常态——取差值最小且 ≤120s
+的那组（同一格两次重跑至少隔几十秒，不会串）。attempt 只有 HHMMSS 没有日期，跨天会撞名，用组内
+采集时间的日期段排掉。
+
+## `watch` 里做"重置"会盖掉紧接着的精确定位（2026-07-29）
+
+`Evidence.vue` 原来挂着 `watch([selDevice, selCase], () => pickFirst())`——选中的设备/用例一变就把
+证据游标重置到"第一项"。卡片「↗」跳转（`consumeJump`）是**同步**设好 `selDevice`/`selCase` 再设
+`currentIndex`（精确定位到某次 attempt）的，但那个 watcher 在**下一个 flush** 才跑，于是精确定位的结果
+被 `pickFirst()` 盖成"最新一次 attempt"：目标恰好是最新那组时看不出来（早期验证就这么蒙过去了），
+目标不是最新组就跳错（真实症状：RING-SET-01 该去 `153510` 却停在 `180406`）。
+
+改成删掉 watcher、由每个修改点显式调用（`toggleCase` 展开时重置；`ensureSelection` 后由调用方重置；
+`consumeJump` 自己定位、不重置）。**判据**：一个"状态变了就恢复默认值"的 watcher，只要存在"改状态的
+同时想设一个非默认值"的路径，就必然打架——这种重置属于**交互动作的一部分**，写在动作里（显式），
+不要挂在状态上（隐式）。
+
+## `overflow-x: auto` + 自动高度的滚动条条，在 WKWebView 下会"晚一拍改高度"（2026-07-29，证据页缩略图条）
+
+**症状**：从别的 tab 切到「证据」，页面出来后**等几秒**会抖一下、像整块重绘；用户圈出的位置是缩略图条右端
+一根莫名的**竖向滚动条**。
+
+**实测**（用 WKWebView 跑真实 Vue 产物 + 假 IPC 复现，`ResizeObserver` 打点）：
+```
++105ms  .thumbs offsetH=48 clientH=38 hbar=10 vbar=10   ← 第一次布局：只有 48 高，还多一根竖条
++109ms  RESIZE .thumbs 622x48 -> 622x58                  ← 回修 +10px
++109ms  RESIZE .stage  622x434 -> 622x424                ← 舞台 -10px，大图重新 fit
+```
+成因三连：
+1. `overflow-x` 一旦非 `visible`，另一轴的 `visible` 就**计算成 `auto`**（CSS 规范，Blink/WebKit 都这样）；
+2. `::-webkit-scrollbar` 定了尺寸 ⇒ 滚动条**占位**（不是 macOS 覆盖式）。`height:auto` 先按内容算成
+   48（46 缩略图 + 2 padding），横向滚动条再吃掉 10px ⇒ 内容盒只剩 38px 装不下 46px 的缩略图 ⇒
+   **纵向滚动条也冒出来**；
+3. 截图 `onload`（走 `asset://`，十几张全分辨率 PNG 要几百毫秒~几秒）触发下一轮布局，WebKit 才把自动
+   高度回修成 58 —— 这一下 +10px 就是"几秒后抖一下"。**Blink 下量不到**（一次布局就是 58），
+   只在 WebKit 复现，所以只有打包成 app 才看得见。
+
+**修法**：`.thumbs` 高度写死 + 关掉纵向溢出 —— `height: 58px; overflow-y: hidden; flex-shrink: 0`
+（58 = 46 缩略图 + 10 滚动条 + 2 余量），尺寸与图片加载彻底解耦。少写 `overflow-y: hidden` 不够：
+自动高度和滚动条互相依赖的循环还在。
+
+**判据**：**占位滚动条 + `height: auto` 的滚动容器 = 布局循环**。凡是 `overflow-*: auto` 且高度靠内容
+撑起来的横向条（缩略图条、chips 条、tab 条），一律显式给高度，并把不需要的那一轴关掉。
+
+**顺带**：定位这类"只在 WebKit 出现"的布局问题不用瞎猜——`swiftc` 起个 20 行的 WKWebView 壳，
+把 `vite build --base ./` 的产物 + 注入的假 `window.__TAURI_INTERNALS__.invoke` 一起加载，就能在
+真引擎里跑真组件并用 `ResizeObserver` 逐帧打点（本轮探针在 scratchpad，未入库）。

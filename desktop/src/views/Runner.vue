@@ -103,7 +103,7 @@ function buildPlan(cases: { case_id: string }[]): Record<string, string[]> {
 }
 const boardMode = ref<"current" | "new">("current"); // 关联当前 / 新建看板
 const brainMode = ref(false); // 脚本自愈：失败自动交 claude 诊断+改脚本重跑
-// UI dump 后端：shell(默认,纯adb,零依赖) / u2(uiautomator2,单次快约4倍，需设备预装并保活
+// UI dump 后端：shell(默认,纯adb,零依赖) / u2(uiautomator2,整轮实测约快2倍，需设备预装并保活
 // atx-agent，跟 Appium 会抢 UiAutomation 互斥，见 decisions.md #30)。切 App 时随 loadAll 从
 // target.json 读回当前值；执行前若与勾选状态不一致，写回 target.json 再跑（adbkit 按
 // target.json 的 dump_backend 选后端，不是运行时参数）。
@@ -265,7 +265,7 @@ async function launch(newBoard: boolean) {
   subTab.value = "monitor"; // 立即跳到执行台看实时过程
   // 选了某个留存版本 → 执行前先在每台设备上强制重装这个版本（不管设备当前是不是已经是它）
   const ver = selectedVersion[slug];
-  const apkPath = ver ? appVersions[slug]?.find((v) => v.version === ver)?.path : undefined;
+  const apkPath = ver && ver !== FOLLOW_DEVICE ? appVersions[slug]?.find((v) => v.version === ver)?.path : undefined;
   const pkg = store.activeApp()?.package;
   runStore
     .start({
@@ -274,10 +274,11 @@ async function launch(newBoard: boolean) {
       plan,
       brain: brainMode.value,
       newBoard,
-      title: `${slug} · ${cases.length} 用例 × ${planSerials.length} 设备${isMatrix ? "" : `（分派 ${cellCount} 格）`}${ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
+      title: `${slug} · ${cases.length} 用例 × ${planSerials.length} 设备${isMatrix ? "" : `（分派 ${cellCount} 格）`}${ver === FOLLOW_DEVICE ? " · 跟随设备" : ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
       apkPath: apkPath && pkg ? apkPath : undefined,
       package: apkPath && pkg ? pkg : undefined,
       langCode: langCode.value || undefined,
+      followDevice: ver === FOLLOW_DEVICE,
     })
     .then(() => loadFlows()); // 跑完刷新用例列表拿最新 last_result
 }
@@ -365,6 +366,10 @@ const expandedApps = reactive(new Set<string>());
 const appVersions = reactive<Record<string, ApkVersionInfo[]>>({});
 // slug -> 用户手动点选的版本。不点选就一直是 undefined——展示用 a.app_version（上次上传注册时探测到的版本）、
 // 执行时也不强制重装，都走老逻辑。只有显式点了某个版本行，这两处才会跟着切换到点选的那个版本。
+// 哨兵值 FOLLOW_DEVICE：显式选择"跟随设备"——语义上等同于不选任何版本（执行前不装机），
+// 但作为列表里一个可点选的条目存在，让用户能从"之前点过某个版本"的状态显式切回来
+// （原逻辑里 selectedVersion 一旦点过某个版本就没有办法回到"不强制装机"，见本次需求）。
+const FOLLOW_DEVICE = "__follow_device__";
 const selectedVersion = reactive<Record<string, string>>({});
 
 async function toggleAppExpand(slug: string) {
@@ -456,10 +461,19 @@ onActivated(() => { if (!runStore.running) loadAll(); });
                     <span v-if="a.slug === store.activeSlug" class="dot">●</span>
                     <button class="app-del" title="删除此 App" @click.stop="removeApp(a.slug)">✕</button>
                   </div>
-                  <div class="app-sub muted">{{ selectedVersion[a.slug] || a.app_version || "—" }} · {{ a.package }}</div>
+                  <div class="app-sub muted">{{ selectedVersion[a.slug] === FOLLOW_DEVICE ? "跟随设备" : (selectedVersion[a.slug] || a.app_version || "—") }} · {{ a.package }}</div>
                 </div>
               </div>
               <div v-if="expandedApps.has(a.slug)" class="app-version-list">
+                <div
+                  class="app-version-item follow-device"
+                  :class="{ on: selectedVersion[a.slug] === FOLLOW_DEVICE }"
+                  @click="pickVersion(a.slug, FOLLOW_DEVICE)"
+                  title="不装机，直接用设备上按包名找到的当前已装 App 来回归"
+                >
+                  <span>跟随设备</span>
+                  <span class="muted app-version-size">不装机</span>
+                </div>
                 <div v-if="!appVersions[a.slug]?.length" class="muted app-version-empty">还没有留存的 APK 版本</div>
                 <div
                   v-for="v in appVersions[a.slug]"
@@ -621,7 +635,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
             <input type="checkbox" v-model="dumpU2" />
             <span class="brain-txt">
               UI dump 用 u2 加速
-              <span class="muted brain-sub">uiautomator2 比默认 shell dump 快约 4 倍，但需设备预装并保活 atx-agent，跟 Appium 互斥。写入 target.json 的 dump_backend。</span>
+              <span class="muted brain-sub">uiautomator2 单次 dump 更快，整轮实测约省一半时间；但需设备预装并保活 atx-agent，跟 Appium 互斥。写入 target.json 的 dump_backend。</span>
             </span>
           </label>
           <button
@@ -769,6 +783,7 @@ h2 { margin: 0; font-weight: 500; }
 .app-version-item:hover { background: var(--surface-1); }
 .app-version-item.on { background: var(--bg-accent); color: var(--text-accent); }
 .app-version-size { margin-left: auto; font-size: 11px; }
+.follow-device { border-bottom: 0.5px solid var(--border); margin-bottom: 2px; padding-bottom: 6px; }
 
 .case-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius); font-size: 13px; cursor: pointer; }
 .case-item:hover { background: var(--surface-1); }

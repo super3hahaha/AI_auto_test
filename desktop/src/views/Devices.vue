@@ -8,11 +8,13 @@ const loading = ref(false);
 const err = ref("");
 const msg = ref("");
 
-async function load() {
+// 「刷新」按钮传 force=true：无条件重查安卓版本号，刷过系统的设备靠这条路更正缓存里的旧值。
+// 进页面/改完别名后的重载不 force（那些场景版本号不可能变，没必要每台等一次 adb getprop）。
+async function load(force = false) {
   loading.value = true;
   err.value = "";
   try {
-    devices.value = await api.listDevices(store.activeSlug);
+    devices.value = await api.listDevices(store.activeSlug, force);
   } catch (e: any) {
     err.value = String(e);
   } finally {
@@ -116,15 +118,16 @@ async function importDevices() {
   }
 }
 
-watch(() => store.activeSlug, load);
-onMounted(load);
+// 都要写成显式 arrow：直接传 load 会把 watch 的 newValue / 事件对象当成 force 实参
+watch(() => store.activeSlug, () => load());
+onMounted(() => load());
 </script>
 
 <template>
   <div>
     <div class="hd">
       <h2>设备</h2>
-      <button @click="load">刷新</button>
+      <button @click="load(true)">刷新</button>
       <button @click="showAdd = !showAdd">{{ showAdd ? "取消添加" : "添加设备" }}</button>
       <button @click="exportDevices">导出</button>
       <button @click="importDevices">导入</button>

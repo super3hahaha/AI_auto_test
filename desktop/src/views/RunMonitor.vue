@@ -2,6 +2,7 @@
 import { ref, reactive, computed, watch, nextTick, onMounted } from "vue";
 import { runStore, labelOf, type CellStatus, type IssueState, type MonitorSource } from "../runStore";
 import { api } from "../api";
+import { store } from "../store";
 
 defineOptions({ name: "RunMonitor" });
 
@@ -217,6 +218,41 @@ function scrollToAnchor() {
   });
 }
 
+// ── 卡片「↗」：跳到证据页并定位到这一格的第一项证据 ──
+// 轮次：历史快照用它自己记的 runId（可能是已归档的旧轮次），实时源没有这个字段 → 回退到当前批次。
+// 「执行记录」页与「执行台」共用本组件，所以这颗按钮两处都有，只是 runId 取法不同。
+const evidenceRunId = computed(
+  () => props.source?.runId || store.runs.find((r) => r.is_current)?.run_id || ""
+);
+// 从该格日志里抓出「这一次执行」的证据坐标。固化脚本每次采证都会打出证据文件全路径
+// （`[ui] 已保存 …/evidence/<slug>/<ver>/<run_id>/<case>/<serial>/<attempt>/ui/xx.xml`），
+// run_id 和 attempt 两段都在里面 → 加上用例、serial 就是四段全齐，能跟证据页**精确**对上，
+// 不用靠时间戳猜。`lines` 本来就存进执行记录快照，所以历史旧记录也配得准——实测本机 15 条记录
+// 98 格全部精确命中，含 34 格 `meta.runId` 字段加入前存的、光看 meta 根本不知道属于哪一轮的格。
+// 用 caseId + 媒体目录名双锚定，避免误抓日志正文里凑巧出现的六位数字；取最后一条匹配。
+function evidenceRefOf(serial: string, caseId: string): { runId: string; attempt: string } {
+  const lines = M.cell(serial, caseId)?.lines || [];
+  const re = new RegExp(`evidence/[^/]+/[^/]+/([^/]+)/${caseId}/[^/]+/(\\d{6})/(?:screenshots|logs|ui)/`);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = re.exec(lines[i]);
+    if (m) return { runId: m[1], attempt: m[2] };
+  }
+  return { runId: "", attempt: "" };
+}
+function jumpToEvidence(serial: string, caseId: string) {
+  const ref = evidenceRefOf(serial, caseId);
+  // 批次优先用日志里抓到的（比 meta.runId 可靠，且覆盖没有那个字段的旧记录）；
+  // attempt 精确定位这一次执行；开跑时刻兜底——脚本刚起来就崩、一条证据都没产出时日志里没有
+  // 路径可抓，那时只能按时间就近配（见 Evidence.matchAttemptIndex）。
+  store.requestEvidence(
+    serial,
+    caseId,
+    ref.runId || evidenceRunId.value,
+    M.cell(serial, caseId)?.startedAt || 0,
+    ref.attempt
+  );
+}
+
 function pickCell(serial: string, caseId: string) {
   const k = M.key(serial, caseId);
   const wasSame = M.selectedKey === k;
@@ -305,7 +341,16 @@ watch(
                     @click="pickCell(s, cid)"
                     @keydown.enter="pickCell(s, cid)"
                   >
-                    <div class="case-id mono">{{ cid }}</div>
+                    <div class="case-top">
+                      <span class="case-id mono">{{ cid }}</span>
+                      <!-- 还没跑过（等待中）必然没有证据，那时不显示这颗按钮 -->
+                      <button
+                        v-if="M.cell(s, cid)!.status !== 'waiting'"
+                        class="evi-jump"
+                        title="去「证据」看这条用例的证据（定位到第一项）"
+                        @click.stop="jumpToEvidence(s, cid)"
+                      >↗</button>
+                    </div>
                     <div class="case-meta">
                       <span class="st-pill" :class="pillClass(M.cell(s, cid)!.status)">{{ labelOf(M.cell(s, cid)!.status) }}</span>
                       <span v-if="M.cell(s, cid)!.issue !== 'none'" class="issue-pill" :class="M.cell(s, cid)!.issue">{{ issueLabel(M.cell(s, cid)!.issue) }}</span>
@@ -400,7 +445,12 @@ watch(
 .case-card:hover { border-color: var(--border-strong); }
 .case-card.dim { opacity: 0.25; }
 .case-card.sel { outline: 2px solid var(--text-accent); outline-offset: 1px; }
+.case-top { display: flex; align-items: center; gap: 6px; }
 .case-id { font-size: 12px; }
+/* 「↗」去证据：常态低对比，悬到卡片上才显眼，别跟状态徽标抢注意力 */
+.evi-jump { margin-left: auto; flex-shrink: 0; width: 20px; height: 20px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 13px; line-height: 1; border: none; border-radius: 5px; background: transparent; color: var(--text-muted); cursor: pointer; }
+.case-card:hover .evi-jump { color: var(--text-accent); background: var(--bg-accent); }
+.evi-jump:hover { color: var(--text-accent); background: var(--bg-accent); filter: brightness(0.96); }
 .case-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .case-meta .et { font-size: 11px; color: var(--text-muted); margin-left: auto; }
 .case-meta .et.recording { color: var(--text-accent); }

@@ -19,7 +19,7 @@
 import argparse, csv, json, os, shutil, subprocess, sys, shlex, datetime, pathlib, re, time
 import xml.etree.ElementTree as ET
 
-from _appctx import REPO, LEDGER, DUMPCACHE, load_cfg, ledger_lock  # 多 App 路径解析
+from _appctx import REPO, LEDGER, DUMPCACHE, load_cfg, ledger_lock, probe_installed_version  # 多 App 路径解析
 ROOT = REPO            # 下文用 ROOT 指仓库根处（config 创证 / evidence / .dumpcache / relative_to）保持不变
 CACHE_ROOT = DUMPCACHE
 CFG = load_cfg()       # 当前活跃 App 的 apps/<slug>/target.json（AITEST_APP / config/active.json 决定）
@@ -30,7 +30,7 @@ SERIAL = ""  # 只认 --serial（多设备并行下没有"默认设备"；不传
 EVID_ROOT = ROOT / CFG.get("evidence_root", "evidence")
 EVID_LEDGER = LEDGER / "evidence.csv"  # 采证即登记的账本（每次采集自动追加一行）；LEDGER=apps/<slug>/ledger
 APP = CFG.get("app_slug") or CFG.get("app_name") or PKG.split(".")[-1]  # 证据目录用的简称，跟展示用 app_name 分开（见 gotchas.md）
-DUMP_BACKEND = CFG.get("dump_backend", "shell")  # UI dump 后端：shell(默认,纯adb) / u2(uiautomator2,需装atx,快约4倍)；--dump-backend 可覆盖
+DUMP_BACKEND = CFG.get("dump_backend", "shell")  # UI dump 后端：shell(默认,纯adb) / u2(uiautomator2,需装atx,整轮约快2倍)；--dump-backend 可覆盖
 _VER = None
 
 
@@ -46,13 +46,16 @@ def run_seg():
 
 
 def app_version():
-    """版本号：优先 config.app_version；否则查设备一次并缓存。"""
+    """版本号：跟随设备模式（env AITEST_FOLLOW_DEVICE=1，桌面壳「跟随设备」选项不装机执行时
+    注入）现查本机真实安装版本并按进程缓存；否则优先 config.app_version，为空时才退回现查
+    （老逻辑，兼容没配 app_version 的机器）。探测逻辑见 _appctx.probe_installed_version，
+    与 run_flow.py 的证据链接拼接共用同一份实现。"""
     global _VER
-    if CFG.get("app_version"):
+    follow_device = os.environ.get("AITEST_FOLLOW_DEVICE") == "1"
+    if not follow_device and CFG.get("app_version"):
         return CFG["app_version"]
     if _VER is None:
-        m = re.search(r"versionName=(\S+)", shell(f"dumpsys package {PKG}").stdout or "")
-        _VER = m.group(1) if m else "unknown"
+        _VER = probe_installed_version(PKG, SERIAL) or CFG.get("app_version") or "unknown"
     return _VER
 
 
@@ -359,7 +362,8 @@ def _dump_tree(cache_screen=None):
     """dump 当前界面 UI 树并解析为节点迭代器（不落证据目录，纯用于定位）。
     两个后端由 DUMP_BACKEND 选（target.json 的 dump_backend / 全局 --dump-backend 覆盖，默认 shell）：
     - shell：`adb shell uiautomator dump` + pull，零设备端依赖；
-    - u2：uiautomator2 `dump_hierarchy`，需设备装 atx 常驻组件，单次快约 4 倍（实测 ~118ms vs ~510ms）。
+    - u2：uiautomator2 `dump_hierarchy`，需设备装 atx 常驻组件，单次 dump 快约 4 倍（实测 ~118ms vs ~510ms）；
+      但 dump 只占整轮耗时一部分，**端到端实测约快 2 倍**（同一轮回归 30min → 15min），对外文案按 2 倍讲。
     两者底层同为 UiAutomator 无障碍树，输出 XML 字段(text/content-desc/resource-id/bounds)与解析逻辑完全通用，
     切后端上层 _find/_match_nodes/sweep 等一律不用改；差别只在速度与设备端依赖。
     ⚠️ WebView 内容不进无障碍树这类盲区两个后端相同——换 u2 只提速、不会让 WebView 广告变得可见（见 gotchas.md）。
@@ -1367,7 +1371,7 @@ def build_parser():
     p.add_argument("--case", help="当前用例 ID，证据归到该用例目录")
     p.add_argument("--serial", help="目标设备序列号（多设备/矩阵跑必传；单设备在线时可省，adb 自动选中那台）")
     p.add_argument("--dump-backend", dest="dump_backend", choices=["shell", "u2"], default=None,
-                   help="UI dump 后端，覆盖 target.json 的 dump_backend：shell(纯adb,零依赖) / u2(uiautomator2,需装atx,快约4倍)")
+                   help="UI dump 后端，覆盖 target.json 的 dump_backend：shell(纯adb,零依赖) / u2(uiautomator2,需装atx,整轮约快2倍)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("devices").set_defaults(fn=cmd_devices)

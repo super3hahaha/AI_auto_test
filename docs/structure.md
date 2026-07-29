@@ -22,7 +22,8 @@ AI_auto_test/
 │   ├── oauth_token*.json     # OAuth token 缓存（gitignore，自动生成）
 │   ├── ad_rules.json         # 通用广告/弹窗清障规则库（adbkit sweep 用）
 │   ├── device_aliases.json   # 序列号→别名登记（桌面壳「设备」tab 维护，gitignore）
-│   └── device_info_cache.json # 序列号→{model,os_version} 缓存，设备拔线后兜底显示用（gitignore，见 gotchas.md）
+│   └── device_info_cache.json # 序列号→{model,os_version} 缓存：①设备拔线后兜底显示 ②os_version 的常态数据源
+│                              #   （list_devices 默认不查 getprop，只有 force=true 才重查，见 decisions #45）
 ├── apps/                # ★ 每个被测 App 一套独立工作区（per-app）
 │   └── <slug>/               # 如 MP3Cutter/
 │       ├── target.json       # 该 App 配置（package/serial/version/sheet_id/doc_id/run_id…；gitignore）
@@ -80,9 +81,9 @@ AI_auto_test/
 │   │   ├── Overview.vue       # 总览面板（overview-panel-prd.md）
 │   │   ├── Devices.vue        # 设备列表/选设备
 │   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38；多设备时用例行尾设备chips逐格分派，见decisions #39)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
-│   │   ├── RunMonitor.vue     # Runner 内嵌的运行监控子组件（流式日志/状态，不单独作为 tab）；数据源可为实时 runStore 或传入的 source 快照（执行记录复用）
+│   │   ├── RunMonitor.vue     # Runner 内嵌的运行监控子组件（流式日志/状态，不单独作为 tab）；数据源可为实时 runStore 或传入的 source 快照（执行记录复用）；用例卡片右上「↗」跳证据页定位到该格第一项（store.requestEvidence，见 decisions #47）
 │   │   ├── RunHistory.vue     # 「执行记录」子tab：列出保存的执行台快照(run_records/)、按 id 切换、用 RunMonitor 只读渲染（makeRecordSource 包快照）
-│   │   ├── Evidence.vue       # 证据查看器（截图/ui dump/日志），MVP-1 首个落地面；左栏按 设备(可收起)→用例→attempt 三层分组(不同设备跑的用例不同)，设备名走 read_device_aliases 映射；文本证据逐行渲染+关键行标红/定位(与 run_flow.KEY_LINE_RE 同口径)
+│   │   ├── Evidence.vue       # 证据查看器（截图/ui dump/日志），MVP-1 首个落地面；左栏按 设备(可收起)→用例→attempt 三层分组(不同设备跑的用例不同)，设备名走 read_device_aliases 映射；文本证据逐行渲染+关键行标红/定位(与 run_flow.KEY_LINE_RE 同口径)；消费 store.evidenceJump 定位到执行台指定的那一格，落空/文件已被清理都有提示（decisions #47）
 │   │   ├── Boards.vue         # 看板视图，点条目可跳到 Evidence
 │   │   └── Cleanup.vue        # 「清理」：扫描随使用堆积的历史文件(证据/APK/记录归档/缓存回收站/构建缓存五类)，按类别结构化列出(名称/大小/时间/受保护)，勾选后移进系统废纸篓(非硬删除)。后端 scan_cleanup + move_to_trash(trash crate)；开发构建缓存在只装打包 app 的机器上扫不到(if p.exists)天然隐身
 │   ├── src/{api.ts,store.ts,runStore.ts}  # Tauri invoke 封装 / 全局状态 / 执行态状态

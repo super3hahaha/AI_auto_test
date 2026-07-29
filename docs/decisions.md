@@ -210,7 +210,8 @@
 
 ## 30. UI dump 后端做成可插拔（shell 默认 / u2 opt-in），不硬切（2026-07-20）
 
-- **背景**：`adb shell uiautomator dump` 每次冷起 uiautomator 进程，实测单次 ~510ms（dump ~480 + pull ~30）；uiautomator2 的 `dump_hierarchy` 走设备常驻 server，实测 ~118ms，**快约 4×**。频繁 dump 的场景（sweep 15 轮循环、waitfor 轮询、多设备并行）墙钟收益明显。
+- **背景**：`adb shell uiautomator dump` 每次冷起 uiautomator 进程，实测单次 ~510ms（dump ~480 + pull ~30）；uiautomator2 的 `dump_hierarchy` 走设备常驻 server，实测 ~118ms，**单次快约 4×**。频繁 dump 的场景（sweep 15 轮循环、waitfor 轮询、多设备并行）墙钟收益明显。
+- **端到端只有约 2×（2026-07-29 实测修正）**：整轮回归还有点击/等待/截图/落库等非 dump 开销，单次 4× 折到整轮实测 **~2×**（同一轮 30min → 15min）。对外文案（Runner.vue 勾选项说明、adbkit `--dump-backend` help）一律按 **2 倍** 讲，4× 只作为单次 dump 的微基准留档，别再拿去当整轮口径。
 - **为什么抽象而不是直接换**：u2 快的代价是设备上要**常驻 atx-agent + 两个 apk 并保活**（会被 doze/省电杀），跟本框架"纯 adb、不给设备装东西、pm clear 复现首启"的黑盒哲学有让步。所以 `_dump_tree` 拆成 `_dump_tree_shell` / `_dump_tree_u2` 两后端，`target.json` 的 `dump_backend` 字段（+ `--dump-backend` 覆盖）切换，**默认 shell 零风险**，单台验证稳定后再按 App/按设备切 u2。两后端输出同为 UiAutomator 层级 XML，字段/bounds 一致，`_nodes_from`/`_match_nodes`/`_present_any`/sweep/find 等上层一律不改。
 - **设备初始化**：`init_target.py --atx-init` 做 `u2.connect`（首次自动装 atx）+ `dump_hierarchy` 健康检查；`--dump-backend u2 --write` 才落盘切后端。运行期保活靠 adbkit `_u2_device()` 惰性缓存 + u2 库 connect 内建 healthcheck。
 - **未定论**：切 u2 是否顺带修好"WebView 插屏广告跳不过"——观察到 shell dump 与 u2 dump 在 AdMob 插屏上节点数不同（23 vs 85），但未干净复现"shell 单独跑必失败、u2 必成功"（一次污染测量见 gotchas.md），故**不以此为切 u2 的理由**，只认提速这个确定收益。
@@ -344,3 +345,32 @@
 - **检测更新不用官方 `tauri-plugin-updater`**：官方方案要求给安装包签名（生成/托管一对公私钥，更新清单 `latest.json` 也要签），配起来比直接打包更麻烦，且和"不签名发布"的现状矛盾。改成自己写（`desktop/src-tauri/src/updater.rs`）：`check_update` 直接 `GET /repos/{owner}/repo/releases/latest`（GitHub 公开 API，公开仓库不需要 token）比对 tag 与 `env!("CARGO_PKG_VERSION")`；`download_update` 流式下载资产到临时目录、进度走本项目一贯的 `Channel` 模式（不是 tauri 全局 event/listen，跟 `run_flow` 等流式命令风格一致）；`apply_update` 分平台落地——mac 挂载 dmg、`ditto` 覆盖 `/Applications/<productName>.app`、清 quarantine、`open` 重启、清理临时文件；windows 直接对下载到的 nsis exe 加 `/S` 静默安装。**安全性上能接受不校验签名的前提是下载源固定指向本仓库自己的 Releases**（`GITHUB_REPO` 常量硬编码，不是用户可配置的任意地址），不是任意第三方地址下载可执行文件。
 - **版本号来源**：`getVersion()`（前端，读 `tauri.conf.json` 的 `version`）与 `CARGO_PKG_VERSION`（后端，读 `Cargo.toml` 的 `version`）两处独立维护，发新版本时 `package.json`/`tauri.conf.json`/`Cargo.toml` 三处版本号都要同步改，否则前端显示的版本和 `check_update` 实际比较的版本会对不上。
 - **`productName` 不能用中文「AI 测试台」**：首发 v1.0.0 实测过——tauri 打包器把安装包**文件名**里的 `productName` 做了 ASCII 净化，中文字符被砍掉只剩 `AI.`，产出 `AI._1.0.0_universal.dmg` 这种看着像损坏导出的文件名（`.app` 包本身内部名字倒是完整保留中文，不受影响，只是外层发行文件名坏了）。改成纯 ASCII 的 `AI-Auto-Test`，`updater.rs` 的 `APP_NAME` 常量要跟着同步改（mac 端 `apply_update` 覆盖安装的目标路径 `/Applications/<APP_NAME>.app` 硬编码在这个常量里，两处必须一致）；窗口标题栏文案（`app.windows[0].title`）是独立字段，不受这次改动影响，仍显示中文。
+
+## 45. `list_devices` 的 `os_version` 改缓存优先 + `force` 显式重查，命令本身改 async（2026-07-29）
+
+- **背景**：执行台（`Runner.vue`）是唯一被 `keep-alive` 保活的 tab，代价是 `onActivated` 每次切回都跑一遍 `loadAll()`。实测卡顿的 98% 在 `adb_devices()` 里**逐台串行**的 `adb shell getprop ro.build.version.release`：4 台无线设备（`ip:5555`）串行 726~1351ms，网络往返，每台 85~330ms。
+- **决定**：不做"切回 tab 节流"（最初的候选方案），改成从根上砍掉这次查询——
+  - **缓存优先**：`config/device_info_cache.json` 里已经存着每台的 `os_version`（原本只当"设备拔线后兜底显示"用）。安卓版本号对同一台设备是**准不变量**（除非刷系统），所以命中缓存就完全不起 adb 子进程。实测 18ms（只剩一次 `adb devices -l`）。
+  - **`force` 参数**：`list_devices(app_slug, force)`，只有「设备」tab 的「刷新」按钮传 `true`（无条件重查，刷过系统的设备靠它更正缓存）。进设备页/改完别名后的重载都不 force——那些场景版本号不可能变。
+  - **要查的那几台并发查**（各起一个 `std::thread`）：force 路径与"新设备首次接入"（缓存里没有）走这条，实测 455ms vs 串行 1351ms。
+  - **`cache_dirty` 只在值真变了时才置**：否则缓存命中路径每次切 tab 都要重写一遍 json，白搭一次写盘。
+- **为什么不选"`onActivated` 节流"**：那是"单次成本降不下来"前提下的妥协，一旦成本从 850ms 降到 18ms 它就是纯负债——节流窗口内切回会**看不到刚发生的变化**（在资源库新固化了一条脚本、或刚拔插了设备，切回执行台却不刷新），跟当初写 `onActivated` 自动刷新的初衷正好相反；窗口取小则常态还卡，取大则数据陈旧，两头堵。
+- **顺带**：`list_devices` 从同步 `pub fn` 改成 `pub async fn` + `spawn_blocking`（见 `gotchas.md` 同名条目——同步 command 在 Tauri 里跑主线程，等 adb 的那段时间窗口事件循环停摆，而且前端 `Promise.all` 并发的几个 invoke 会在主线程排队，白等一遍）。这条**独立于缓存优化**：哪怕 force 路径只要 455ms，也不该让它冻住窗口。
+
+## 46. 场景库新增「跟随设备」（不装机执行）+ 证据版本段现查真实安装版本（2026-07-29）
+
+- **背景**：App 库版本列表原来只能"点某个留存版本→执行前强制重装"，没有"不装机，直接用设备上已装的 App 回归"这个显式选项——不选任何版本时其实就是这个语义（`apkPath`/`package` 不传给 `runStore.start`，见 `Runner.vue::launch`），但一旦点过某个版本号就再没法从 UI 上切回来。
+- **决定**：给 App 库版本列表加一条固定条目「跟随设备」（哨兵值 `FOLLOW_DEVICE`），点击即把该 App 的 `selectedVersion` 显式设成这个哨兵，执行时不传 `apkPath`/`package`（走原有的"不装机"代码路径）。
+- **连带发现并修的证据路径 bug**：`evidence/<slug>/<版本>/...` 的版本段一直是直接读 `target.json.app_version`（注册/上传时写入的静态值），选留存版本强制重装也不会回写它——不装机的「跟随设备」下这个字段跟设备上真实装的版本可能完全不是一回事（多设备场景下各台还可能互不相同）。参照本项目"语言=自动"已落地的模式（执行前逐台现查设备当前系统语言），改成：
+  - 新增 `AITEST_FOLLOW_DEVICE=1` 环境变量，由 `run_flow`/`run_flow_repair` 两个 Tauri 命令在 `follow_device: true` 时注入子进程（`auto_repair.py` 转手调 `run_flow.py` 时 `env=os.environ.copy()`，天然透传，不用额外接线，同 `LANG_CODE`）。
+  - `_appctx.py` 新增共用函数 `probe_installed_version(pkg, serial)`：`adb -s <serial> shell dumpsys package <pkg>` 现查 `versionName`。`adbkit.py::app_version()`（决定证据实际落盘目录）与 `run_flow.py`（决定 `executions.csv`「证据链接」列的文本）**共用这一份实现**——这两处原本是各自独立拼接版本号的两套代码，必须让它们用同一个函数，否则"文件夹在哪"和"账本记的链接指哪"会分岔。
+  - 该环境变量置位时忽略 `target.json.app_version`，未置位时行为跟改动前完全一致（老逻辑：优先 config 值，为空才现查）。
+
+## 47. 执行台/执行记录用例卡片「↗」跳证据：走全局一次性信号 `store.evidenceJump`（2026-07-29）
+
+- **需求**：执行台（及「执行记录」回看）的用例卡片上要能一键跳到「证据」tab 并停在该格第一项证据，省掉"记住设备+用例名→切 tab→在左栏几十条里翻找"。
+- **为什么不用 emit 事件链**：发起方 `RunMonitor` 嵌在 `Runner` 里，跟 `App.vue` 的视图切换隔两层（`Boards.vue` 那种只隔一层的才值得 emit）。改成 `store.requestEvidence(serial, caseId, runId)` 写一个一次性请求 `store.evidenceJump`，`App.vue` 监听它切到 evidence tab，`Evidence.vue` 在 `loadEvidence()` 末尾 `consumeJump()` 消费并置空（命中就选中该设备+用例、停在**最新一次 attempt** 的第一条证据、侧栏 `scrollIntoView`；没命中才回落到原来的默认选中逻辑）。`Evidence` 不在 `keep-alive` 名单里、每次都是新挂载，所以点击时它还没挂载——批次锚点在发起侧先切好，Evidence 挂载时一次加载就读对了那份 evidence.csv，不用二次触发。
+- **两个 tab 天然都有这颗按钮**：执行台与执行记录渲染的是同一个 `RunMonitor`（后者只是把 `makeRecordSource(record)` 当 `source` prop 传进去），只有 run_id 取法不同——`MonitorSource` 新增可选 `runId`（历史快照取 `record.meta.runId`），实时源没有这个字段则回退到 `store.runs` 里 `is_current` 那条。`meta.runId` 字段加入前存的旧记录是空，这时不动批次锚点、由 Evidence 侧给"没找到"提示，而不是悄悄按当前轮次去读一份不相干的证据。
+- **定位到哪一次执行（attempt）：从该格日志的证据路径里抓 run_id + attempt，不用整轮 id、也不靠时间戳猜**。证据里 attempt 段是该格 `run_flow` 启动时刻的 HHMMSS，逐格不同（一轮里实测 `175125/175351/175534/180715`），整轮的 run_id / 执行记录 id 只等于第一格。而固化脚本每次采证都会把证据文件全路径打进日志（`…/evidence/<slug>/<ver>/<run_id>/<case>/<serial>/<attempt>/ui/xx.xml`），`RunCell.lines` 又随执行记录一起存盘 → 拿它做四段精确配对，**连 `meta.runId` 字段加入前存的旧记录也能对准**（实测 15 条记录 98 格全部精确命中，其中 34 格属于这种旧记录，靠日志里的 run_id 救回来；跳转时批次锚点也优先用它而不是 `meta.runId`）。兜底：脚本刚起来就崩、一条证据都没产出时日志里没有路径可抓，才退回按新增的 `RunCell.startedAt` 就近配（≤120s，不能要求严格相等，见 `gotchas.md` 同名条目）；两级都配不上就退回最新一次，并在提示条里说清"看的不是你点的那次"。
+- **serial 两种形态必须都清洗**：跳转请求带的是原始 adb serial（`192.168.209.239:5555`），而 Evidence 左栏的设备键是从证据路径里切出来的、被 `adbkit._safe()` 清洗过的段（`192.168.209.239_5555`）——匹配时两边都过 `sanitizeSerial()`，否则无线设备永远落空（同一个坑 `gotchas.md` 里已有条目，这次是第三处踩到）。
+- **顺带补「证据文件已被清除」的提示**：「清理」页删的是 `evidence/<slug>/<ver>/<run_id>` 整轮**物料目录**，账本里的 `evidence.csv` 行不跟着删（它是历史流水，`log.csv`/审计要用）。所以清过的旧批次是"条目在、文件没了"：以前图片 `onerror` 后舞台就是一片空白，看着像功能坏了。改成图片 `@error` / 文本读取失败都标进 `missingFiles`，舞台渲染成一块说明（提示大概是被清理移进了废纸篓、附相对路径），缩略图显示 ✕。跳转落空的提示条文案里也把"证据可能已被清除"列为第一种可能。

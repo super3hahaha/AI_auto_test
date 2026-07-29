@@ -667,9 +667,15 @@ fn getprop(serial: &str, prop: &str) -> String {
     }
 }
 
+/// force=false（默认路径）：os_version 缓存优先，命中就完全不起 adb 子进程。安卓版本号对同一台
+/// 设备是准不变量（除非刷系统），而 getprop 是无线设备上 85~300ms 的网络往返 —— 执行台每次切回
+/// tab 都重查一遍是纯浪费（4 台串行实测 835ms，卡顿的 98%）。
+/// force=true：设备页显式「刷新」用，无条件重查所有在线设备，刷过系统的设备靠它更正。
+/// 需要查的那几台并发查（各起一个线程），耗时从 sum(N) 降到 max(N)。
 fn adb_devices(
     root: &Path,
     aliases: &HashMap<String, String>,
+    force: bool,
 ) -> Result<Vec<DeviceRow>, String> {
     let out = Command::new("adb").args(["devices", "-l"]).output();
     let out = match out {
@@ -680,6 +686,8 @@ fn adb_devices(
     let mut cache = device_info_cache(root);
     let mut cache_dirty = false;
     let mut devices = vec![];
+    // 先解析出设备清单，把「要查 os_version 的在线设备」攒起来一起并发查
+    let mut parsed: Vec<(String, String, String)> = vec![]; // (serial, state, model)
     for line in text.lines().skip(1) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('*') {
@@ -696,22 +704,59 @@ fn adb_devices(
             .find_map(|t| t.strip_prefix("model:"))
             .unwrap_or("")
             .to_string();
+        parsed.push((serial, state, model));
+    }
+    // 离线/未授权/未插上的不查（不值得等 adb 超时）；在线的：force 时全查，否则只查缓存没有的
+    let todo: Vec<String> = parsed
+        .iter()
+        .filter(|(serial, state, _)| {
+            state == "device"
+                && (force
+                    || cache
+                        .get(serial)
+                        .map(|c| c.os_version.is_empty())
+                        .unwrap_or(true))
+        })
+        .map(|(serial, _, _)| serial.clone())
+        .collect();
+    let mut queried: HashMap<String, String> = HashMap::new();
+    let handles: Vec<_> = todo
+        .into_iter()
+        .map(|serial| {
+            std::thread::spawn(move || {
+                let v = getprop(&serial, "ro.build.version.release");
+                (serial, v)
+            })
+        })
+        .collect();
+    for h in handles {
+        if let Ok((serial, v)) = h.join() {
+            queried.insert(serial, v);
+        }
+    }
+    for (serial, state, model) in parsed {
         let alias = aliases.get(&serial).cloned().unwrap_or_default();
         let os_version = if state == "device" {
-            getprop(&serial, "ro.build.version.release")
+            match queried.get(&serial) {
+                Some(v) => v.clone(),
+                // 没进 todo 说明缓存里有；取缓存值（拿不到就留空，下次 force 会补）
+                None => cache.get(&serial).map(|c| c.os_version.clone()).unwrap_or_default(),
+            }
         } else {
             String::new()
         };
-        // 查到了新值就刷新缓存，供下次拔掉后兜底显示
+        // 查到了新值就刷新缓存，供下次拔掉后兜底显示。只在值真的变了时置 dirty ——
+        // 缓存命中路径下每次都写盘毫无意义（切个 tab 就重写一遍 json）。
         if !model.is_empty() || !os_version.is_empty() {
             let entry = cache.entry(serial.clone()).or_default();
-            if !model.is_empty() {
+            if !model.is_empty() && entry.model != model {
                 entry.model = model.clone();
+                cache_dirty = true;
             }
-            if !os_version.is_empty() {
+            if !os_version.is_empty() && entry.os_version != os_version {
                 entry.os_version = os_version.clone();
+                cache_dirty = true;
             }
-            cache_dirty = true;
         }
         devices.push(DeviceRow {
             serial,
@@ -743,11 +788,23 @@ fn adb_devices(
     Ok(devices)
 }
 
+/// 起 adb 子进程，必须 async + spawn_blocking：同步 command 在 Tauri 里跑在主线程上，
+/// 等 adb 的那段时间窗口事件循环停摆（切回执行台的「卡顿」感就是这么来的），而且前端
+/// Promise.all 并发的几个 invoke 会在主线程上排队，白等一遍。
+/// force 见 adb_devices：默认缓存优先，设备页显式刷新才传 true。
 #[tauri::command]
-pub fn list_devices(app: AppHandle, _app_slug: String) -> Result<Vec<DeviceRow>, String> {
+pub async fn list_devices(
+    app: AppHandle,
+    _app_slug: String,
+    force: Option<bool>,
+) -> Result<Vec<DeviceRow>, String> {
     let root = root_of(&app)?;
-    let aliases = device_aliases(&root);
-    adb_devices(&root, &aliases)
+    tauri::async_runtime::spawn_blocking(move || {
+        let aliases = device_aliases(&root);
+        adb_devices(&root, &aliases, force.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 读取序列号→别名映射本身（不走 adb，纯读 config/device_aliases.json）。
@@ -1311,6 +1368,7 @@ pub async fn run_flow(
     script: String,
     serial: String,
     lang_code: Option<String>,
+    follow_device: Option<bool>,
     on_event: Channel<String>,
 ) -> Result<i32, String> {
     let root = root_of(&app)?;
@@ -1330,6 +1388,12 @@ pub async fn run_flow(
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
             cmd.env("LANG_CODE", lc);
         }
+        // 场景库选了「跟随设备」（不装机，用设备上已装的 App 回归）时注入，让 run_flow.py /
+        // adbkit.py 的证据版本段现查设备真实安装版本，而不是信任 target.json 里可能过期的
+        // app_version（见 _appctx.probe_installed_version）。
+        if follow_device.unwrap_or(false) {
+            cmd.env("AITEST_FOLLOW_DEVICE", "1");
+        }
         stream_child(cmd, on_event, Some(track_key))
     })
     .await
@@ -1346,6 +1410,7 @@ pub async fn run_flow_repair(
     script: String,
     serial: String,
     lang_code: Option<String>,
+    follow_device: Option<bool>,
     on_event: Channel<String>,
 ) -> Result<i32, String> {
     let root = root_of(&app)?;
@@ -1361,9 +1426,12 @@ pub async fn run_flow_repair(
         // 这里显式设置（哪怕是空串="跟随 CLI 默认"）会覆盖它自己的默认值，见该文件顶部注释。
         cmd.env("AUTO_REPAIR_MODEL", &cfg.claude_model);
         // auto_repair.py 转手调 run_flow.py 时 env=os.environ.copy()，同样会把这里注入的
-        // LANG_CODE 一路透传下去，见 run_flow 里的注释。
+        // LANG_CODE/AITEST_FOLLOW_DEVICE 一路透传下去，见 run_flow 里的注释。
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
             cmd.env("LANG_CODE", lc);
+        }
+        if follow_device.unwrap_or(false) {
+            cmd.env("AITEST_FOLLOW_DEVICE", "1");
         }
         stream_child(cmd, on_event, Some(track_key))
     })
@@ -2324,3 +2392,4 @@ pub fn move_to_trash(app: AppHandle, rel_paths: Vec<String>) -> Result<CleanupRe
 
     Ok(CleanupResult { removed, freed, errors })
 }
+

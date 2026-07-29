@@ -28,6 +28,10 @@ export interface RunCell {
   status: CellStatus;
   exitCode: number | null;
   elapsed: number; // 秒
+  startedAt: number; // 这一格开跑的毫秒时间戳（0=还没跑/旧执行记录没这个字段）。
+                     // 用来把卡片「↗」跳过去的证据对准**这一次执行**的 attempt 目录：证据路径里的
+                     // attempt 段就是该格 run_flow 启动时刻的 HHMMSS（见 tools/run_flow.py），
+                     // 是逐格各不相同的值，拿整轮的 run_id/记录 id 配不上（那个只等于第一格）。
   lines: string[]; // 该格自己的流式日志
   recording: boolean; // 脚本已跑完（status 已是 pass/fail 等终态），但 judge_result 还没落库——
                      // 整轮"完成"要等这个也变 false，不然进度会显示"N/N 完成"却其实还在判定。
@@ -80,6 +84,10 @@ export interface MonitorSource {
   syncing: boolean;
   docGenerating: boolean;
   title: string;
+  // 这批格子属于哪一轮（看板/证据页的 run_id）。只有历史快照才带（取 record.meta.runId），
+  // 实时源不带——实时就是当前轮次，由消费方回退到 store.runs 里 is_current 那条。
+  // 用于用例卡片「↗」跳证据时把证据页的批次锚点切到对的那一轮（含已归档的旧轮次）。
+  runId?: string;
   issueTotal: number;
   cells: RunCell[];
   events: RunEvent[];
@@ -169,6 +177,8 @@ export const runStore = reactive({
     apkPath?: string; // 选了某个留存版本时，跑用例前先在每台设备上强制重装这个 apk
     package?: string;
     langCode?: string; // 场景库显式选的目标语言代号（如 ko）；不传=不切语言，走脚本固化时的原文
+    followDevice?: boolean; // 场景库选了「跟随设备」：不装机，直接用设备上已装的 App 回归；
+    // 证据版本段现查设备真实安装版本（见 run_flow.py/adbkit.py 的 AITEST_FOLLOW_DEVICE）
   }) {
     if (this.running || this.publishing) return;
     const specById = new Map(opts.cases.map((c) => [c.case_id, c]));
@@ -195,6 +205,7 @@ export const runStore = reactive({
           status: "waiting",
           exitCode: null,
           elapsed: 0,
+          startedAt: 0,
           lines: [],
           recording: false,
           issue: "none",
@@ -223,6 +234,9 @@ export const runStore = reactive({
       this.pushEvent("语言：自动（执行前逐台现查设备当前系统语言并换算成 LANG_CODE，见下方逐设备日志）");
     } else if (opts.langCode) {
       this.pushEvent(`语言：LANG_CODE=${opts.langCode}（固化脚本已接入 t() 查表的断言会按此换算，未接入的仍走原文）`);
+    }
+    if (opts.followDevice) {
+      this.pushEvent("跟随设备：不装机，直接用设备上按包名找到的已装 App 回归；证据版本段现查各设备真实安装版本（可能与 target.json 记录的不同，多设备也可能彼此不同）");
     }
     // 语言选「自动」时按设备现查+缓存（同一设备多条用例只查一次系统语言，不重复调 adb）；
     // 非自动模式直接原样透传场景库选定的固定值（空串=不注入）。
@@ -305,10 +319,11 @@ export const runStore = reactive({
       cell.status = "running";
       this.pushEvent(`▶ ${s} / ${c.case_id} 开始（${this.brain ? "auto_repair" : "run_flow"}）`);
       const t0 = Date.now();
+      cell.startedAt = t0; // 证据 attempt 段配对用（run_flow 自己取的是 python 起来之后的时刻，差几百毫秒，配对时留容差）
       const runner = opts.brain ? api.runFlowRepair : api.runFlow;
       const lc = await resolveLangFor(s);
       try {
-        const code = await runner(opts.slug, c.case_id, c.script, s, lc, (l) => {
+        const code = await runner(opts.slug, c.case_id, c.script, s, lc, !!opts.followDevice, (l) => {
           cell.lines.push(l);
           this.pushEvent(`[${s}/${c.case_id}] ${l}`, /失败|异常|✖|error|Error/.test(l) ? "error" : "info");
         });
@@ -593,6 +608,9 @@ export function makeRecordSource(record: RunRecord): MonitorSource {
     syncing: false,
     docGenerating: false,
     title: record.meta.title,
+    // 卡片「↗」跳证据时要按这一轮去读 evidence.csv（可能已归档）；runId 字段加入前存的旧记录是
+    // undefined，消费方回退到当前批次并在找不到时提示，不静默错读别的轮次。
+    runId: record.meta.runId,
     // 问题清单摘要分母：终态记录里 issue 非 none 的格数（= 已登记 + 待人工），驱动头部 publishPhase 摘要
     issueTotal: record.cells.filter((c) => c.issue !== "none").length,
     cells: record.cells,

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { ref, onMounted, watch } from "vue";
 import { store } from "./store";
 import Setup from "./views/Setup.vue";
 import Overview from "./views/Overview.vue";
@@ -14,14 +14,21 @@ type View = "overview" | "devices" | "runner" | "resources" | "evidence" | "boar
 const active = ref<View>("runner");
 const ready = ref(false);
 
-const nav: { key: View; label: string }[] = [
+const nav: { key: View; label: string; primary?: boolean }[] = [
   { key: "overview", label: "概览" },
   { key: "devices", label: "设备" },
   { key: "resources", label: "资源库" },
-  { key: "runner", label: "执行台" },
+  { key: "runner", label: "执行台", primary: true },
   { key: "evidence", label: "证据" },
   { key: "boards", label: "看板" },
 ];
+
+// 执行台/执行记录的用例卡片点「↗」→ 切到证据 tab（定位到哪一格由 Evidence 挂载后消费
+// store.evidenceJump 完成）。Evidence 不在 keep-alive 名单里，每次都是新挂载，故只需切视图。
+watch(
+  () => store.evidenceJump,
+  (v) => { if (v) active.value = "evidence"; }
+);
 
 onMounted(async () => {
   await store.loadConfig();
@@ -52,11 +59,11 @@ async function onConfigured() {
           v-for="n in nav"
           :key="n.key"
           class="navitem"
-          :class="{ on: active === n.key }"
+          :class="{ on: active === n.key, primary: n.primary }"
           :disabled="!store.cfg?.configured"
           @click="active = n.key"
         >
-          {{ n.label }}
+          <span v-if="n.primary" class="navitem-mark">▶</span>{{ n.label }}
         </button>
       </nav>
       <div class="nav-foot">
@@ -135,6 +142,25 @@ nav {
 .navitem.on {
   background: var(--bg-accent);
   color: var(--text-accent);
+}
+.navitem.primary {
+  background: var(--bg-accent);
+  color: var(--text-accent);
+  font-weight: 600;
+  box-shadow: inset 0 0 0 1px var(--text-accent);
+}
+.navitem.primary:hover {
+  filter: brightness(0.96);
+}
+.navitem.primary.on {
+  background: var(--border-accent);
+  color: #fff;
+  box-shadow: none;
+}
+.navitem-mark {
+  display: inline-block;
+  margin-right: 5px;
+  font-size: 9px;
 }
 .nav-foot {
   margin-top: auto;

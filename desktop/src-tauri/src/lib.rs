@@ -1,4 +1,5 @@
 mod commands;
+mod updater;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -56,6 +57,9 @@ pub fn run() {
             commands::save_apk_version,
             commands::scan_cleanup,
             commands::move_to_trash,
+            updater::check_update,
+            updater::download_update,
+            updater::apply_update,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

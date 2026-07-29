@@ -120,6 +120,17 @@ export interface CleanupResult {
   freed: number;
   errors: string[];
 }
+export interface UpdateInfo {
+  version: string;
+  asset_name: string;
+  asset_url: string;
+  asset_size: number;
+  body: string;
+}
+export interface DownloadProgress {
+  downloaded: number;
+  total: number;
+}
 export interface ClaudeCliStatus {
   installed: boolean;
   path: string;
@@ -191,6 +202,17 @@ export const api = {
 
   // Claude CLI 安装/登录状态（「脚本自愈」功能依赖它）
   checkClaudeCli: () => invoke<ClaudeCliStatus>("check_claude_cli"),
+
+  // 检测更新：查本仓库 GitHub Releases 最新 tag，有更新返回 UpdateInfo，已是最新返回 null
+  checkUpdate: () => invoke<UpdateInfo | null>("check_update"),
+  // 下载安装包到临时目录，onProgress 收下载进度，resolve 本地文件路径
+  downloadUpdate(url: string, assetName: string, onProgress: (p: DownloadProgress) => void) {
+    const ch = new Channel<DownloadProgress>();
+    ch.onmessage = onProgress;
+    return invoke<string>("download_update", { url, assetName, onProgress: ch });
+  },
+  // 静默安装并重启 app（mac 覆盖 /Applications 下的包，win 走 nsis /S）；调用后当前进程会退出
+  applyUpdate: (savePath: string) => invoke<void>("apply_update", { savePath }),
 
   // 流式：返回 promise（resolve 退出码）；onLine 收每行日志。langCode 不传/空串=不注入
   // LANG_CODE，固化脚本里的 t() 走原文直通（未接过语言机制的脚本行为不变）。

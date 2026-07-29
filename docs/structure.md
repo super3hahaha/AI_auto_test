@@ -76,7 +76,7 @@ AI_auto_test/
 ├── .claude/skills/flow-freeze/       # skill：探通路径→固化 flow_*.sh + 失败判定标准
 ├── desktop/             # ★ Tauri2+Vue3 桌面壳（可视化：设置/设备/执行/证据/看板）
 │   ├── src/views/            # 一个 tab 一个文件，App.vue 用 active 字符串切换（keep-alive 只保活 Runner）
-│   │   ├── Setup.vue          # 首屏：选活跃 App / 配置 target.json，配置完才进主界面
+│   │   ├── Setup.vue          # 首屏：选活跃 App / 配置 target.json，配置完才进主界面；底部「版本」区块查/装更新
 │   │   ├── Overview.vue       # 总览面板（overview-panel-prd.md）
 │   │   ├── Devices.vue        # 设备列表/选设备
 │   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38；多设备时用例行尾设备chips逐格分派，见decisions #39)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
@@ -86,7 +86,10 @@ AI_auto_test/
 │   │   ├── Boards.vue         # 看板视图，点条目可跳到 Evidence
 │   │   └── Cleanup.vue        # 「清理」：扫描随使用堆积的历史文件(证据/APK/记录归档/缓存回收站/构建缓存五类)，按类别结构化列出(名称/大小/时间/受保护)，勾选后移进系统废纸篓(非硬删除)。后端 scan_cleanup + move_to_trash(trash crate)；开发构建缓存在只装打包 app 的机器上扫不到(if p.exists)天然隐身
 │   ├── src/{api.ts,store.ts,runStore.ts}  # Tauri invoke 封装 / 全局状态 / 执行态状态
-│   └── src-tauri/             # Rust 壳：commands.rs 是暴露给前端 invoke 的命令集
+│   └── src-tauri/             # Rust 壳：commands.rs 是暴露给前端 invoke 的命令集；updater.rs 是检测/下载/安装更新
+│                              #   （查本仓库 GitHub Releases 最新 tag，不用 tauri-plugin-updater，省签名密钥）
+├── .github/workflows/release.yml  # 打 v* tag 触发：tauri-action build mac universal dmg + win nsis exe，
+│                                   #   发布到 GitHub Releases（未签名，Windows 装机会有 SmartScreen 警告）
 ├── seeds/               # 造数据用脚本（共享）：push_media.sh 推 assets/ 到设备
 ├── evidence/            # 证据物料：evidence/<slug>/<ver>/<run_id>/<用例>/<serial>/<attempt>/{screenshots,ui,logs}
 └── docs/

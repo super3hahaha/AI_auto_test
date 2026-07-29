@@ -336,3 +336,10 @@
   - `adbkit.py`：模块级 `SERIAL` 不再读 `CFG.get("serial", "")`，改成默认空串，只认 `--serial` 显式传入。**这里不是"改成必传"**——`adbkit.py` 同时服务主循环逐屏探索模式（`docs/RUNBOOK.md` 里 `python3 tools/adbkit.py --case <ID> ui <step>` 这类不带 `--serial` 的手动调用），单设备在线时省掉 `--serial` 让 adb 原生行为兜底（只有一台在线，`adb` 不加 `-s` 自动就选中它）是合理且常用的交互方式，跟"退回配置里存的默认设备"是两件不同的事——去掉的只是后者。
   - `preflight.py`：原来"设备"自检直接拿 `cfg.get("serial")` 当目标去比对是否在线；改成先列出全部在线设备，`--serial` 可选传入指定用哪台跑 #2/#3（App/素材）检查，只有一台在线时自动选它，多台在线又没传 `--serial` 就明确报"跑不出来，需要指定"而不是静默退回一个可能不对的设备。
 - **教训**：一个"没传就退回配置默认值"的兜底，在单设备时代是省事的便利，多设备并行落地后就变成沉默的错误来源——`judge_result.py` 那条注释其实已经预警过，但预警留在注释里、代码路径没删，后续任何一个新加的调用点还是可能漏传 `--serial` 踩回这个坑。真正根治的办法不是到处加"记得传 serial"的提醒，是让缺 serial 直接报错（argparse 必传参数/`required=True`），把"忘传"从"悄悄跑错设备"变成"当场跑不起来"。
+
+## 44. 桌面壳打包发布走 GitHub Releases（`tauri-action`），检测更新不用 `tauri-plugin-updater`（2026-07-29）
+
+- **背景**：想让同事下载装好的 dmg/exe 直接用，不用装 Node/Rust 工具链自己编译；另外想要"设置页点检测更新，有新版本一键装好重启"，参照的是同作者另一个项目 `tester-app` 已经跑通的方案。
+- **打包发布**：新增 `.github/workflows/release.yml`，推 `v*` tag 触发，`macos-latest` 用 `--target universal-apple-darwin --bundles dmg` 出 universal dmg，`windows-latest` 用 `--bundles nsis` 出 exe，都发布到 GitHub Releases（`releaseDraft: false` 直接公开）。**不签名**：没有 Apple 开发者账号/代码签名证书，代价是 macOS 首次打开要右键"打开"、Windows 会弹 SmartScreen 警告——可接受，跟 `tester-app` 的取舍一致。
+- **检测更新不用官方 `tauri-plugin-updater`**：官方方案要求给安装包签名（生成/托管一对公私钥，更新清单 `latest.json` 也要签），配起来比直接打包更麻烦，且和"不签名发布"的现状矛盾。改成自己写（`desktop/src-tauri/src/updater.rs`）：`check_update` 直接 `GET /repos/{owner}/repo/releases/latest`（GitHub 公开 API，公开仓库不需要 token）比对 tag 与 `env!("CARGO_PKG_VERSION")`；`download_update` 流式下载资产到临时目录、进度走本项目一贯的 `Channel` 模式（不是 tauri 全局 event/listen，跟 `run_flow` 等流式命令风格一致）；`apply_update` 分平台落地——mac 挂载 dmg、`ditto` 覆盖 `/Applications/<productName>.app`、清 quarantine、`open` 重启、清理临时文件；windows 直接对下载到的 nsis exe 加 `/S` 静默安装。**安全性上能接受不校验签名的前提是下载源固定指向本仓库自己的 Releases**（`GITHUB_REPO` 常量硬编码，不是用户可配置的任意地址），不是任意第三方地址下载可执行文件。
+- **版本号来源**：`getVersion()`（前端，读 `tauri.conf.json` 的 `version`）与 `CARGO_PKG_VERSION`（后端，读 `Cargo.toml` 的 `version`）两处独立维护，发新版本时 `package.json`/`tauri.conf.json`/`Cargo.toml` 三处版本号都要同步改，否则前端显示的版本和 `check_update` 实际比较的版本会对不上。

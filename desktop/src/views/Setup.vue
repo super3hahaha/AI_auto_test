@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted } from "vue";
-import { api, type ClaudeCliStatus } from "../api";
+import { getVersion } from "@tauri-apps/api/app";
+import { api, type ClaudeCliStatus, type UpdateInfo } from "../api";
 import { store } from "../store";
 
 const emit = defineEmits<{ configured: [] }>();
@@ -35,6 +36,66 @@ async function saveModel() {
     err.value = String(e);
   } finally {
     modelSaving.value = false;
+  }
+}
+
+// ── app 版本号 + 检测更新（读本仓库 GitHub Releases 最新 tag，见 src-tauri/src/updater.rs）──
+const appVersion = ref("");
+getVersion().then((v) => (appVersion.value = v)).catch(() => {});
+
+type UpdateState = "idle" | "checking" | "latest" | "available" | "downloading" | "installing" | "error";
+const updateState = ref<UpdateState>("idle");
+const updateInfo = ref<UpdateInfo | null>(null);
+const updateErr = ref("");
+const downloadProgress = ref({ downloaded: 0, total: 0 });
+const showUpdateModal = ref(false);
+
+function formatBytes(bytes: number): string {
+  if (!bytes) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  const val = bytes / Math.pow(1024, i);
+  return `${val.toFixed(i > 0 ? 1 : 0)} ${units[i]}`;
+}
+const downloadPercent = () => {
+  const { downloaded, total } = downloadProgress.value;
+  return total ? Math.round((downloaded / total) * 100) : 0;
+};
+
+async function checkUpdate() {
+  updateState.value = "checking";
+  updateErr.value = "";
+  updateInfo.value = null;
+  try {
+    const info = await api.checkUpdate();
+    if (info) {
+      updateInfo.value = info;
+      updateState.value = "available";
+      showUpdateModal.value = true;
+    } else {
+      updateState.value = "latest";
+    }
+  } catch (e: any) {
+    updateErr.value = String(e);
+    updateState.value = "error";
+  }
+}
+
+async function startDownload() {
+  if (!updateInfo.value) return;
+  updateState.value = "downloading";
+  downloadProgress.value = { downloaded: 0, total: updateInfo.value.asset_size };
+  try {
+    const savePath = await api.downloadUpdate(
+      updateInfo.value.asset_url,
+      updateInfo.value.asset_name,
+      (p) => (downloadProgress.value = p)
+    );
+    updateState.value = "installing";
+    await api.applyUpdate(savePath); // 成功后当前进程会退出重启，这行往后不会执行到
+  } catch (e: any) {
+    updateErr.value = String(e);
+    updateState.value = "error";
   }
 }
 
@@ -195,6 +256,64 @@ async function save() {
         </a>
       </div>
     </div>
+
+    <!-- ── 关于 / 检测更新 ── -->
+    <div class="about-block">
+      <h3>版本</h3>
+      <div class="version-row">
+        <div class="version-left">
+          <span class="muted">当前版本</span>
+          <span v-if="appVersion" class="pill pill-accent">v{{ appVersion }}</span>
+        </div>
+        <div class="version-right">
+          <button
+            v-if="updateState === 'idle' || updateState === 'latest' || updateState === 'error'"
+            class="sm"
+            @click="checkUpdate"
+          >
+            {{ updateState === "error" ? "重试" : "检测更新" }}
+          </button>
+          <span v-if="updateState === 'latest'" class="pill pill-success">已是最新版本</span>
+          <span v-if="updateState === 'checking'" class="muted sm">检查中…</span>
+
+          <template v-if="updateState === 'available' && updateInfo">
+            <span class="pill pill-warning">v{{ updateInfo.version }} 可更新</span>
+            <button class="primary sm" @click="showUpdateModal = true">查看更新</button>
+          </template>
+
+          <div v-if="updateState === 'downloading'" class="dl-progress">
+            <div class="dl-bar"><div class="dl-fill" :style="{ width: downloadPercent() + '%' }"></div></div>
+            <span class="muted sm dl-text">
+              {{ downloadPercent() }}%
+              <template v-if="downloadProgress.total">
+                （{{ formatBytes(downloadProgress.downloaded) }} / {{ formatBytes(downloadProgress.total) }}）
+              </template>
+            </span>
+          </div>
+
+          <span v-if="updateState === 'installing'" class="muted sm">正在安装并重启…</span>
+        </div>
+      </div>
+      <div v-if="updateState === 'error' && updateErr" class="err" style="margin-top: 10px">{{ updateErr }}</div>
+    </div>
+
+    <!-- ── 更新弹窗 ── -->
+    <div v-if="showUpdateModal && updateInfo" class="modal-mask" @click.self="showUpdateModal = false">
+      <div class="modal-box card">
+        <div class="modal-header">
+          <span class="modal-title">发现新版本 v{{ updateInfo.version }}</span>
+          <button class="sm" @click="showUpdateModal = false">✕</button>
+        </div>
+        <div class="modal-body">
+          <pre v-if="updateInfo.body" class="release-notes">{{ updateInfo.body }}</pre>
+          <p v-else class="muted">暂无更新说明</p>
+        </div>
+        <div class="modal-footer">
+          <button class="sm" @click="showUpdateModal = false">稍后再说</button>
+          <button class="primary sm" @click="showUpdateModal = false; startDownload()">下载并安装</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
@@ -335,5 +454,115 @@ label {
 }
 .doc-link:hover {
   text-decoration: underline;
+}
+
+.pill.sm, .sm {
+  font-size: 11px;
+}
+button.sm {
+  padding: 3px 8px;
+}
+
+/* ── 版本 / 检测更新 ── */
+.about-block {
+  margin-top: 32px;
+  padding-top: 24px;
+  border-top: 0.5px solid var(--border);
+}
+.about-block h3 {
+  margin: 0 0 12px;
+  font-size: 15px;
+  font-weight: 500;
+}
+.version-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.version-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.version-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.dl-progress {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 180px;
+}
+.dl-bar {
+  flex: 1;
+  height: 6px;
+  background: var(--surface-1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+.dl-fill {
+  height: 100%;
+  background: var(--border-accent);
+  border-radius: 3px;
+  transition: width 0.2s;
+}
+.dl-text {
+  white-space: nowrap;
+}
+
+/* ── 更新弹窗 ── */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+.modal-box {
+  width: 480px;
+  max-width: 90vw;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+}
+.modal-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px 12px;
+  border-bottom: 0.5px solid var(--border);
+}
+.modal-title {
+  font-size: 14px;
+  font-weight: 500;
+}
+.modal-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 18px;
+}
+.release-notes {
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  margin: 0;
+}
+.modal-footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 18px 16px;
+  border-top: 0.5px solid var(--border);
 }
 </style>

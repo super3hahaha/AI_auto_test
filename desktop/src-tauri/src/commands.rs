@@ -843,14 +843,21 @@ pub fn upsert_device_alias(app: AppHandle, serial: String, alias: String) -> Res
     write_device_aliases(&root, &map)
 }
 
-/// 删除设备别名登记：只影响 config/device_aliases.json，不影响物理设备连接本身
-/// （已插上的设备下次刷新仍会出现，只是 alias 变空）。
+/// 删除设备别名登记：清 config/device_aliases.json 里的登记。
+/// USB 设备物理插着的话下次刷新仍会出现（软件层面弄不掉 USB 连接，只是 alias 变空）。
+/// 网络 adb（serial 形如 ip:port）额外 `adb disconnect`——不然 adb server 记着这个地址，
+/// 下次 adb devices 扫描还是会把它列成 offline，删了等于没删。断开后要用再 adb connect 回来，
+/// 跑用例时 adbkit.py 的掉线自愈已经会自动重连，不影响自动化。
 #[tauri::command]
 pub fn delete_device_alias(app: AppHandle, serial: String) -> Result<(), String> {
     let root = root_of(&app)?;
     let mut map = device_aliases(&root);
     map.remove(&serial);
-    write_device_aliases(&root, &map)
+    write_device_aliases(&root, &map)?;
+    if serial.contains(':') {
+        let _ = Command::new("adb").args(["disconnect", &serial]).output();
+    }
+    Ok(())
 }
 
 /// 导出设备别名登记到给定路径（前端先用 save 对话框选路径）
@@ -1044,6 +1051,26 @@ pub fn set_target_dump_backend(app: AppHandle, app_slug: String, dump_backend: S
     let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
     let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
     v["dump_backend"] = Value::String(dump_backend);
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 设本次实际装机的 App 版本：写回 apps/<slug>/target.json 的 app_version。
+/// 场景库「选中留存版本执行」这条路径只会 `adb install -r` 逐台强制重装选中的 apk（见
+/// runStore.ts `start()` 装机段），却从没把选中的版本号回写进 target.json——`app_version`
+/// 只在 `register_app`（首次上传注册）时被 init_target.py 现查一次，之后哪怕又跑了别的
+/// build，这个字段也不会跟着变。case_result.py/adbkit.py/doc_report.py 全都直接读这个静态
+/// 字段（决定证据落哪个版本目录、Doc 报告「测试版本」显示什么），跟不上就会自相矛盾
+/// （2026-08-04 发现：设备上 dumpsys 真实装的是 2.3.5J，报告却显示成上次注册时的 2.3.5）。
+/// 装机成功后立刻调用本命令，让 target.json 跟"这一轮实际跑的是哪个版本"保持一致。
+#[tauri::command]
+pub fn set_target_app_version(app: AppHandle, app_slug: String, app_version: String) -> Result<(), String> {
+    let root = root_of(&app)?;
+    let p = app_root(&root, &app_slug).join("target.json");
+    let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+    v["app_version"] = Value::String(app_version);
     fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1316,9 +1343,50 @@ fn pump_capture<R: std::io::Read>(r: R, ch: &Channel<String>, cap: &std::sync::M
     }
 }
 
+/// kill -TERM -<pgid>：负号表示整个进程组。
+#[cfg(unix)]
+fn term_pgid(pid: i32) {
+    let _ = Command::new("kill").args(["-TERM", &format!("-{pid}")]).status();
+}
+
+/// 探活（kill -0）+ 仍存活则补 SIGKILL 兜底——SIGTERM 可被忽略或来不及处理（尤其 claude CLI
+/// 这类外部二进制，退出行为不受本仓库控制），发完 TERM 不代表进程组真的没了。
+#[cfg(unix)]
+fn kill_pgid_if_alive(pid: i32) {
+    let alive = Command::new("kill")
+        .args(["-0", &format!("-{pid}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if alive {
+        let _ = Command::new("kill").args(["-KILL", &format!("-{pid}")]).status();
+    }
+}
+
+/// 应用退出（Cmd+Q / 系统关闭请求，不止是点了「停止执行」）前的兜底清理：把 RUN_PGIDS 里登记的
+/// 进程组全部收掉，避免 python/run_flow/auto_repair/claude 在应用主进程消失后变成孤儿进程继续
+/// 留在后台。同步阻塞最多 2 秒——应用本就在退出，等这一下换干净收尾是值得的。
+pub fn kill_all_run_pgids_blocking() {
+    let entries: Vec<(String, i32)> = RUN_PGIDS.lock().unwrap().clone();
+    if entries.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        for (_key, pid) in &entries {
+            term_pgid(*pid);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        for (_key, pid) in &entries {
+            kill_pgid_if_alive(*pid);
+        }
+    }
+}
+
 /// 中止当前正在跑的所有 run：向每个已登记的进程组发 SIGTERM（可捕获，让 run_flow/auto_repair
 /// 有机会补记「已中止」日志后退出），整组 python→bash→adb→claude 一起收。多设备并行时每台
-/// 设备一个进程组，全部一起停。没有在跑的 run 返回 false。
+/// 设备一个进程组，全部一起停。没有在跑的 run 返回 false。SIGTERM 发出后台延迟探活，
+/// 对未响应的补发 SIGKILL 兜底，不阻塞本次调用返回。
 #[tauri::command]
 pub fn abort_run() -> Result<bool, String> {
     let entries: Vec<(String, i32)> = RUN_PGIDS.lock().unwrap().clone();
@@ -1327,12 +1395,16 @@ pub fn abort_run() -> Result<bool, String> {
     }
     #[cfg(unix)]
     {
-        for (_key, pid) in &entries {
-            // kill -TERM -<pgid>：负号表示整个进程组
-            let _ = Command::new("kill")
-                .args(["-TERM", &format!("-{pid}")])
-                .status();
+        let pids: Vec<i32> = entries.iter().map(|(_, p)| *p).collect();
+        for pid in &pids {
+            term_pgid(*pid);
         }
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            for pid in &pids {
+                kill_pgid_if_alive(*pid);
+            }
+        });
         Ok(true)
     }
     #[cfg(not(unix))]
@@ -1719,6 +1791,52 @@ pub struct ApkInfo {
     pub suggested_slug: String,
 }
 
+/// 录制器桥（tools/recorder.py 的 probe/act/export 三个无状态子命令）。
+///
+/// 为什么是"无状态桥"而不是把逻辑搬到 Rust：选择器候选/父锚推导/前后屏 diff/flow 草稿生成全在
+/// recorder.py 里，浏览器版（`recorder.py --serial X serve`）和桌面壳共用同一份实现，避免两处漂移。
+/// 录制过程中的步骤列表由前端（views/Recorder.vue）持有，act 时把上一屏的 labels 回传当 diff 基线，
+/// 所以这里每次调用都是独立进程、无需常驻会话。
+///
+/// 耗时：probe ≈ 1-3s（截图 + UI dump 并行），act ≈ 3-5s（动作 + 等界面稳 + 再探一屏）。前端必须
+/// 上 loading 态，不能让用户以为卡死。
+#[tauri::command]
+pub async fn recorder_cmd(
+    app: AppHandle,
+    app_slug: String,
+    sub: String,
+    serial: String,
+    payload: Option<String>,
+) -> Result<Value, String> {
+    let root = root_of(&app)?;
+    let cfg = load_app_config(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut args = vec![
+            "tools/recorder.py".to_string(),
+            "--serial".to_string(),
+            serial,
+            sub.clone(),
+        ];
+        if let Some(p) = payload {
+            args.push("--json".to_string());
+            args.push(p);
+        }
+        let out = python_cmd(&root, &cfg.python, &args, Some(&app_slug))
+            .output()
+            .map_err(|e| format!("启动 recorder.py 失败：{e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg: String = err.lines().rev().take(6).collect::<Vec<_>>().join(" / ");
+            return Err(format!("录制器 {sub} 失败：{}", if msg.is_empty() { "无错误输出".into() } else { msg }));
+        }
+        serde_json::from_slice::<Value>(&out.stdout)
+            .map_err(|e| format!("录制器 {sub} 的输出不是合法 JSON（{e}）：{}",
+                                 String::from_utf8_lossy(&out.stdout).chars().take(200).collect::<String>()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// 本地解析 APK（不碰设备）：aapt dump badging 抠 package/versionName/application-label。
 #[tauri::command]
 pub fn probe_apk(apk_path: String) -> Result<ApkInfo, String> {
@@ -1814,6 +1932,19 @@ pub fn save_apk_version(app: AppHandle, slug: String, src_path: String, version:
     let dest = dir.join(format!("{}.apk", sanitize_version(&version)));
     fs::copy(&src_path, &dest).map_err(|e| format!("复制 APK 失败：{e}"))?;
     Ok(dest.to_string_lossy().to_string())
+}
+
+/// 从留存版本列表移出一个 APK 文件（App 库版本树的「删除」按钮）。硬删，不进回收站——
+/// 这只是本地缓存的安装包，随时能重新上传，不是像 removeApp 那样连用例/账本一起挪走的场景。
+/// 版本号按 save_apk_version 同一套 sanitize_version 拼文件名，不接收前端传来的路径，避免删错目录。
+#[tauri::command]
+pub fn delete_apk_version(app: AppHandle, slug: String, version: String) -> Result<(), String> {
+    let root = root_of(&app)?;
+    let path = apks_dir(&root, &slug).join(format!("{}.apk", sanitize_version(&version)));
+    if !path.exists() {
+        return Err(format!("版本文件不存在：{}", path.display()));
+    }
+    fs::remove_file(&path).map_err(|e| format!("删除失败：{e}"))
 }
 
 // ---------------------------------------------------------------------------

@@ -4,13 +4,14 @@ import { store } from "./store";
 import Setup from "./views/Setup.vue";
 import Overview from "./views/Overview.vue";
 import Devices from "./views/Devices.vue";
+import Recorder from "./views/Recorder.vue";
 import Runner from "./views/Runner.vue";
 import Resources from "./views/Resources.vue";
 import Evidence from "./views/Evidence.vue";
 import Boards from "./views/Boards.vue";
 import Cleanup from "./views/Cleanup.vue";
 
-type View = "overview" | "devices" | "runner" | "resources" | "evidence" | "boards" | "cleanup" | "setup";
+type View = "overview" | "devices" | "recorder" | "runner" | "resources" | "evidence" | "boards" | "cleanup" | "setup";
 const active = ref<View>("runner");
 const ready = ref(false);
 
@@ -18,6 +19,7 @@ const nav: { key: View; label: string; primary?: boolean }[] = [
   { key: "overview", label: "概览" },
   { key: "devices", label: "设备" },
   { key: "resources", label: "资源库" },
+  { key: "recorder", label: "录制器" },
   { key: "runner", label: "执行台", primary: true },
   { key: "evidence", label: "证据" },
   { key: "boards", label: "看板" },
@@ -83,11 +85,15 @@ async function onConfigured() {
 
     <main class="content">
       <Setup v-if="active === 'setup'" @configured="onConfigured" />
-      <!-- 只保活 Runner：跑固化脚本时切走 tab 不销毁它，执行状态/流式日志得以延续；
-           其余视图仍按原样每次进入重新挂载（切回自动刷新数据）。 -->
-      <keep-alive v-else include="Runner">
+      <!-- 保活 Runner + Recorder：
+           · Runner —— 跑固化脚本时切走 tab 不销毁它，执行状态/流式日志得以延续；
+           · Recorder —— 录制进度（步骤列表 + 当前屏）只在内存里，销毁就等于白录一遍。
+           其余视图仍按原样每次进入重新挂载（切回自动刷新数据）。
+           保活的视图不能只靠 onMounted 初始化：切回来走的是 onActivated（见两个视图内的用法）。 -->
+      <keep-alive v-else :include="['Runner', 'Recorder']">
         <Overview v-if="active === 'overview'" />
         <Devices v-else-if="active === 'devices'" />
+        <Recorder v-else-if="active === 'recorder'" />
         <Runner v-else-if="active === 'runner'" />
         <Resources v-else-if="active === 'resources'" />
         <Evidence v-else-if="active === 'evidence'" />

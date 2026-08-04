@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from "vue";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { api, type DeviceRow } from "../api";
 import { store } from "../store";
 
@@ -61,7 +62,11 @@ async function saveEdit(serial: string) {
 
 // 删除别名登记（不影响物理设备连接，只是这台设备从「已知设备」里移除/清空别名）
 async function removeDevice(d: DeviceRow) {
-  if (!confirm(`确认删除设备登记 ${d.alias || d.serial}？\n仅清除别名登记，不影响设备物理连接。`)) return;
+  const ok = await confirm(`仅清除别名登记，不影响设备物理连接。`, {
+    title: `确认删除设备登记 ${d.alias || d.serial}？`,
+    kind: "warning",
+  });
+  if (!ok) return;
   try {
     await api.deleteDeviceAlias(d.serial);
     msg.value = `已删除设备登记：${d.serial}`;

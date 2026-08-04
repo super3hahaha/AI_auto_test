@@ -176,6 +176,8 @@ export const runStore = reactive({
     title: string;
     apkPath?: string; // 选了某个留存版本时，跑用例前先在每台设备上强制重装这个 apk
     package?: string;
+    appVersion?: string; // 配 apkPath 一起传：装机成功后回写 target.json.app_version，
+    // 不然这个字段会停留在上次 register_app 时探测到的旧版本上（见 set_target_app_version 注释）
     langCode?: string; // 场景库显式选的目标语言代号（如 ko）；不传=不切语言，走脚本固化时的原文
     followDevice?: boolean; // 场景库选了「跟随设备」：不装机，直接用设备上已装的 App 回归；
     // 证据版本段现查设备真实安装版本（见 run_flow.py/adbkit.py 的 AITEST_FOLLOW_DEVICE）
@@ -310,6 +312,14 @@ export const runStore = reactive({
         }
       }
       this.pushEvent("📦 装机完成");
+      if (opts.appVersion) {
+        try {
+          await api.setTargetAppVersion(opts.slug, opts.appVersion);
+          this.pushEvent(`已回写 target.json.app_version：${opts.appVersion}`);
+        } catch (e: any) {
+          this.pushEvent(`⚠ 回写 app_version 失败：${e}（不影响本轮执行，但报告/证据目录可能仍显示旧版本）`, "error");
+        }
+      }
     }
 
     // 跑一格（一台设备上的一条用例）：执行 → 分类 → 落账本。账本写入端已有进程间锁

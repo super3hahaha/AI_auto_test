@@ -262,6 +262,40 @@ CUT-CORE-01/MIX-CORE-01/SPLIT-CORE-01 都有重命名收尾这一步，新模块
       是否还在包内（不在就 `launch` 重进）→ `waitfor` 长一点 → 还没进就回上一页重点一次**，最多 3 轮。
     - 提前退出的失败分支也要走统一收尾（`flow_ring_lib.sh` 抽了个 `finish()`：logscan + 按 `FAILED`
       定 exit 码），别在早退分支里裸 `exit 1` 把崩溃扫描跳过去。
+11. **调 `seeds/push_media.sh` 必须捕获真实输出再落日志，禁止写死"已重推素材"**——`push_media.sh`
+    内部是按远端/本地文件大小逐个比对 skip/pushed 的（没变就跳过，不是每次都真的重新推），如果把
+    它的 stdout 重定向到 `/dev/null` 再打一行固定文案，日志会永远显示"已重推"，完全看不出这次
+    到底是真推了还是全部命中缓存跳过（2026-08-04 发现，当时 6 个脚本全中招，见 `docs/gotchas.md`
+    同日条目）。**标准写法（直接照抄，三行 `grep -c` 都必须带 `|| true`）**：
+    ```bash
+    PM_OUT=$(bash seeds/push_media.sh "$S" 2>&1)
+    # grep -c 在 0 命中时返回 exit 1，配合脚本头部 set -e 会在任何 log() 输出之前直接杀死
+    # 整条流程（0 字节日志、无任何截图/证据）——素材已推送过、这次全是 skip 行是最常见的
+    # 触发场景（2026-08-04 MIX-CORE-01 三台设备真机复现），这三行只是统计计数用于打日志，
+    # 不是断言，必须加 `|| true` 让零命中不再杀脚本，不影响后面任何判定逻辑。
+    PM_PUSHED=$(grep -c '^pushed ' <<<"$PM_OUT" || true)
+    PM_SKIP=$(grep -c '^skip ' <<<"$PM_OUT" || true)
+    PM_CLEAN=$(grep -c '^cleaned ' <<<"$PM_OUT" || true)
+    PM_MSG="skip ${PM_SKIP}"
+    [ "$PM_PUSHED" -gt 0 ] && PM_MSG="$PM_MSG、pushed ${PM_PUSHED}（$(grep '^pushed ' <<<"$PM_OUT" | sed 's/^pushed //' | tr '\n' ' ')）"
+    [ "$PM_CLEAN" -gt 0 ] && PM_MSG="$PM_MSG、清理残留 ${PM_CLEAN}"
+    log "素材同步：${PM_MSG}（已触发媒体扫描）"
+    ```
+    `PM_OUT=$(bash seeds/push_media.sh "$S" 2>&1)` 这一行是否额外加 `|| true` 看脚本本身的容错
+    策略：本来就该在 `push_media.sh` 出错时中止的脚本，直接这样写即可（`set -e` 下赋值语句仍会
+    因子命令非0退出而终止脚本，效果等价于原来的裸调用）；本来就容错跑下去的脚本（如
+    `flow_mix_core.sh`/`flow_mix_shortest.sh`）才在这一行末尾也加 `|| true`。**三行 `grep -c`
+    的 `|| true` 是硬性的，不受这条容错策略选择的影响**——统计计数零命中是常态，不加会导致
+    脚本在"素材没变化"这个最常见的场景下随机性崩溃，且崩得早、没有任何证据留痕，比被测 App
+    真的坏了更难排查。
+12. **同一模块拆成的"姊妹脚本"（如 `flow_mix_core.sh`/`flow_mix_shortest.sh`、`flow_cut_fmt.sh`/
+    `flow_cut_fmt02.sh`，头注里通常会互相点名"同一模块拆两条用例/两个脚本"）往往有大段同源
+    代码。在某一个脚本里踩坑修好一段共享代码后，**顺手检查其余姊妹脚本是不是抄的同一段**，
+    一并同步修掉，不要假设"这次只是这台设备/这条用例巧合撞上"——2026-08-04 `flow_mix_core.sh`
+    先修好"点 `next_tv` 后偶发插屏广告卡住 `waitfor`"，`flow_mix_shortest.sh` 当时没同步，
+    结果几小时后同一个坑在另一台设备上又把 `MIX-CORE-02` 打挂了一次（见 `docs/gotchas.md`
+    同日条目）。判断标准：改动的代码段是不是"选择器/等待/清障"这类跟被测功能强相关、姊妹
+    脚本大概率原样复制的部分（跟 UI 强绑定的截图文案、`CASE` 变量名这类天然不同的部分除外）。
 
 ## 失败判定标准（硬规则，2026-07-22 起）
 
@@ -309,5 +343,25 @@ duration 不符）用 `|| true` 吞掉 output-check 的非0退出码，只 log �
    `log` 那一行要**直接说清根因**（"什么值 ≠ 什么预期，为什么，跳过了哪一步"），别写成
    "校验失败，见上"——那句话就是复盘时能看到的全部。这些关键词是前后端共用的口径，写失败
    文案时用上其中一个（惯例是「严重异常：」开头写根因、`✖` 开头写单点校验不通过）。
+7. **`logscan` 是每个 flow 脚本的强制项，`output-check` 按用例是否有具体产物要核对来决定跑不跑**
+   （纯 UI 交互/解锁类流程没有输出文件可查时可以不跑 `output-check`，但只要脚本操作了 App
+   就必须跑一次 `logscan`）。**光调用还不够，必须把输出捕获下来做命中数判断并接进 `FAILED`**——
+   标准写法照抄 `flow_mix_core.sh`/`flow_ring_lib.sh` 的 `finish()`：
+   ```bash
+   LS=$($AK --case "$CASE" logscan final 2>&1)
+   grep -qE '，[1-9][0-9]* 条命中' <<< "$LS" && { log "logscan 命中崩溃/异常"; FAILED=1; }
+   ```
+   `$AK --case "$CASE" logscan final >/dev/null 2>&1 || true` 这种裸调用只会留一条空的
+   evidence 记录，从不检查命中数、从不置位 `FAILED`，logscan 形同虚设——2026-08-04 审计
+   `apps/MP3Cutter/flows/` 全部 30 个脚本时发现两类真实缺口，均已修复：`flow_cut_save.sh`/
+   `flow_merge_fmt.sh` 的「失败判定标准」注释里写了 logscan，但脚本实际从没调用过（已补齐
+   调用+判定）；另外 10 个 `flow_unlock_*.sh` 是前面说的裸调用型（已改成捕获输出+判定，
+   确认过往未真的命中过崩溃，改动不影响历史判定结论）。
+   排查现有脚本是否中招：
+   ```bash
+   for f in apps/*/flows/flow_*.sh; do grep -q 'logscan' "$f" || echo "缺 logscan: $f"; done
+   ```
+   找完全没调用的；再看有调用但紧跟 `>/dev/null 2>&1 || true`（没把输出存进变量、没有
+   `grep` 命中判断）的，是"调了但不判定"型，同样要按上面标准写法补上。
 
 背景决策详情见 `docs/decisions.md` #33、#34、#41。

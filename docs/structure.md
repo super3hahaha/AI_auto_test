@@ -32,6 +32,8 @@ AI_auto_test/
 │       │   └── strings_table.json  # {资源key: {locale: 译文}}，供固化脚本按语言查表换算选择器文案
 │       ├── cases/            # 该 App 用例定义（YAML）；_TEMPLATE.yaml 字段模板
 │       ├── apks/             # 留存的多版本 APK 本体（<version>.apk，gitignore）；上传时复制，执行前选版本强制重装
+│       ├── recordings/       # 录制器产物（tools/recorder.py，gitignore）：<case>/{rec.json, shots/NN.png, flow_*.draft.sh}
+│       │                     #   rec.json 是**中间物**：人点出来的选择器序列 + 每步前后屏 diff，供 AI 翻成 cases/*.yaml + flows/flow_*.sh
 │       └── ledger/           # 该 App 本机执行产物（gitignore）
 │           ├── summary.csv   # 摘要：全局计数
 │           ├── structure.csv # 结构视图：模块→目的→覆盖用例
@@ -52,9 +54,22 @@ AI_auto_test/
 │   │                    #   含 ledger_lock() 账本进程间锁（可重入 flock，所有账本 CSV 写点必须包它）
 │   ├── exec_ledger.py   # ★ executions.csv 读写 + (run_id,用例,serial) upsert + 聚合回 queue + 旧表补「执行设备」列
 │   ├── _probe_skip.py   # 临时探针：跳过/关闭按钮出没时 dump 树，看它进不进无障碍树/选择器是什么
-│   ├── adbkit.py        # 手和眼：ADB 封装（ui/tap/shot/bounds/db/sp/seed/logscan/sweep...），唯一碰 adb 的地方
-│   │                    #   bounds 子命令：按 id/text/desc（可 --child N 取第N个子节点）打印 BOUNDS/CENTER/SIZE，
-│   │                    #   给固化脚本现算坐标用——canvas 自绘无 id 的控件只能这么定位，禁止在 bash 里 grep XML
+│   ├── adbkit.py        # 手和眼：ADB 封装（ui/nodes/tap/shot/bounds/db/sp/seed/logscan/sweep...），唯一碰 adb 的地方
+│   │                    #   bounds 子命令：按 id/text/desc（可 --child N 或多级路径 --child 2,0,1 逐级下钻）打印
+│   │                    #   BOUNDS/CENTER/SIZE，给固化脚本现算坐标用——canvas 自绘无 id 的控件、以及 id/text/desc
+│   │                    #   全空的图标按钮（某些页的返回箭头）只能这么定位，禁止在 bash 里 grep XML
+│   │                    #   nodes 子命令：当前屏 → JSON 节点表，每个候选选择器带**全树匹配数 n + idx**，
+│   │                    #   自身无选择器的节点带 anc（最近唯一祖先 + --child 路径）；给录制器/桌面壳吃。
+│   │                    #   --skip-pkg <pkg> 整包排除（在统计匹配数之前），排别的包时用
+│   │                    #   u2 后端出口 _strip_systemui() 剥掉状态栏窗口 → 与 shell 同构（见 decisions #30）
+│   ├── recorder.py      # ★ 桌面录制器（demo）：本地 HTTP 服务，人在浏览器点真机 → 选择器序列 + 每步前后屏 diff
+│   │                    #   → apps/<slug>/recordings/<case>/{rec.json, flow_*.draft.sh}。动作全经 adbkit 下发
+│   │                    #   （录制路径 == 回放路径）；点击只记选择器不记坐标，滑动/长拖记「锚控件 + 千分比」
+│   │                    #   提速：优先 u2 后端(失败退 shell 并记住) + probe 时 nodes --cache，
+│   │                    #   点击 --from-cache 免掉重复 dump（3.4s→0.04s）；一步 act 实测 8.9s→1.98s；
+│   │                    #   该参数**只在执行那一刻追加**，绝不能进导出脚本（会按陈旧 dump 点错，见 gotchas）
+│   ├── recorder_ui.html # 录制器前端（单文件无依赖）：截图叠控件框——黄=唯一选择器 / 红=选择器有歧义（点前
+│   │                    #   强制消歧）/ 蓝=自身无选择器靠父锚定位；右侧步骤列表带每步 diff.appeared
 │   ├── lang_table.py    # 多语言 strings.xml 资源包(目录/zip，来源可以是翻译导出包，也可以是 lang-string-compare
 │   │                    #   的 extract_apk_strings.py 从 apk 反编译出的同构产物) → apps/<slug>/lang/strings_table.json；
 │   │                    #   固化脚本靠 resolve 子命令按语言查表换算选择器文案，解语言切换后 taptext/tapdesc 失效的问题
@@ -76,10 +91,15 @@ AI_auto_test/
 ├── .claude/skills/adb-testcase-gen/  # skill：一句话目标→真机探查→YAML 用例
 ├── .claude/skills/flow-freeze/       # skill：探通路径→固化 flow_*.sh + 失败判定标准
 ├── desktop/             # ★ Tauri2+Vue3 桌面壳（可视化：设置/设备/执行/证据/看板）
-│   ├── src/views/            # 一个 tab 一个文件，App.vue 用 active 字符串切换（keep-alive 只保活 Runner）
+│   ├── src/views/            # 一个 tab 一个文件，App.vue 用 active 字符串切换（keep-alive 只保活 Runner+Recorder：
+│   │                           #   执行状态/录制进度切走不能丢；保活视图内禁用全局 querySelector、初始化走 onActivated）
 │   │   ├── Setup.vue          # 首屏：选活跃 App / 配置 target.json，配置完才进主界面；底部「版本」区块查/装更新
 │   │   ├── Overview.vue       # 总览面板（overview-panel-prd.md）
 │   │   ├── Devices.vue        # 设备列表/选设备
+│   │   ├── Recorder.vue       # ★「录制器」tab（侧栏排在执行台前）：截图叠控件框，人点一遍真机 → 步骤 + 每步 diff
+│   │   │                      #   → 导出 recordings/<case>/{rec.json, flow_*.draft.sh}。步骤列表在前端持有，
+│   │   │                      #   后端 tools/recorder.py 的 probe/act/export 是无状态子命令（Rust: recorder_cmd）。
+│   │                      #   被 keep-alive 保活（切走不丢步骤），故量 DOM 用模板 ref + onActivated 重量
 │   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38；多设备时用例行尾设备chips逐格分派，见decisions #39)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
 │   │   ├── RunMonitor.vue     # Runner 内嵌的运行监控子组件（流式日志/状态，不单独作为 tab）；数据源可为实时 runStore 或传入的 source 快照（执行记录复用）；用例卡片右上「↗」跳证据页定位到该格第一项（store.requestEvidence，见 decisions #47）
 │   │   ├── RunHistory.vue     # 「执行记录」子tab：列出保存的执行台快照(run_records/)、按 id 切换、用 RunMonitor 只读渲染（makeRecordSource 包快照）

@@ -59,13 +59,75 @@ def app_version():
     return _VER
 
 
+_WIRELESS_SERIAL_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}:\d+$")
+_RECONNECT_TRIED = False  # 整个进程生命周期最多重连一次，避免把普通非零退出误判成掉线反复重连拖慢整轮
+
+
+def _is_wireless_serial(s):
+    return bool(_WIRELESS_SERIAL_RE.match(s or ""))
+
+
+def _looks_offline(text):
+    """判断 adb 本身报的错是不是「设备掉线」类，而非远端命令的正常非零退出（如 grep 无匹配）。
+    只认 adb 协议层的信号，不看命令语义——命令语义失败的 stderr 不会含这几个词。"""
+    t = (text or "").lower()
+    if "device offline" in t:
+        return True
+    if "adb: error: device" in t and "not found" in t:
+        return True
+    return False
+
+
+def _try_reconnect_once():
+    """无线设备疑似掉线时尝试 `adb connect` 重连一次，成功才让调用方重试原命令。
+    根因是企业 WiFi 下的 AP 漫游导致 TCP 长连接瞬断（见 docs/gotchas.md 2026-08-04 条目），
+    不是本框架的并发资源争抢，所以这里只治「掉线后不会自愈」，不动执行编排。"""
+    global _RECONNECT_TRIED
+    if _RECONNECT_TRIED or not _is_wireless_serial(SERIAL):
+        return False
+    _RECONNECT_TRIED = True
+    print(f"[adb] {SERIAL} 疑似掉线，尝试 adb connect 重连…", file=sys.stderr)
+    try:
+        subprocess.run(["adb", "connect", SERIAL], capture_output=True, text=True, timeout=15)
+    except subprocess.TimeoutExpired:
+        pass
+    time.sleep(1.5)
+    try:
+        st = subprocess.run(["adb", "-s", SERIAL, "get-state"], capture_output=True, text=True, timeout=10)
+        ok = st.returncode == 0 and st.stdout.strip() == "device"
+    except subprocess.TimeoutExpired:
+        ok = False
+    print(f"[adb] {SERIAL} 重连{'成功，重试本条命令' if ok else '仍失败，按原错误返回'}", file=sys.stderr)
+    return ok
+
+
 def adb(*args, capture=False, stdout_file=None):
-    """执行 adb 命令。SERIAL 非空时自动加 -s。"""
+    """执行 adb 命令。SERIAL 非空时自动加 -s。
+    命中「设备掉线」信号时自动重连一次并重试本条命令（一个进程内最多一次），见上文
+    _try_reconnect_once；非掉线导致的非零退出（命令本身失败）按原样直接返回，不重试。"""
     cmd = ["adb"] + (["-s", SERIAL] if SERIAL else []) + list(args)
-    if stdout_file:
-        with open(stdout_file, "wb") as f:
-            return subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
-    return subprocess.run(cmd, capture_output=capture, text=True)
+
+    def _run():
+        if stdout_file:
+            with open(stdout_file, "wb") as f:
+                return subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    r = _run()
+    err = r.stderr
+    if isinstance(err, bytes):
+        err = err.decode("utf-8", "replace")
+    if r.returncode != 0 and _looks_offline(err) and _try_reconnect_once():
+        r = _run()
+
+    if not stdout_file and not capture:
+        # 保持旧语义：capture=False 时调用方不取返回值里的文本，而是希望直接看到输出——
+        # 这里改成先捕获（为了能检测掉线信号）再原样转发到本进程 stdout/stderr。
+        if r.stdout:
+            sys.stdout.write(r.stdout)
+        if r.stderr:
+            sys.stderr.write(r.stderr)
+    return r
 
 
 def shell(remote, capture=True):
@@ -135,11 +197,25 @@ def _append_evidence(case, step, etype, abs_path, assertion="", result=""):
 
 # ---------- 子命令 ----------
 
+def _ensure_awake():
+    """执行前置：设备若息屏/锁屏（mWakefulness 非 Awake）则亮屏+滑动解锁，
+    避免 launch 在锁屏状态下起不来（真机跑一段时间自动熄屏是常见坑）。
+    无密码锁屏的滑动解锁足够；有密码锁屏这一下滑不开，仍会导致后续步骤失败，暂不处理。"""
+    out = shell("dumpsys power", capture=True).stdout
+    m = re.search(r"mWakefulness=(\w+)", out)
+    if m and m.group(1) != "Awake":
+        shell("input keyevent KEYCODE_WAKEUP")
+        time.sleep(0.5)
+        shell("input swipe 300 1000 300 500")
+        time.sleep(0.5)
+
+
 def cmd_devices(args):
     print(adb("devices", capture=True).stdout)
 
 
 def cmd_launch(args):
+    _ensure_awake()
     # 优先 am start 显式启动页（比 monkey 可靠）；无 main_activity 时回退 monkey
     if MAIN_ACTIVITY:
         print(shell(f"am start -n {PKG}/{MAIN_ACTIVITY}").stdout)
@@ -150,6 +226,36 @@ def cmd_launch(args):
 def cmd_reset(args):
     print(shell(f"pm clear {PKG}").stdout)
     print(f"[reset] 已清空 {PKG} 的数据。")
+    _ensure_ascii_ime()
+
+
+ADB_IME = "com.github.uiautomator/.AdbKeyboard"
+
+
+def _ensure_ascii_ime():
+    """把设备默认输入法固定切到 uiautomator2 自带的哑键盘 ADB_IME（无联想/拼音引擎）——
+    根治 `input text` 被联想 IME 拦截改写成乱码的问题（见 docs/gotchas.md 2026-07-21/2026-08-04）。
+    没走"把 Gboard 切到英文 subtype"这条路：2026-08-04 真机实测过 `settings put secure
+    selected_input_method_subtype <en_US的hash>` 对 Gboard 读写都不生效，设置完立刻被冲掉
+    （呼应 cmd_text 里那条"selected_input_method_subtype 恒为 -1"的旧观察）；换掉整个 IME
+    才是唯一可靠的路子。优先走 uiautomator2 的 `set_fastinput_ime`（缺包会自动推装，已装直接
+    `ime set` 切过去），u2 连不上时退化成纯 `adb shell ime set`（前提是设备已装这个键盘）。
+    每次 reset 顺手保证一次，全程 best-effort——连不上/装不上只打印提示，不阻断 reset 本身，
+    调用方（各 flow 脚本）该在真正打字的地方按需要另做校验（见 cmd_text 的 --assert-typed）。"""
+    dev = _u2_device_soft()
+    if dev is not None:
+        try:
+            dev.set_input_ime(True)
+        except Exception as e:
+            print(f"[reset] 输入法固化失败（u2 set_fastinput_ime 异常：{e}），如遇 input text 乱码见 docs/gotchas.md")
+            return
+    else:
+        shell(f"ime set {ADB_IME}")
+    cur = shell("settings get secure default_input_method", capture=True).stdout.strip()
+    if cur == ADB_IME:
+        print(f"[reset] 输入法已固定为哑键盘 {ADB_IME}（无联想引擎，input text 不再受拼音等 IME 干扰）")
+    else:
+        print(f"[reset] 输入法固化后校验不一致（当前={cur!r}），如遇 input text 乱码见 docs/gotchas.md")
 
 
 def cmd_ui(args):
@@ -222,17 +328,6 @@ def cmd_ui(args):
 def cmd_shot(args):
     case = need_case(args)
     out = evid_dir(case, "screenshots") / f"{args.name}.png"
-    shell("screencap -p /sdcard/_shot.png")
-    adb("pull", "/sdcard/_shot.png", str(out))
-    print(f"[shot] {out}")
-    # 「dump 有没有喂给这条断言」是语义判断，只有写 note 的人自己知道，不按文件是否存在猜
-    # （同名 ui/<step>.xml 存在也可能只是导航用的 dump，跟这条断言无关）——由调用方用
-    # --used-dump 显式声明，合并登记一行（不拆两行）：证据类型用 + 连接，文件/链接列仍只放
-    # 截图路径，XML 按约定路径（同用例目录 ui/ 子目录+同步骤名）能推出来，不重复登记。
-    ui_dir = out.parent.parent / "ui"
-    if getattr(args, "used_dump", False) and not ui_dir.exists():
-        print(f"[shot] 警告：--used-dump 但 {ui_dir} 下没有任何 UI dump 文件，确认真的引用了 dump 数据吗？", file=sys.stderr)
-    etype = "screenshots+UI XML" if getattr(args, "used_dump", False) else "screenshots"
 
     # ---- 真实断言门控（可选）----
     # 历史坑：shot 只截图+登记，result 默认写死「通过」，含义其实是「脚本走到了这行」而非「断言成立」，
@@ -242,6 +337,12 @@ def cmd_shot(args):
     # 任一不满足→result 记「失败」（可 --assert-fail-result 改）并非 0 退出，让「通过」不再是无脑默认值。
     # 注意：WebView 插屏（AdMob Creative Preview）内容不进 uiautomator 树，--assert-gone 对它是盲区；
     # 靠 --assert-text 断言「首页控件必须在屏」才能兜住"被广告全屏盖住"这种情形（广告在上，首页控件就不在树里）。
+    #
+    # 断言轮询必须在截图之前跑完（2026-08-04 真机撞过）：轮询期间会自己插 sweep 清障，
+    # 如果先截图再轮询，截图定格的是「轮询开始前」那一刻的屏幕，轮询清完障之后才判定的
+    # 「通过」跟这张图对不上——报表上出现「结果通过、配图却是隐私弹窗+插屏广告」的自相矛盾。
+    # 所以：先把断言轮询跑完（不需要截图，只读 uiautomator 树），最后再截一张，
+    # 保证截图反映的就是判定那一刻的真实屏幕状态。
     result = getattr(args, "shot_result", "通过")
     want = getattr(args, "assert_text", None) or []
     gone = getattr(args, "assert_gone", None) or []
@@ -264,6 +365,18 @@ def cmd_shot(args):
         fails += [f"不该出现的标志仍在屏：{v!r}" for v in gone if _present_any(nodes, v)]
         if fails:
             result = getattr(args, "assert_fail_result", None) or "失败"
+
+    shell("screencap -p /sdcard/_shot.png")
+    adb("pull", "/sdcard/_shot.png", str(out))
+    print(f"[shot] {out}")
+    # 「dump 有没有喂给这条断言」是语义判断，只有写 note 的人自己知道，不按文件是否存在猜
+    # （同名 ui/<step>.xml 存在也可能只是导航用的 dump，跟这条断言无关）——由调用方用
+    # --used-dump 显式声明，合并登记一行（不拆两行）：证据类型用 + 连接，文件/链接列仍只放
+    # 截图路径，XML 按约定路径（同用例目录 ui/ 子目录+同步骤名）能推出来，不重复登记。
+    ui_dir = out.parent.parent / "ui"
+    if getattr(args, "used_dump", False) and not ui_dir.exists():
+        print(f"[shot] 警告：--used-dump 但 {ui_dir} 下没有任何 UI dump 文件，确认真的引用了 dump 数据吗？", file=sys.stderr)
+    etype = "screenshots+UI XML" if getattr(args, "used_dump", False) else "screenshots"
 
     _append_evidence(case, args.name, etype, out, assertion=getattr(args, "note", "") or "",
                      result=result)  # note→断言列；result→结果列（默认「通过」，挂了断言则按检查真判）
@@ -445,6 +558,32 @@ def _dump_xml_shell(cache_screen=None):
     return tmp
 
 
+SYSTEMUI_PKG = "com.android.systemui"
+
+
+def _strip_systemui(xml):
+    """从 u2 的 dump 里剥掉 SystemUI（状态栏/导航栏）窗口，让 u2 后端与 shell 后端看到同一棵树。
+
+    u2 的 `dump_hierarchy()` dump **所有窗口**，而 `adb shell uiautomator dump` 只 dump **当前活跃
+    窗口**。实测同一屏 u2 134 个节点 / shell 108 个，多出来的 26 个几乎全是状态栏（clock / wifi_combo /
+    battery / 一堆通知图标的 content-desc）。这些节点没人会去点，留着的坏处是实打实的：它们参与
+    **全树匹配数**统计，`--index` 会跟着错行——那样"切后端只变快、语义不变"就不成立了。
+
+    所以在后端出口就剥掉，下游（nodes / find / tapid / waitfor / sweep / .dumpcache 缓存）一律看到
+    对齐后的树，不必每个命令各自传排除参数（尤其 `--from-cache` 那条路读的是缓存 XML，漏掉它就会
+    出现"nodes 报的 index 和 tapid 实际数的 index 不一致"这种极难查的错行）。
+    剥完实测：108 == 108，节点集合完全一致，59 个共有选择器匹配数无一不同（见 decisions #30）。
+    """
+    try:
+        root = ET.fromstring(xml)
+    except ET.ParseError:
+        return xml  # 解析不了就原样返回，让下游的解析错误处理去报
+    removed = [c for c in list(root) if c.get("package") == SYSTEMUI_PKG]
+    for c in removed:
+        root.remove(c)
+    return ET.tostring(root, encoding="unicode") if removed else xml
+
+
 def _u2_dump_xml(retries=2):
     """u2 dump_hierarchy，带重连重试。atx server 会被系统省电策略/内存压力瞬时杀掉，在飞的那次
     dump 抛「Remote end closed connection」——这是 u2 后端的固有脆弱点（保活，见 gotchas.md/decisions #30）。
@@ -454,7 +593,7 @@ def _u2_dump_xml(retries=2):
     last = "未知"
     for i in range(retries + 1):
         try:
-            xml = _u2_device().dump_hierarchy()
+            xml = _strip_systemui(_u2_device().dump_hierarchy())
             if xml and "<hierarchy" in xml:
                 return xml
             last = "dump_hierarchy 返回空/无 <hierarchy>"
@@ -576,11 +715,12 @@ def _match_outside_panel(nodes, panel_ids):
     return None  # 面板几乎占满全屏，找不到安全空白处，别乱点
 
 
-def _match_nodes(nodes, attr, value, partial):
+def _match_nodes(nodes, attr, value, partial, nocase=False):
     hits = []
     for n in nodes:
         v = n.get(attr, "")
-        ok = (value in v) if partial else (v == value or v.endswith("/" + value))
+        v_cmp, value_cmp = (v.lower(), value.lower()) if nocase else (v, value)
+        ok = (value_cmp in v_cmp) if partial else (v_cmp == value_cmp or v_cmp.endswith("/" + value_cmp))
         if v and ok:
             c = _center(n.get("bounds"))
             if c:
@@ -596,8 +736,13 @@ def _present_any(nodes, value, partial=True):
 
 
 def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cache=None,
-          timeout=0.0, interval=0.5, sweep_on_wait=True):
+          timeout=0.0, interval=0.5, sweep_on_wait=True, nocase=False):
     """by ∈ {id,text,desc}。返回 (全部匹配, 第 index 个) 的中心坐标。
+    - nocase：大小写不敏感匹配。Android 按钮常见 textAllCaps 渲染（控件实际 text 属性是全大写，
+      如 "ALLOW"），而多语言查表存的译文是正常大小写（如 "Allow"），精确匹配会对不上——2026-08-04
+      RING-SET-01 真机验证过：taptext 因这个大小写差异点空，`||true` 兜底吞掉失败，弹窗一直挡在屏幕上，
+      后续控件永远等不到，最终超时误判 needs_human。这类"按钮大写、译文表正常大小写"的坑具有普遍性，
+      不止这一个弹窗，所以做成通用选项而非只在这一处硬编码大写字符串。
     - from_xml：从已有 dump 定位（省去重新 dump，同屏多次点击复用）。
     - from_cache：screen_id，命中 .dumpcache 则等价 from_xml（免 dump）；未命中则照常活 dump，
       并把这次结果顺手写进该缓存槽（下次/下一条命令再用就能命中）。
@@ -619,7 +764,7 @@ def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cac
     start = time.monotonic()
     while True:
         nodes = _nodes_from(from_xml) if from_xml else _dump_tree(cache_screen=cache)
-        hits = _match_nodes(nodes, attr, value, partial)
+        hits = _match_nodes(nodes, attr, value, partial, nocase=nocase)
         if hits:
             break
         if from_xml or timeout <= 0:
@@ -700,12 +845,22 @@ def cmd_bounds(args):
     el = hits[args.index]
     parent_b = None
     if args.child is not None:
-        kids = [k for k in el if k.tag == "node"]
-        if args.child >= len(kids):
-            sys.exit(f"[bounds] {args.by}={args.value!r} 只有 {len(kids)} 个子节点，"
-                     f"--child {args.child} 越界（界面结构变了？先跑 `ui` 看树）。")
+        # --child 接受「0」也接受「2,0,1」这样的多级路径（逐级下钻），后者用于定位嵌在几层
+        # 匿名容器里、自身 id/text/desc 全空的控件（如 MP3Cutter 剪辑器页左上角返回箭头，
+        # 三个属性全空，只能按 toolbar → 第0个子节点 这样锚，见 recorder.py 的 anc 字段）。
         parent_b = _bounds_tuple(el)
-        el = kids[args.child]
+        try:
+            hops = [int(x) for x in str(args.child).split(",") if x.strip() != ""]
+        except ValueError:
+            sys.exit(f"[bounds] --child {args.child!r} 不是合法的子节点路径（要么单个数字 0，要么逗号分隔 2,0,1）。")
+        if not hops:
+            sys.exit("[bounds] --child 路径为空。")
+        for depth, ci in enumerate(hops):
+            kids = [k for k in el if k.tag == "node"]
+            if ci >= len(kids):
+                sys.exit(f"[bounds] {args.by}={args.value!r} 沿 --child {args.child} 走到第 {depth + 1} 层时越界："
+                         f"该层只有 {len(kids)} 个子节点，要第 {ci} 个（界面结构变了？先跑 `ui` 看树）。")
+            el = kids[ci]
     b = _bounds_tuple(el)
     if not b:
         sys.exit(f"[bounds] 命中的节点没有可解析的 bounds 属性：{el.get('bounds')!r}")
@@ -717,10 +872,108 @@ def cmd_bounds(args):
         print("PARENT_BOUNDS={} {} {} {}".format(*parent_b))
 
 
+def cmd_nodes(args):
+    """把当前屏 UI 树输出成 JSON 节点表（stdout 纯 JSON），供录制器/桌面壳消费。
+
+    为什么不让消费方自己解析 `ui` 吐的 XML：录制器要的不只是 bounds，更关键的是**每个候选
+    选择器在全树的匹配数**——`taptext 重命名` 会同时命中对话框标题和确认按钮（见
+    flow_cut_save.sh 头注那个真踩过的坑），这种歧义只有在"人选中这个控件的当下"就告警才
+    拦得住，留到回放时才发现，已经点错了。匹配语义与 `_match_nodes` 的精确模式严格对齐
+    （id 走 `endswith("/"+短名)` 或全等、text/desc 走全等，且节点必须有可解析 bounds），
+    所以这里报 n=1 的选择器，`tapid/taptext/tapdesc` 拿去点必然唯一命中；n>1 时给出的
+    idx 就是该节点在这个选择器下的 `--index` 值（同为文档序，与 _match_nodes 一致）。
+
+    自身三个属性全空、选择器够不着的控件（真实例子：MP3Cutter 剪辑器页左上角返回箭头是个
+    id/text/desc 全空的 ImageButton；同屏 go_faq 里的图标 ImageView 也是）不会被丢掉，而是带上
+    `anc` —— 最近的那个**有唯一选择器的祖先** + 从它数下来的子节点索引路径，正好喂给
+    `bounds <by> <v> --child <路径>`，所以这类控件的坐标同样是脚本运行时现算的，不是写死像素。
+
+    输出：{"w","h","count","nodes":[{i,b:[l,t,r,b],c:[cx,cy],cls,clk,id,text,desc,
+                                    sels:[{by,v,n,idx}], anc:{by,v,child:"2,0"}|null}]}
+    sels 已排序：唯一匹配的排前，同等唯一性下 id > text > desc（与固化脚本的选择器偏好一致）。
+    """
+    root = _dump_root(cache_screen=args.cache_screen)
+    # 展平但**保留层级路径**：path 是从根数下来的子节点索引序列，与 cmd_bounds 的 --child 同一套
+    # 语义（都只数 tag=="node" 的子节点），所以这里给出的 anc.child 能被 --child 原样吃下。
+    flat = []
+
+    def walk(e, path):
+        for i, k in enumerate([k for k in e if k.tag == "node"]):
+            flat.append((k, path + [i]))
+            walk(k, path + [i])
+
+    walk(root, [])
+    raw = []
+    for e, path in flat:
+        b = _bounds_tuple(e)
+        rid = e.get("resource-id") or ""
+        raw.append({
+            "path": path, "b": list(b) if b else None,
+            "pkg": e.get("package") or "",
+            "cls": (e.get("class") or "").split(".")[-1],
+            "clk": e.get("clickable") == "true",
+            "id": _clean(rid.split("/")[-1]),
+            "text": _clean(e.get("text") or ""),
+            "desc": _clean(e.get("content-desc") or ""),
+        })
+    # skip_pkg：整包排除（如 com.android.systemui 状态栏）。**必须在统计匹配数之前排除**，
+    # 否则 n/idx 里仍含被排除节点，`--index` 会错行。为什么需要这个：u2 后端 dump 的是**所有
+    # 窗口**（shell 只 dump 当前活跃窗口），同一屏实测 u2 134 个节点 / shell 108 个，多出来的
+    # 几乎全是状态栏（clock/wifi/battery/通知图标）——录制器根本不需要，留着还会污染匹配数。
+    # 排除后两后端对 App 控件的视图基本对齐，换后端不改变 --index 语义（见 decisions #30）。
+    skip = set(args.skip_pkg or [])
+    keep_node = lambda n: bool(n["b"]) and n["pkg"] not in skip
+    # 匹配数只统计有 bounds 的节点：_match_nodes 要求 center 可解析，无 bounds 的节点
+    # tapid/taptext 本来就够不着，算进去会让 n/idx 与真实点击行为对不上。
+    total = {"id": {}, "text": {}, "desc": {}}
+    for n in raw:
+        if not keep_node(n):
+            continue
+        for by in total:
+            if n[by]:
+                total[by][n[by]] = total[by].get(n[by], 0) + 1
+    seen = {"id": {}, "text": {}, "desc": {}}
+    for n in raw:
+        sels = []
+        if keep_node(n):
+            for by in ("id", "text", "desc"):
+                v = n[by]
+                if not v:
+                    continue
+                idx = seen[by].get(v, 0)
+                seen[by][v] = idx + 1
+                sels.append({"by": by, "v": v, "n": total[by][v], "idx": idx})
+            sels.sort(key=lambda s: (s["n"] > 1, ("id", "text", "desc").index(s["by"])))
+        n["sels"] = sels
+    by_path = {tuple(n["path"]): n for n in raw}
+    out = []
+    for i, n in enumerate(raw):
+        if not keep_node(n):
+            continue  # 无 bounds（画不出框也点不了）或属于被排除的包，不给录制器当靶子
+        anc = None
+        if not n["sels"]:
+            p = n["path"]
+            for k in range(len(p) - 1, 0, -1):  # 从最近的父节点往上找第一个能唯一定位的祖先
+                a = by_path.get(tuple(p[:k]))
+                uniq = next((s for s in (a or {}).get("sels", []) if s["n"] == 1), None)
+                if uniq:
+                    anc = {"by": uniq["by"], "v": uniq["v"], "child": ",".join(map(str, p[k:]))}
+                    break
+        l, t, r, bo = n["b"]
+        out.append({**{k: v for k, v in n.items() if k != "path"},
+                    "i": i, "c": [(l + r) // 2, (t + bo) // 2], "anc": anc})
+    print(json.dumps({
+        "w": max((n["b"][2] for n in raw if keep_node(n)), default=0),
+        "h": max((n["b"][3] for n in raw if keep_node(n)), default=0),
+        "count": len(out), "nodes": out,
+    }, ensure_ascii=False))
+
+
 def _tap_selector(by, args):
     hits, (center, v, b) = _find(by, args.value, index=args.index, partial=args.partial,
                                  from_xml=args.from_xml, from_cache=args.from_cache,
-                                 timeout=args.timeout, interval=args.interval)
+                                 timeout=args.timeout, interval=args.interval,
+                                 nocase=getattr(args, "nocase", False))
     if len(hits) > 1:
         print(f"[warn] {by}={args.value!r} 有 {len(hits)} 个匹配，点第 {args.index} 个 ({v})", file=sys.stderr)
     shell(f"input tap {center[0]} {center[1]}")
@@ -1409,6 +1662,9 @@ def build_parser():
         s.add_argument("value")
         s.add_argument("--index", type=int, default=0, help="多个匹配时点第几个(默认0)")
         s.add_argument("--partial", action="store_true", help="子串匹配而非精确")
+        s.add_argument("--nocase", action="store_true",
+                       help="大小写不敏感匹配，治 Android 按钮 textAllCaps 渲染（控件实际text全大写，"
+                            "如'ALLOW'）跟多语言译文表正常大小写（如'Allow'）对不上的坑")
         s.add_argument("--from", dest="from_xml", default=None, help="从已有 UI dump(xml) 定位，省去重新 dump")
         s.add_argument("--from-cache", dest="from_cache", default=None,
                        help="按 screen_id 查 .dumpcache；命中则免 dump，未命中则活 dump 并顺手写入该缓存槽")
@@ -1426,9 +1682,10 @@ def build_parser():
     s.add_argument("by", choices=["id", "text", "desc"])
     s.add_argument("value")
     s.add_argument("--index", type=int, default=0, help="多个匹配时取第几个(默认0)")
-    s.add_argument("--child", type=int, default=None,
-                   help="取命中节点的第N个子节点的 bounds（0起）。canvas 自绘、没有 resource-id 的控件"
-                        "（如波形 View）只能这么定位；同时额外打印 PARENT_BOUNDS 供调用方做包含性校验")
+    s.add_argument("--child", default=None,
+                   help="取命中节点的第N个子节点的 bounds（0起）；也接受多级路径如 2,0,1（逐级下钻）。"
+                        "canvas 自绘、没有 resource-id 的控件（如波形 View）、以及 id/text/desc 全空的"
+                        "图标按钮（如某些页的返回箭头）只能这么定位；额外打印 PARENT_BOUNDS 供做包含性校验")
     s.add_argument("--partial", action="store_true")
     s.add_argument("--from", dest="from_xml", default=None, help="从已有 UI dump(xml) 定位，省去重新 dump")
     s.add_argument("--from-cache", dest="from_cache", default=None,
@@ -1437,6 +1694,15 @@ def build_parser():
     s.add_argument("--timeout", type=float, default=0.0, help="找不到时轮询等待秒数(默认0=单次)")
     s.add_argument("--interval", type=float, default=0.5, help="轮询间隔秒(默认0.5)")
     s.set_defaults(fn=cmd_bounds)
+    s = sub.add_parser("nodes", help="当前屏 UI 树输出成 JSON 节点表（含每个候选选择器的全树匹配数），供录制器/桌面壳消费")
+    s.add_argument("--cache", dest="cache_screen", default=None,
+                   help="同 ui：顺手把这次 dump 写进 .dumpcache 缓存槽")
+    s.add_argument("--skip-pkg", dest="skip_pkg", action="append", default=[],
+                   help="整包排除该 package 的节点（可重复），排除发生在统计匹配数之前。"
+                        "典型用法 --skip-pkg com.android.systemui：u2 后端会 dump 所有窗口、"
+                        "带进一堆状态栏节点，排掉后两后端对 App 控件的视图对齐（见 decisions #30）")
+    s.set_defaults(fn=cmd_nodes)
+
     s = sub.add_parser("waitfor")
     s.add_argument("by", choices=["id", "text", "desc"])
     s.add_argument("value")

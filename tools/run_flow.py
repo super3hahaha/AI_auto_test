@@ -208,11 +208,37 @@ def main():
     # 过滤会把今天所有 attempt 的 01-home 全列出来（误导）。证据路径含 .../<serial>/<attempt>/，
     # 用它精确圈到本次这一批（attempt=本次开始时刻 HHMMSS）。
     ev = LEDGER / "evidence.csv"
+    # serial 原样是 "192.168.x.x:5555" 这种带冒号的 adb 序列号，但证据路径里的设备段
+    # 是 adbkit._safe() 清洗过的（冒号→下划线，见 tools/adbkit.py `_safe()`），这里要用
+    # 同一清洗规则否则网络设备（serial 带冒号）永远匹配不上，判定提醒会无差别常年误报。
+    # 算在 ev.exists() 判断之外：下面兜底截图分支可能是本轮第一条证据（此刻 evidence.csv
+    # 还不存在），补拍之后要用同一个 scope 重新过滤，不能只在文件已存在时才算出这个值。
+    safe_serial = re.sub(r"[^A-Za-z0-9._-]", "_", serial or "default")
+    scope = f"/{safe_serial}/{attempt}/"
     mine = []
     if ev.exists():
-        scope = f"/{serial}/{attempt}/"
         mine = [r for r in csv.DictReader(open(ev, encoding="utf-8"))
                 if r.get("用例ID") == a.case and scope in (r.get("文件/链接") or "")]
+
+    # 兜底失败截图：exit!=0 但本轮一张「结果=失败」的截图都没登记时，大概率是脚本内部只有非
+    # UI 类校验（logscan/output-check/MediaStore 交叉核对）判了失败，flow-freeze 规定的「就地
+    # 截图」压根没触发——这种情况判失败却一张画面都留不下。这里补一张当前屏幕状态兜底，好过
+    # 完全没有影像证据；已经就地截过失败图的分支不重复补（同一次失败不留两张意义重叠的截图）。
+    # 只查「截图类」证据（证据类型含 screenshots），不能拿 99-run-log 那行（证据类型=logs，也
+    # 挂结果=失败）当"已经有失败截图"，否则永远误判成"已经有"。
+    if rc != 0 and not any(r.get("结果") == "失败" and "screenshots" in (r.get("证据类型") or "")
+                           for r in mine):
+        try:
+            subprocess.run([sys.executable, "tools/adbkit.py", "--case", a.case, "--serial", serial,
+                            "shot", "99-flow-failed", "脚本整体异常退出，兜底截图（无就地失败截图）",
+                            "--result", "失败"],
+                           cwd=str(ROOT), env=env, check=False)
+        except Exception as e:  # noqa: BLE001 —— 兜底截图失败不能影响执行判定
+            print(f"[run_flow] 兜底失败截图失败（不影响本次判定）：{e}")
+        else:
+            if ev.exists():
+                mine = [r for r in csv.DictReader(open(ev, encoding="utf-8"))
+                        if r.get("用例ID") == a.case and scope in (r.get("文件/链接") or "")]
 
     # 判定提醒收敛：2026-07-22 起 exit code 与脚本内部 FAILED 标记绑定（见 skill flow-freeze
     # 「失败判定标准」），exit!=0 已经意味着脚本自己判过至少一处 output-check/logscan/结果断言

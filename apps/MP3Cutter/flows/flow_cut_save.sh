@@ -227,6 +227,10 @@ else
   log "结果: 未见'音频已保存'，已截图待查"
   FAILED=1
 fi
+
+LS=$($AK --case "$CASE" logscan final 2>&1)
+grep -qE '，[1-9][0-9]* 条命中' <<< "$LS" && { log "logscan 命中崩溃/异常"; FAILED=1; }
+log "崩溃扫描已跑（见 evidence.csv logs 行）"
 log "DONE（FAILED=$FAILED）"
 [ "$FAILED" = "1" ] && exit 1
 exit 0

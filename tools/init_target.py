@@ -106,17 +106,24 @@ def pick_serial(explicit):
 
 
 def detect(pkg, serial):
+    # detect() 本身跑完前 main() 才统一打印结果；中间每一步（尤其 adb pull 整个 apk）在
+    # WiFi ADB 下可能耗时几秒到几十秒，desktop 执行台日志区那段时间没东西可显示，看起来像
+    # 卡住——这里逐步 print（PYTHONUNBUFFERED=1 已保证行缓冲，见 commands.rs::python_cmd）
+    # 给前端一个实时进度，不影响实际耗时。
     result = {"package": pkg, "serial": serial}
 
+    print(f"[init_target] 探测 {pkg} @ {serial} …")
     path_out = adb(serial, "shell", "pm", "path", pkg).stdout.strip()
     if not path_out:
         sys.exit(f"[init_target] {pkg} 在设备 {serial} 上未安装，先装包。")
     apk_paths = [l.split(":", 1)[1] for l in path_out.splitlines() if l.startswith("package:")]
     base_apk = next((p for p in apk_paths if "base.apk" in p), apk_paths[0])
 
+    print("[init_target] 查版本号（dumpsys package）…")
     dumpsys = adb(serial, "shell", "dumpsys", "package", pkg).stdout
     m = re.search(r"versionName=(\S+)", dumpsys)
     result["app_version"] = m.group(1) if m else "unknown"
+    print(f"[init_target]   app_version = {result['app_version']}")
 
     flags_line = next((l for l in dumpsys.splitlines() if "flags=" in l or "pkgFlags=" in l), "")
     debuggable = "DEBUGGABLE" in flags_line
@@ -127,8 +134,10 @@ def detect(pkg, serial):
     if aapt:
         DUMPCACHE.mkdir(exist_ok=True)
         local_apk = DUMPCACHE / f"_probe_{pkg}.apk"
+        print(f"[init_target] 拉取 apk 探 app_name/main_activity（{base_apk}，WiFi ADB 可能较慢）…")
         pull = adb(serial, "pull", base_apk, str(local_apk))
         if pull.returncode == 0:
+            print("[init_target] apk 已拉到本地，aapt dump badging 解析中…")
             badging = subprocess.run([aapt, "dump", "badging", str(local_apk)],
                                       capture_output=True, text=True).stdout
             lm = re.search(r"application-label:'([^']*)'", badging)
@@ -151,12 +160,14 @@ def detect(pkg, serial):
 
     db_candidates = []
     if debuggable:
+        print("[init_target] debuggable，查 databases/ 候选（run-as ls）…")
         ls = adb(serial, "shell", "run-as", pkg, "ls", "databases/")
         if ls.returncode == 0:
             db_candidates = [f for f in ls.stdout.split() if f.endswith(".db")]
     result["_db_candidates"] = db_candidates
     result["db_name"] = db_candidates[0] if len(db_candidates) == 1 else ""
 
+    print("[init_target] 探测完成。")
     return result
 
 

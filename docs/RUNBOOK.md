@@ -24,7 +24,8 @@
 | 截图存证（带步骤说明+结果） | `... --case <ID> shot <step> "一句话说明" [--result 失败]`（说明→断言列、默认结果通过；采证即自动登记 evidence.csv） |
 | **按选择器点击（首选）** | `... tapid <resource-id>` / `taptext <文案>` / `tapdesc <desc>`（`--index N` 消歧、`--partial` 子串） |
 | 定位调试（只找不点） | `... find id\|text\|desc <值>` |
-| 取控件几何算坐标（机器可读） | `... bounds id\|text\|desc <值> [--child N] [--from-cache <step>]` → `BOUNDS=/CENTER=/SIZE=/PARENT_BOUNDS=`。canvas 自绘、无 resource-id 的控件（波形等）用 `--child N` 按「父 id + 第几个子节点」取；**别在 bash 里 grep/sed 抠 XML 的 bounds**，两个 dump 后端排版不同会抠错（见 `docs/gotchas.md` 2026-07-29） |
+| 取控件几何算坐标（机器可读） | `... bounds id\|text\|desc <值> [--child N\|N,M,…] [--from-cache <step>]` → `BOUNDS=/CENTER=/SIZE=/PARENT_BOUNDS=`。canvas 自绘、无 resource-id 的控件（波形等）、以及 id/text/desc 全空的图标按钮（某些页的返回箭头）用 `--child` 按「父 id + 子节点路径」取（支持多级 `2,0,1` 逐级下钻）；**别在 bash 里 grep/sed 抠 XML 的 bounds**，两个 dump 后端排版不同会抠错（见 `docs/gotchas.md` 2026-07-29） |
+| 拿整屏节点表（JSON，给工具吃） | `... nodes` → `{w,h,count,nodes:[{b,c,cls,clk,id,text,desc,sels:[{by,v,n,idx}],anc}]}`。`sels[].n` 是该选择器**全树匹配数**（n>1 就是歧义，得配 `--index idx`）；自身无选择器的节点带 `anc`（最近唯一祖先 + `--child` 路径）。录制器/桌面壳用它，人排查时仍用 `ui` |
 | 输入/按键/滑动 | `... text ".."` / `key <KEYCODE>` / `swipe ...` |
 | 兜底：裸坐标点击 | `... tap X Y`（仅在无 id/text/desc 可用时；坐标别写进用例） |
 | 造前置数据 | `... seed seeds/<x>.sql` |

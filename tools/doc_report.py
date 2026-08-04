@@ -94,20 +94,101 @@ def read_summary():
     return d
 
 
-def last_log_note(cid):
+def last_log_note(cid, serial=""):
     """取 log.csv 里这条用例最后一条「完成执行」的备注——case_result.py 落判定时写的结论文本
-    只存在 log.csv 里，board.csv/queue.csv 都没有对应列，找不到别的地方能拿到"失败原因"。"""
+    只存在 log.csv 里，board.csv/queue.csv 都没有对应列，找不到别的地方能拿到"失败原因"。
+
+    serial 给定时只认该设备的行（log.csv 行尾有「执行设备」列）：多设备并行下同一条用例会有
+    N 条「完成执行」，不筛设备就会把 A 机的结论安到 B 机的失败上。老账本这一列是空的，
+    按设备筛不到就退回"不筛设备"的老行为，别因为迁移前的数据把失败原因整段丢掉。"""
     p = LEDGER / "log.csv"
     if not p.exists():
         return ""
-    note = ""
-    for r in csv.DictReader(open(p, encoding="utf-8")):
-        if r.get("用例ID") == cid and r.get("动作") == "完成执行":
-            note = r.get("备注", "") or note
-    return note
+    rows = [r for r in csv.DictReader(open(p, encoding="utf-8"))
+            if r.get("用例ID") == cid and r.get("动作") == "完成执行"]
+    mine = [r for r in rows if (r.get("执行设备") or "") == serial] if serial else rows
+    for r in reversed(mine or rows):
+        if r.get("备注"):
+            return r["备注"]
+    return ""
 
 
-def failed_cases_without_issue(queue, issues):
+def read_exec_rows():
+    """本轮 executions.csv（逐台执行明细，(run_id, 用例ID, serial) 一行，见 exec_ledger.py）。
+    按 target.json 的 run_id 过滤；过滤后为空就退回全表——老账本可能没写 run_id，而 new_run.py
+    开新一轮时会把这张表整份归档+清空，现存内容本来就是本轮的。"""
+    rows = read_csv("executions")
+    run_id = ""
+    if CFG_PATH.exists():
+        try:
+            run_id = (json.loads(CFG_PATH.read_text()).get("run_id") or "").strip()
+        except Exception:
+            run_id = ""
+    mine = [r for r in rows if (r.get("run_id") or "") == run_id] if run_id else []
+    return mine or rows
+
+
+def run_devices(exec_rows, cfg):
+    """本轮实际跑过的设备 serial 列表（按 executions.csv 里首次出现的顺序去重）。
+    executions 为空（老轮次没有这张表 / 全靠单机 CLI 跑的）才退回 target.json 的单台 serial。
+    标题区「测试设备」必须列全部设备：多机回归时只显示 cfg.serial（编排最后写进去的那台）
+    会让报告读起来像只在一台上跑过，跟"本轮范围"一样属于阅读者必须先看到的执行前提。"""
+    serials = []
+    for r in exec_rows:
+        s = (r.get("serial") or "").strip()
+        if s and s not in serials:
+            serials.append(s)
+    if not serials:
+        s = (cfg.get("serial") or "").strip()
+        if s:
+            serials = [s]
+    return serials
+
+
+def device_evidence_link(cid, serial, exec_rows):
+    """executions.csv 里 (用例, 设备) 那一行的证据链接——即该设备自己的证据目录。
+    queue.csv 的「证据链接」是聚合概览列（多设备并行下是最后写入那台的），拿它当"这条问题的
+    证据"在多机场景会指错设备。"""
+    for r in exec_rows:
+        if r.get("用例ID") == cid and (r.get("serial") or "") == serial and r.get("证据链接"):
+            return r["证据链接"]
+    return ""
+
+
+def case_device_links(cid, serials, exec_rows):
+    """[(serial, 该设备证据目录)]，没有明细行的设备略过。"""
+    return [(s, link) for s in serials if (link := device_evidence_link(cid, s, exec_rows))]
+
+
+def issue_devices(issue, exec_rows, default_serial=""):
+    """这条问题记录复现在哪些设备上（serial 列表）。
+
+    优先 issues.csv 的「执行设备」列（case_issue.py --serial 登记的，就是"哪台复现"的一手信息）；
+    没登记（老问题行/登记时没传 --serial）退回 executions.csv 里这条用例判失败的设备；
+    再找不到就退回该用例本轮跑过的全部设备，最后兜到 target.json 的 serial。
+    宁可给"本轮跑过的这几台"这种略宽的范围，也不能一个设备都不写——多机回归时"在哪台上出的"
+    是复现问题的第一前提。"""
+    own = (issue.get("执行设备") or "").strip()
+    if own:
+        return [s.strip() for s in own.split(",") if s.strip()]
+    cid = issue.get("用例ID", "")
+    mine = [r for r in exec_rows if r.get("用例ID") == cid]
+    failed = [(r.get("serial") or "").strip() for r in mine if r.get("执行结果") == "失败"]
+    cands = failed or [(r.get("serial") or "").strip() for r in mine]
+    out = []
+    for s in cands:
+        if s and s not in out:
+            out.append(s)
+    return out or ([default_serial] if default_serial else [])
+
+
+def devices_label(serials):
+    """多台设备拼成一行人读的标签："oppo a31 (Android 12)、pixel7 (Android 13)"。"""
+    labels = [device_label(s) for s in serials if s]
+    return "、".join(labels) if labels else "-"
+
+
+def failed_cases_without_issue(queue, issues, exec_rows):
     """登记 issues.csv 是语义判断（Claude Code 人工做的一步，见 case_result.py 文档），自动化
     链路只负责把 通过/失败/需复核 落进 queue.csv，不会自动建 issue 行——所以"这条用例执行结果
     是失败"和"issues.csv 里有它的问题记录"完全可能对不上（真实发生过：跑完之后没人手工登记
@@ -121,12 +202,21 @@ def failed_cases_without_issue(queue, issues):
     for r in queue:
         cid = r.get("用例ID", "")
         if r.get("执行结果") == "失败" and cid not in issue_cids:
+            # 多设备并行下这条用例可能在不止一台上判失败——都得露面，不能只挑一台；
+            # 逐台各自的「实际结果」备注也分别取（同一条用例不同设备的失败原因可能完全不同）。
+            fail_serials = [(er.get("serial") or "").strip() for er in exec_rows
+                             if er.get("用例ID") == cid and er.get("执行结果") == "失败"]
+            fail_serials = [s for i, s in enumerate(fail_serials) if s and s not in fail_serials[:i]]
+            symptom = "；".join(
+                f"[{device_label(s)}] {last_log_note(cid, s)}" for s in fail_serials if last_log_note(cid, s)
+            ) if fail_serials else last_log_note(cid)
             extra.append({
                 "问题ID": "", "用例ID": cid, "严重级别": "",
                 "标题": r.get("一句话测试目标") or r.get("测试目的", ""),
-                "预期结果": "", "实际结果": last_log_note(cid) or "（未登记问题详情，见证据链接自行核查）",
+                "预期结果": "", "实际结果": symptom or "（未登记问题详情，见证据链接自行核查）",
                 "复现步骤": "", "证据链接": r.get("证据链接", ""),
                 "状态": "待登记", "负责人备注": "本轮判定为失败但尚未人工登记正式问题，见上方「实际结果」。",
+                "执行设备": ",".join(fail_serials),
             })
     return extra
 
@@ -143,11 +233,21 @@ def read_log_span():
 
 
 def device_os_version(serial):
-    """现查 `ro.build.version.release`（比如"13"）。设备当时不在线/adb 不可用就返回空——
-    报告生成时设备未必还连着（可能是收工很久之后手动重跑 doc_report），查不到不算错，
-    不强求非要有系统版本，跟 device_label() 的"没有就不拼"是同一个态度。"""
+    """安卓版本号（比如"13"）：缓存优先，命中 config/device_info_cache.json（desktop 壳设备列表
+    维护的同一份缓存，见 commands.rs os_version 缓存优先逻辑）就不起 adb 子进程——报告生成时
+    多台设备大概率已经收工下线（本轮跑完很久之后才手动重跑 doc_report），逐台现查又慢又大概率
+    全部超时。缓存没有才现查 `ro.build.version.release` 兜底；查不到也不算错，不强求非要有
+    系统版本，跟 device_label() 的"没有就不拼"是同一个态度。"""
     if not serial:
         return ""
+    p = ROOT / "config/device_info_cache.json"
+    if p.exists():
+        try:
+            ver = (json.loads(p.read_text(encoding="utf-8")).get(serial) or {}).get("os_version", "")
+            if ver:
+                return ver
+        except Exception:
+            pass
     try:
         r = subprocess.run(["adb", "-s", serial, "shell", "getprop", "ro.build.version.release"],
                             capture_output=True, text=True, timeout=5)
@@ -157,21 +257,43 @@ def device_os_version(serial):
         return ""
 
 
+def device_model(serial):
+    """型号（比如"Pixel_4"）：只读缓存 config/device_info_cache.json（desktop 壳设备列表维护，
+    跟 device_os_version() 同一份文件），不现查——型号不像系统版本会变，缓存里没有就是真没有，
+    不值得为它单独起一次 adb 子进程拖慢报告生成。"""
+    if not serial:
+        return ""
+    p = ROOT / "config/device_info_cache.json"
+    if not p.exists():
+        return ""
+    try:
+        return (json.loads(p.read_text(encoding="utf-8")).get(serial) or {}).get("model", "")
+    except Exception:
+        return ""
+
+
 def device_label(serial):
     """按 config/device_aliases.json（{serial: alias}，跨 App 共用，desktop 壳「设备别名」登记的
-    同一份文件）把 serial 翻成人读的别名；没登记过就退回原始 serial。能查到系统版本就拼在后面
-    （"别名 (Android 13)"），查不到（设备当时不在线）就只显示别名/serial，不强求。"""
+    同一份文件）把 serial 翻成人读的别名；没登记过（常见于 WiFi ADB 的 ip:port，没人会去专门
+    登记一个会变的地址）就退回型号（"Pixel_4"），型号也没缓存到才兜底显示原始 serial——
+    报告里"192.168.209.239:5555"这种纯地址对读者毫无辨识度，型号好歹能认出是哪类机型。
+    能查到系统版本就拼在后面（"别名 (Android 13)"），查不到（设备当时不在线）就不拼，不强求。"""
     if not serial:
         return "-"
     label = serial
     p = ROOT / "config/device_aliases.json"
+    alias = None
     if p.exists():
         try:
             alias = json.loads(p.read_text(encoding="utf-8")).get(serial)
-            if alias:
-                label = alias
         except Exception:
             pass
+    if alias:
+        label = alias
+    else:
+        model = device_model(serial)
+        if model:
+            label = model
     ver = device_os_version(serial)
     return f"{label} (Android {ver})" if ver else label
 
@@ -670,10 +792,11 @@ def build_report(live, drive, folder_id, want_images):
     queue = read_csv("board")  # 报告基于本轮 board（scope 过滤后），非全量 queue
     issues = read_csv("issues")
     evidence = read_csv("evidence")
+    cfg = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
+    exec_rows = read_exec_rows()  # 逐台执行明细（多设备并行的真值），标题设备清单/问题复现设备都靠它
     _board_ids = {r.get("用例ID") for r in queue}  # queue 即本轮 board
     issues = [r for r in issues if r.get("用例ID") in _board_ids]  # 问题清单只留本轮用例
-    issues = issues + failed_cases_without_issue(queue, issues)  # 兜底：失败但没人登记 issue 的也得露面
-    cfg = json.loads(CFG_PATH.read_text()) if CFG_PATH.exists() else {}
+    issues = issues + failed_cases_without_issue(queue, issues, exec_rows)  # 兜底：失败但没人登记 issue 的也得露面
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     queue_by_cid = {r.get("用例ID"): r for r in queue}
 
@@ -705,8 +828,11 @@ def build_report(live, drive, folder_id, want_images):
     b.para([("项目名称：", {"bold": True, "color": DARK}), (cfg.get("app_name") or cfg.get("package", "-"), {"color": GREY})])
     if cfg.get("app_version"):
         b.para([("测试版本：", {"bold": True, "color": DARK}), (cfg["app_version"], {"color": GREY})])
-    # 测试设备：优先显示 device_aliases.json 里登记的别名（比如"pixel4"），没登记过才退回 serial。
-    b.para([("测试设备：", {"bold": True, "color": DARK}), (device_label(cfg.get("serial", "")), {"color": GREY})])
+    # 测试设备：多机并行回归必须列全部设备，不能只显示 target.json 的 cfg.serial（编排收尾
+    # 最后写进去的那台）——那样读起来像只在一台上跑过。优先用 executions.csv 本轮出现过的全部
+    # serial（run_devices），没有才退回单台 cfg.serial；每台都走 device_label 拼"别名 (Android x)"。
+    run_serials = run_devices(exec_rows, cfg)
+    b.para([("测试设备：", {"bold": True, "color": DARK}), (devices_label(run_serials), {"color": GREY})])
     start_t, end_t = read_log_span()
     exec_span = format_exec_span(start_t, end_t, now)
     b.para([("执行时间：", {"bold": True, "color": DARK}), (exec_span, {"color": GREY})])
@@ -759,11 +885,12 @@ def build_report(live, drive, folder_id, want_images):
             cid = r.get("用例ID", "")
             qrow = queue_by_cid.get(cid)
             name = (qrow.get("一句话测试目标") or qrow.get("测试目的", "")) if qrow else ""
-            rows.append([cid, name, qrow.get("模块", "") if qrow else ""])
+            devs = devices_label(issue_devices(r, exec_rows, cfg.get("serial", "")))
+            rows.append([cid, name, qrow.get("模块", "") if qrow else "", devs])
         live.table(
-            headers=["用例编号", "用例名称", "所属模块"],
+            headers=["用例编号", "用例名称", "所属模块", "复现设备"],
             rows=rows,
-            col_widths=[70, 330, 70],  # 编号/模块窄，名称宽——不然长文案挤成一堆窄列
+            col_widths=[65, 260, 65, 110],  # 编号/模块窄，名称宽，复现设备够放"别名 (Android x)"
         )
     else:
         b = DocBuilder()
@@ -775,7 +902,7 @@ def build_report(live, drive, folder_id, want_images):
     live.flush(b)
 
     # ---- 四、失败用例详情（每条用例一张 label/value 表：失败原因/测试版本/测试日期/
-    #      前置条件/测试用例/复现步骤/问题现象/证据类型/证据地址/问题截图）----
+    #      前置条件/测试用例/复现步骤/证据类型/证据地址/问题截图）----
     b = DocBuilder()
     b.heading("四、失败用例详情", 1, color=DARK)
     if not want_images:
@@ -785,7 +912,12 @@ def build_report(live, drive, folder_id, want_images):
     for r in issues:
         cid = r.get("用例ID", "")
         qrow = queue_by_cid.get(cid)
-        current_link = qrow.get("证据链接", "") if qrow else ""
+        devs = issue_devices(r, exec_rows, cfg.get("serial", ""))
+        dev_links = case_device_links(cid, devs, exec_rows)  # [(serial, 该设备自己的证据目录)]
+        # 证据地址优先按设备取 executions.csv 的逐台真值——多设备并行下 queue「证据链接」是
+        # 概览列（最后写入那台），拿它当"这条问题的证据"在多机场景会指错设备/漏掉其它复现设备。
+        # 只有一台复现、或查不到逐台明细时才退回 queue 的聚合链接。
+        current_link = (dev_links[0][1] if len(dev_links) == 1 else "") or (qrow.get("证据链接", "") if qrow else "")
         pid = r.get("问题ID", "")
         title = f"{pid} · {cid}  {r.get('标题','')}" if pid else f"{cid}（待登记问题ID）  {r.get('标题','')}"
 
@@ -802,17 +934,19 @@ def build_report(live, drive, folder_id, want_images):
             kv.append(["测试版本", cfg["app_version"]])
         if date_str:
             kv.append(["测试日期", date_str])
+        if devs:  # 至少给"设备别名 + 安卓版本"，多台复现的问题必须知道是哪几台，不能被概览列盖过去
+            kv.append(["复现设备", devices_label(devs)])
         if seed:
             kv.append(["前置条件", seed])
         if goal:
             kv.append(["测试用例", goal])
         if steps:
             kv.append(["复现步骤", steps])
-        if symptom:
-            kv.append(["问题现象", symptom])
         if types:
             kv.append(["证据类型", " / ".join(types)])
-        if current_link:
+        if len(dev_links) > 1:  # 不止一台复现且逐台证据目录不同——分别列出，别只显示其中一台
+            kv.append(["证据地址", "\n".join(f"[{device_label(s)}] {link}" for s, link in dev_links)])
+        elif current_link:
             kv.append(["证据地址", current_link])
 
         # 关键截图 + 关键文本证据——沿用「关键」标注筛选，避免把某条用例反复重跑的历史证据都堆进来

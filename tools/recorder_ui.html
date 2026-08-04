@@ -1,0 +1,260 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>录制器 demo</title>
+<style>
+  :root { --bd:#d8dae0; --mut:#6b7280; --acc:#2563eb; --warn:#b91c1c; --ok:#047857; }
+  * { box-sizing:border-box }
+  body { margin:0; font:13px/1.5 -apple-system,"PingFang SC",sans-serif; color:#111; background:#f6f7f9 }
+  header { display:flex; gap:8px; align-items:center; flex-wrap:wrap;
+           padding:8px 12px; background:#fff; border-bottom:1px solid var(--bd); position:sticky; top:0; z-index:50 }
+  button { font:inherit; padding:5px 11px; border:1px solid var(--bd); border-radius:999px; background:#fff; cursor:pointer }
+  button:hover { border-color:#999 }
+  button.on { background:#111; color:#fff; border-color:#111 }
+  button:disabled { opacity:.45; cursor:default }
+  .dot { width:7px; height:7px; border-radius:50%; background:var(--ok); display:inline-block; margin-right:5px }
+  .sp { flex:1 }
+  .mut { color:var(--mut) }
+  main { display:flex; gap:14px; padding:14px; align-items:flex-start }
+  #stage { position:relative; width:390px; flex:none; background:#000; border-radius:10px; overflow:hidden;
+           box-shadow:0 2px 10px rgba(0,0,0,.14) }
+  #stage.grab { cursor:crosshair }
+  #shot { display:block; width:100%; height:auto }
+  /* 用 outline 不用 border：WKWebView 下半透明 dashed border 的盒子会被填上底色+冒圆角
+     （桌面壳踩过，Chromium 无此问题），outline 走另一条渲染路径且不进盒模型 */
+  .box { position:absolute; background:none; cursor:pointer; outline:1px dashed #ffbe00 }
+  .box:hover { background:rgba(37,99,235,.28); outline:1px solid #fff }
+  .box.amb { outline-color:#ff5050 }
+  .box.anc { outline-color:#5aaaff }
+  /* 与 img 严格重合的框层：同宽（width:100%）+ aspect-ratio 锁成截图比例 → 同高。
+     inset:0 铺满被 img 撑开的 #frame ⇒ 与 img 严格重合，不含任何数值计算（桌面壳上
+     "JS 量尺寸" 和 "aspect-ratio" 两种做法都翻过车，见 gotchas.md）。*/
+  #frame { position:relative; display:block; line-height:0 }
+  #overlay { position:absolute; inset:0; pointer-events:none }
+  #overlay .box { pointer-events:auto }
+  #line { position:absolute; height:2px; background:#0f0; transform-origin:0 50%; pointer-events:none; display:none }
+  aside { flex:1; min-width:0 }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:10px; padding:10px 12px; margin-bottom:8px }
+  .step { display:grid; grid-template-columns:26px 1fr; gap:8px }
+  .step .n { color:var(--mut) }
+  code { background:#f1f2f4; padding:1px 5px; border-radius:4px; font-size:12px; word-break:break-all }
+  .tag { display:inline-block; font-size:11px; padding:1px 7px; border-radius:999px; background:#eef2ff; color:#3730a3; margin-right:4px }
+  .warn { color:var(--warn) }
+  #tip { position:fixed; z-index:60; background:#111; color:#fff; padding:6px 9px; border-radius:6px;
+         font-size:12px; pointer-events:none; display:none; max-width:320px }
+  #mask { position:fixed; inset:0; background:rgba(255,255,255,.72); z-index:80; display:none;
+          align-items:center; justify-content:center; font-size:15px }
+  #ambig { position:fixed; inset:0; background:rgba(0,0,0,.35); z-index:70; display:none;
+           align-items:center; justify-content:center }
+  #ambig > div { background:#fff; border-radius:12px; padding:16px 18px; width:440px; max-width:92vw }
+  #ambig label { display:block; padding:6px 8px; border:1px solid var(--bd); border-radius:8px; margin:5px 0; cursor:pointer }
+  #ambig label:hover { background:#f6f7f9 }
+</style>
+
+<header>
+  <span><span class="dot"></span><b>录制中</b></span>
+  <span class="mut" id="meta"></span>
+  <span class="sp"></span>
+  <button onclick="act({kind:'launch'})">启动应用</button>
+  <button onclick="act({kind:'sweep'})">清障</button>
+  <button onclick="act({kind:'key',code:'KEYCODE_BACK'})">返回</button>
+  <button onclick="act({kind:'key',code:'KEYCODE_HOME'})">主页</button>
+  <button onclick="act({kind:'key',code:'KEYCODE_DEL'})">退格</button>
+  <button onclick="typeText()">输入文本</button>
+  <button id="m-swipe" onclick="mode('swipe')">滑动</button>
+  <button id="m-drag" onclick="mode('longdrag')">长拖</button>
+  <button id="m-xy" onclick="mode('xy')">硬坐标</button>
+  <button onclick="note()">备注</button>
+  <button onclick="refresh()">重新探屏</button>
+  <button onclick="undo()">撤销</button>
+  <button onclick="exportRec()"><b>导出</b></button>
+</header>
+
+<main>
+  <div id="stage" onmousedown="down(event)"><div id="frame"><img id="shot" alt=""><div id="overlay"></div></div><div id="line"></div></div>
+  <aside>
+    <div class="card" id="hint"></div>
+    <div id="steps"></div>
+  </aside>
+</main>
+
+<div id="tip"></div>
+<div id="mask"><div id="maskTxt">执行中…</div></div>
+<div id="ambig"><div>
+  <b>这个控件的首选选择器不唯一</b>
+  <p class="mut" style="margin:6px 0 10px">全树有多个节点匹配同一个选择器（对话框标题和确认按钮同文案就是这种情况）。
+  选一个能唯一定位的，或确认用 <code>--index</code> 按序号定位——后者 UI 一改就会点错行。</p>
+  <div id="ambigList"></div>
+  <div style="text-align:right;margin-top:10px">
+    <button onclick="closeAmbig()">取消</button>
+    <button class="on" onclick="confirmAmbig()">用选中的点</button>
+  </div>
+</div></div>
+
+<script>
+let S = null, MODE = 'tap', drag = null, pend = null;
+const $ = s => document.querySelector(s);
+const esc = s => (s||'').replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function api(path, body) {
+  $('#mask').style.display = 'flex';
+  try {
+    const r = await fetch(path, body ? {method:'POST', body:JSON.stringify(body)} : {method:'POST'});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.error || r.status);
+    return j;
+  } catch (e) { alert('失败：' + e.message); throw e; }
+  finally { $('#mask').style.display = 'none'; }
+}
+
+async function boot() {
+  S = await (await fetch('/api/state')).json();
+  $('#meta').textContent = `${S.app} · ${S.serial} · 会话 ${S.case}`;
+  if (!S.screen || !S.screen.nodes) S.screen = (await api('/api/refresh')).screen;
+  render();
+}
+
+function mode(m) {
+  MODE = (MODE === m) ? 'tap' : m;
+  for (const k of ['swipe','longdrag','xy']) $('#m-' + (k==='longdrag'?'drag':k)).classList.toggle('on', MODE === k);
+  $('#stage').classList.toggle('grab', MODE !== 'tap');
+  hint();
+}
+
+function hint() {
+  const t = {
+    tap: '点屏幕上的<b>虚线框</b>直接下发点击（记的是选择器不是坐标）。红框=该选择器不唯一，点了会先让你消歧。',
+    swipe: '<b>滑动模式</b>：在屏幕上按下拖到终点松开。起止点会锚到所在控件的选择器 + 百分比，导出脚本时现算坐标。',
+    longdrag: '<b>长拖模式</b>：同滑动，但先长按再拖（波形起止手柄这类要用它）。',
+    xy: '<b>硬坐标模式</b>：点任意位置下发 tap x y。只在控件全树无 id/text/desc（canvas 自绘）时用，该步会被标红提醒必须改。',
+  }[MODE];
+  const N = S.screen.nodes, drawn = document.querySelectorAll('.box').length;
+  const sel = N.filter(x=>x.sels.length).length, anc = N.filter(x=>!x.sels.length && x.anc).length;
+  const amb = N.filter(x=>x.sels.length && x.sels[0].n>1).length, dead = N.filter(x=>!x.sels.length && !x.anc).length;
+  $('#hint').innerHTML = t + `<div class="mut" style="margin-top:6px">本屏 ${N.length} 个节点，画出 ${drawn} 个框（同位置重复容器已折叠）：` +
+    `<b>${sel}</b> 个能用选择器定位（黄框）` +
+    (amb ? `，其中 <span class="warn">${amb} 个首选不唯一（红框）</span>` : '') +
+    (anc ? `；<b style="color:#2563eb">${anc}</b> 个自身无选择器、靠父锚+子序号定位（蓝框）` : '') +
+    (dead ? `；${dead} 个彻底够不着（不画框，只能走硬坐标模式）` : '') + '</div>';
+}
+
+function render() {
+  const sc = S.screen, st = $('#stage'), img = $('#shot');
+  const draw = () => {   // 幂等：先清旧框再画，onload 与手动调用重复触发也不会叠框
+    const ov = $('#overlay');
+    ov.innerHTML = '';
+    // 基准只用截图真实像素（后端给的 shot_w/shot_h 或 img 的 natural*），**绝不用 sc.w/h**——
+    // 那是节点 bounds 的包围盒，前台是对话框时只有对话框那么大，误用会把框整体放大（见 Recorder.vue）
+    const W = sc.shot_w || img.naturalWidth, H = sc.shot_h || img.naturalHeight;
+    if (!W || !H) return;
+    // 同位置叠着的多个同尺寸容器节点只留一个（优先能唯一定位的，同等取更内层），否则叠成一坨
+    const rank = n => n.sels.length ? (n.sels[0].n === 1 ? 2 : 1) : 0;
+    const keep = new Map();
+    for (const n of sc.nodes) {
+      if (!n.sels.length && !n.anc) continue;
+      const k = n.b.join(',');
+      if (!keep.has(k) || rank(n) >= rank(keep.get(k))) keep.set(k, n);
+    }
+    const list = [...keep.values()]
+      .sort((a,b) => ((b.b[2]-b.b[0])*(b.b[3]-b.b[1])) - ((a.b[2]-a.b[0])*(a.b[3]-a.b[1])));
+    for (const n of list) {   // 面积大的先插入 → 小控件在上层，点击自然命中最贴合的那个
+      const d = document.createElement('div');
+      d.className = 'box' + (!n.sels.length ? ' anc' : n.sels[0].n > 1 ? ' amb' : '');
+      d.style.left = n.b[0]/W*100 + '%';  d.style.top = n.b[1]/H*100 + '%';
+      d.style.width = (n.b[2]-n.b[0])/W*100 + '%';  d.style.height = (n.b[3]-n.b[1])/H*100 + '%';
+      d.onmouseenter = e => {
+        const s = n.sels.length
+          ? n.sels.map(s => esc(`${s.by}=${s.v}`) + (s.n>1 ? ` <span style="color:#fca5a5">(${s.n}个匹配, idx ${s.idx})</span>` : '')).join('<br>')
+          : `<span style="color:#93c5fd">自身 id/text/desc 全空</span><br>靠父锚 ${esc(n.anc.by)}=${esc(n.anc.v)} --child ${esc(n.anc.child)}`;
+        $('#tip').innerHTML = `<b>${esc(n.cls)}</b>${n.clk?' · clickable':''}<br>${s}`;
+        $('#tip').style.display = 'block';
+      };
+      d.onmousemove = e => { const t=$('#tip'); t.style.left=(e.clientX+12)+'px'; t.style.top=(e.clientY+12)+'px'; };
+      d.onmouseleave = () => $('#tip').style.display = 'none';
+      d.onclick = e => { if (MODE === 'tap') { e.stopPropagation(); pick(n); } };
+      ov.appendChild(d);
+    }
+    hint();
+  };
+  img.onload = draw;
+  img.src = sc.png ? 'data:image/png;base64,' + sc.png : '';
+  if (img.complete) draw();
+  steps();
+}
+
+function steps() {
+  $('#steps').innerHTML = S.steps.length ? '' : '<div class="card mut">还没有步骤。先「启动应用」，然后点屏幕上的框。</div>';
+  for (const s of S.steps) {
+    const d = document.createElement('div'); d.className = 'card step';
+    const app = s.diff.appeared, gone = s.diff.disappeared;
+    d.innerHTML = `<div class="n">#${s.n}</div><div>
+      <div><b>${esc(s.label)}</b></div>
+      ${s.script?.length ? `<div style="margin:4px 0">${s.script.map(l=>`<code>${esc(l)}</code>`).join('<br>')}</div>` : ''}
+      ${s.cmd && s.script?.length > 1 ? `<div class="mut" style="font-size:11px">录制当下执行 <code>${esc(s.cmd.join(' '))}</code>（实时坐标）；上面那几行才是脚本里的样子</div>` : ''}
+      ${s.warn ? `<div class="warn">⚠︎ ${esc(s.warn)}</div>` : ''}
+      ${s.needs_attention ? `<div class="warn">⚠︎ ${esc(s.needs_attention)}</div>` : ''}
+      ${s.child_anchor ? `<div class="mut">父锚 ${esc(s.child_anchor.by)}=${esc(s.child_anchor.v)} --child ${esc(s.child_anchor.child)}（导出脚本用 bounds 现算坐标）</div>` : ''}
+      ${s.anchor ? `<div class="mut">锚 ${esc(s.anchor.sel.by)}=${esc(s.anchor.sel.v)} @ ${s.anchor.rx}‰,${s.anchor.ry}‰${s.anchor_to?` → ${s.anchor_to.rx}‰,${s.anchor_to.ry}‰`:''}</div>` : ''}
+      ${s.straightened ? `<div class="mut">⤳ ${esc(s.straightened)}</div>` : ''}
+      ${app.length ? `<div style="margin-top:4px">新出现 ${app.slice(0,6).map(t=>`<span class="tag">${esc(t)}</span>`).join('')}${app.length>6?`<span class="mut">+${app.length-6}</span>`:''}</div>` : '<div class="mut" style="margin-top:4px">界面文案无变化</div>'}
+      ${gone.length ? `<div class="mut">消失 ${gone.slice(0,4).map(esc).join('、')}${gone.length>4?` +${gone.length-4}`:''}</div>` : ''}
+    </div>`;
+    $('#steps').appendChild(d);
+  }
+}
+
+function pick(n) {
+  if (!n.sels.length) return act({kind:'tap', x:n.c[0], y:n.c[1], anc:n.anc});
+  if (n.sels[0].n === 1) return act({kind:'tap', sel:n.sels[0]});
+  pend = n;
+  $('#ambigList').innerHTML = n.sels.map((s,i) =>
+    `<label><input type="radio" name="sel" value="${i}" ${i?'':'checked'}>
+      <code>${esc(s.by)}=${esc(s.v)}</code>
+      ${s.n===1 ? '<span style="color:var(--ok)">唯一命中 ✓</span>'
+                : `<span class="warn">${s.n} 个匹配 → 用 --index ${s.idx} 点第 ${s.idx+1} 个</span>`}</label>`).join('');
+  $('#ambig').style.display = 'flex';
+}
+function closeAmbig() { $('#ambig').style.display = 'none'; pend = null; }
+function confirmAmbig() {
+  const i = +document.querySelector('input[name=sel]:checked').value, n = pend;
+  closeAmbig(); act({kind:'tap', sel:n.sels[i]});
+}
+
+function down(e) {
+  if (MODE === 'tap') return;
+  const img = $('#shot'), r = img.getBoundingClientRect();
+  const to = ev => [Math.round((ev.clientX-r.left)/r.width*img.naturalWidth),
+                    Math.round((ev.clientY-r.top)/r.height*img.naturalHeight)];
+  const [x, y] = to(e);
+  if (MODE === 'xy') return act({kind:'tap', x, y});
+  drag = {x, y, sx:e.clientX-r.left, sy:e.clientY-r.top};
+  const ln = $('#line'); ln.style.display='block'; ln.style.left=drag.sx+'px'; ln.style.top=drag.sy+'px'; ln.style.width='0';
+  const move = ev => {
+    const dx = (ev.clientX-r.left)-drag.sx, dy = (ev.clientY-r.top)-drag.sy;
+    ln.style.width = Math.hypot(dx,dy)+'px';
+    ln.style.transform = `rotate(${Math.atan2(dy,dx)}rad)`;
+  };
+  const up = ev => {
+    document.removeEventListener('mousemove', move); document.removeEventListener('mouseup', up);
+    ln.style.display='none';
+    const [x2, y2] = to(ev);
+    if (Math.hypot(x2-drag.x, y2-drag.y) < 20) { drag=null; return; }
+    act({kind: MODE, x1:drag.x, y1:drag.y, x2, y2}); drag = null;
+  };
+  document.addEventListener('mousemove', move); document.addEventListener('mouseup', up);
+  e.preventDefault();
+}
+
+function typeText() { const v = prompt('输入文本（会用 --assert-typed 校验真打进去了）'); if (v) act({kind:'text', value:v}); }
+function note()     { const v = prompt('给这一步记一句备注（不操作设备，只写进录制文件）'); if (v) act({kind:'note', value:v}); }
+
+async function act(body) { const j = await api('/api/act', body); S.steps.push(j.step); S.screen = j.screen; render(); }
+async function refresh() { S.screen = (await api('/api/refresh')).screen; render(); }
+async function undo()   { S.steps = (await api('/api/undo')).steps; steps(); }
+async function exportRec() {
+  const c = prompt('用例 ID（决定落盘目录）', S.case); if (!c) return;
+  S.case = c;
+  const j = await api('/api/export', {case:c});
+  alert(`已导出 ${j.steps} 步 / ${j.shots} 张截图\n\n录制文件：${j.rec}\n脚本草稿：${j.flow}`);
+}
+boot();
+</script>

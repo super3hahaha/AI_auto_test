@@ -212,7 +212,40 @@
 
 - **背景**：`adb shell uiautomator dump` 每次冷起 uiautomator 进程，实测单次 ~510ms（dump ~480 + pull ~30）；uiautomator2 的 `dump_hierarchy` 走设备常驻 server，实测 ~118ms，**单次快约 4×**。频繁 dump 的场景（sweep 15 轮循环、waitfor 轮询、多设备并行）墙钟收益明显。
 - **端到端只有约 2×（2026-07-29 实测修正）**：整轮回归还有点击/等待/截图/落库等非 dump 开销，单次 4× 折到整轮实测 **~2×**（同一轮 30min → 15min）。对外文案（Runner.vue 勾选项说明、adbkit `--dump-backend` help）一律按 **2 倍** 讲，4× 只作为单次 dump 的微基准留档，别再拿去当整轮口径。
-- **为什么抽象而不是直接换**：u2 快的代价是设备上要**常驻 atx-agent + 两个 apk 并保活**（会被 doze/省电杀），跟本框架"纯 adb、不给设备装东西、pm clear 复现首启"的黑盒哲学有让步。所以 `_dump_tree` 拆成 `_dump_tree_shell` / `_dump_tree_u2` 两后端，`target.json` 的 `dump_backend` 字段（+ `--dump-backend` 覆盖）切换，**默认 shell 零风险**，单台验证稳定后再按 App/按设备切 u2。两后端输出同为 UiAutomator 层级 XML，字段/bounds 一致，`_nodes_from`/`_match_nodes`/`_present_any`/sweep/find 等上层一律不改。
+- **为什么抽象而不是直接换**：u2 快的代价是设备上要**常驻 atx-agent + 两个 apk 并保活**（会被 doze/省电杀），跟本框架"纯 adb、不给设备装东西、pm clear 复现首启"的黑盒哲学有让步。所以 `_dump_tree` 拆成 `_dump_tree_shell` / `_dump_tree_u2` 两后端，`target.json` 的 `dump_backend` 字段（+ `--dump-backend` 覆盖）切换，**默认 shell 零风险**，单台验证稳定后再按 App/按设备切 u2。两后端输出同为 UiAutomator 层级 XML，`_nodes_from`/`_match_nodes`/`_present_any`/sweep/find 等上层一律不改。
+- **⚠️ 修正「字段/bounds 一致」这句（2026-08-03 实测，原文说法不准）**：两后端**节点集合不同**——
+  `adb shell uiautomator dump` 只 dump **当前活跃窗口**，u2 的 `dump_hierarchy()` dump **所有窗口**。
+  同一屏实测 u2 **134 个节点 / shell 108 个**，多出的 26 个几乎全是 SystemUI 状态栏
+  （`status_bar`/`clock`/`wifi_combo`/`battery`/通知图标 desc）。这跟下面「未定论」里 AdMob 插屏
+  23 vs 85 是同一个现象，不是广告特有。
+  **bounds 方面**：两边都有唯一 id 的 27 个控件里 **21 个完全一致**；6 个不一致的全是整屏级容器
+  ——`root_view`/`content`/`action_bar_root` shell 报 2214、u2 报 2280（差 66px = 底部导航栏），
+  外加广告 WebView 3 个差 1px。**具体业务控件（会被 tapid/taptext 点的那些）bounds 一致**，
+  所以切后端不会让点击坐标漂移。
+  **真正要防的风险**：u2 多出的 SystemUI 节点可能让某个 text/desc 的**全树匹配数 +1**，
+  连带 `--index` 错行。已检查：现有脚本没有一处用那 6 个容器算坐标；`--index` 涉及的
+  `tv_name` 两后端匹配数一致（8=8）。要切之前**按这两条自查**，不要只看速度。
+- **单次提速在慢设备上远超 4×（2026-08-03 实测，Pixel_4 USB）**：`adb shell uiautomator dump`
+  **2.18/2.21/2.18s**（连跑三次一模一样，说明是每次新起进程 + 建 UiAutomation 连接的固定冷启动
+  开销，与节点数无关——`--compressed` 砍掉 25% 节点只快 0.03s）；u2 首次 1.71s（含建连），之后
+  **0.31s**，快约 **7×**。`pull` 只占 0.02s、`adb shell true` 基线 0.02s，所以传输和通道都不是瓶颈。
+  录制器这种「每步都要探屏」的交互场景收益最大：一步 3.2s → 约 1.1s。
+- **实现上已让 u2 对齐 shell（2026-08-03）**：`_strip_systemui()` 在 **u2 后端出口**剥掉
+  `package == com.android.systemui` 的顶层窗口，之后 `nodes`/`find`/`tapid`/`waitfor`/`sweep`/
+  `.dumpcache` 一律看到与 shell 同构的树。剥完实测 108 == 108 节点、节点集合完全一致、59 个共有
+  选择器匹配数无一不同——**"切后端只变快、语义不变"这句现在才真正成立**。
+  为什么放在后端出口而不是让每个命令传排除参数：`--from-cache` 那条路读的是**缓存 XML**，漏掉它
+  就会出现"`nodes` 报的 idx 与 `tapid` 实际数的 idx 不一致"这种极难查的错行。
+  另给 `nodes` 保留了通用的 `--skip-pkg <pkg>`（可重复，排除发生在统计匹配数之前），排别的包时用。
+  ⚠️ 副作用：u2 后端下**看不到状态栏/导航栏节点**了。当前没有用例需要点它们（权限弹窗是
+  `com.android.permissioncontroller`、广告是 App 内 WebView，都不受影响）；真要测通知栏得放开这个过滤。
+- **录制器固定优先 u2（2026-08-03）**：`tools/recorder.py` 每步都要探屏，是对 dump 延迟最敏感的
+  场景。它优先用 u2、失败自动退回 shell 并记住（某台设备没初始化过 atx 时不能整个不可用），当前
+  后端在录制器 UI 上显示。实测一步 act：**8.9s（无线+每步重复 dump）→ 1.98s**（USB + `--from-cache`
+  复用 + u2）。回归仍按 `target.json` 的 `dump_backend`（默认 shell）跑，两边视图已对齐、互不影响。
+- **shell 与 u2 可以共存**（2026-08-03 实测）：装了 atx 的机器上 `adb shell uiautomator dump`
+  照样成功，不必担心 atx 常驻会独占 UiAutomation 而让 shell 后端失效。**但别在 u2 dump 刚跑完
+  的瞬间紧接着跑 shell dump**——实测过一次 0.26s 就返回「拉取 UI 树失败」（连接还没放开）。
 - **设备初始化**：`init_target.py --atx-init` 做 `u2.connect`（首次自动装 atx）+ `dump_hierarchy` 健康检查；`--dump-backend u2 --write` 才落盘切后端。运行期保活靠 adbkit `_u2_device()` 惰性缓存 + u2 库 connect 内建 healthcheck。
 - **未定论**：切 u2 是否顺带修好"WebView 插屏广告跳不过"——观察到 shell dump 与 u2 dump 在 AdMob 插屏上节点数不同（23 vs 85），但未干净复现"shell 单独跑必失败、u2 必成功"（一次污染测量见 gotchas.md），故**不以此为切 u2 的理由**，只认提速这个确定收益。
 
@@ -374,3 +407,35 @@
 - **定位到哪一次执行（attempt）：从该格日志的证据路径里抓 run_id + attempt，不用整轮 id、也不靠时间戳猜**。证据里 attempt 段是该格 `run_flow` 启动时刻的 HHMMSS，逐格不同（一轮里实测 `175125/175351/175534/180715`），整轮的 run_id / 执行记录 id 只等于第一格。而固化脚本每次采证都会把证据文件全路径打进日志（`…/evidence/<slug>/<ver>/<run_id>/<case>/<serial>/<attempt>/ui/xx.xml`），`RunCell.lines` 又随执行记录一起存盘 → 拿它做四段精确配对，**连 `meta.runId` 字段加入前存的旧记录也能对准**（实测 15 条记录 98 格全部精确命中，其中 34 格属于这种旧记录，靠日志里的 run_id 救回来；跳转时批次锚点也优先用它而不是 `meta.runId`）。兜底：脚本刚起来就崩、一条证据都没产出时日志里没有路径可抓，才退回按新增的 `RunCell.startedAt` 就近配（≤120s，不能要求严格相等，见 `gotchas.md` 同名条目）；两级都配不上就退回最新一次，并在提示条里说清"看的不是你点的那次"。
 - **serial 两种形态必须都清洗**：跳转请求带的是原始 adb serial（`192.168.209.239:5555`），而 Evidence 左栏的设备键是从证据路径里切出来的、被 `adbkit._safe()` 清洗过的段（`192.168.209.239_5555`）——匹配时两边都过 `sanitizeSerial()`，否则无线设备永远落空（同一个坑 `gotchas.md` 里已有条目，这次是第三处踩到）。
 - **顺带补「证据文件已被清除」的提示**：「清理」页删的是 `evidence/<slug>/<ver>/<run_id>` 整轮**物料目录**，账本里的 `evidence.csv` 行不跟着删（它是历史流水，`log.csv`/审计要用）。所以清过的旧批次是"条目在、文件没了"：以前图片 `onerror` 后舞台就是一片空白，看着像功能坏了。改成图片 `@error` / 文本读取失败都标进 `missingFiles`，舞台渲染成一块说明（提示大概是被清理移进了废纸篓、附相对路径），缩略图显示 ✕。跳转落空的提示条文案里也把"证据可能已被清除"列为第一种可能。
+
+## 48. Doc 报告补齐多设备身份：标题「测试设备」列全部设备、失败详情标「复现设备」（2026-08-03）
+
+- **问题**（用户实测发现）：多设备并行回归时，`doc_report.py` 标题区「测试设备」只读 `target.json.serial`（编排收尾最后写进去的那台），读起来像整轮只在一台上跑过；失败用例列表/详情也没有任何字段说明这条问题是在哪台设备上复现的——同一条用例矩阵跑多台、只有一台失败时，报告完全看不出"是谁"，只能自己去翻 `executions.csv`。
+- **决定**：
+  - 新增 `read_exec_rows()`（按 `run_id` 过滤 `executions.csv`，逐台执行明细的真值）+ `run_devices()`（本轮出现过的全部 serial，去重保序）+ `devices_label()`（拼成"别名 (Android x)、别名2 (Android y)"）。标题区「测试设备」改用 `devices_label(run_devices(...))`，executions 为空（老账本/纯 CLI 单机跑）才退回单台 `cfg.serial`。
+  - 新增 `issue_devices(issue, exec_rows, default_serial)`：判定一条问题记录复现在哪几台——优先 `issues.csv`「执行设备」列（`case_issue.py --serial` 登记的一手信息，支持逗号分隔多值）；没登记就退回 `executions.csv` 里该用例判「失败」的设备；再退到该用例本轮跑过的全部设备；最后兜 `cfg.serial`。三、失败用例列表新增「复现设备」列，四、失败用例详情新增「复现设备」kv 行——至少给"设备别名+安卓版本"，不能只靠概览列。
+  - 「证据地址」同理改按设备取值：新增 `device_evidence_link()`/`case_device_links()` 直接读 `executions.csv` 里 `(用例, 设备)` 那一行自己的证据链接（而非 `queue.csv` 聚合列，多设备并行下聚合列是最后写入那台）。只有一台复现时用该设备自己的链接（顺便修正了单设备场景下概览列可能跟真实设备错位的旧 bug）；多台复现且各自证据目录不同则逐台列出 `[别名] 链接`，不能只显示其中一台。
+  - `last_log_note(cid, serial="")` 加设备过滤：多设备并行下同一条用例的「完成执行」日志有 N 条，不筛设备会把 A 机的失败原因安到 B 机头上；`failed_cases_without_issue()` 补的兜底问题记录同理按设备分别取「实际结果」文案、拼进「执行设备」列。
+  - `device_os_version()` 改缓存优先（读 `config/device_info_cache.json`，跟 desktop 壳 `list_devices` 同一份缓存、同一种"缓存优先，force 才现查"思路，见 #45），缓存没有才现查 `adb getprop`——报告多半是收工很久之后手动重跑，这时大概率全部设备离线，逐台现查又慢又大概率全超时。
+
+## 49. `device_label()` 补「型号」兜底 + 场景库装机成功后回写 `target.json.app_version`（2026-08-04）
+
+- **问题一**（用户截图发现）：无线设备（`ip:port` 形式）多数没在 `device_aliases.json` 登记别名，`doc_report.py` 的 `device_label()` 之前只有 别名→原始 serial 两级，没登时 Doc 报告直接显示 `192.168.209.239:5555` 这种纯地址，可读性极差。其实同一个坑三处前端（`Runner.vue`/`Evidence.vue`/`RunMonitor.vue`）2026-07-29 已经修过"别名 > 型号 > 原始兜底"（见 gotchas.md 对应条目），当时漏改 `doc_report.py`，是同一个坑第四次冒出来。
+  - **决定**：新增 `device_model(serial)`（只读 `config/device_info_cache.json` 的 `model` 字段，不现查——型号不像系统版本会变），`device_label()` 补上这一级：别名 > 型号 > 原始 serial。
+- **问题二**（用户追问「测试版本」为什么没显示热修后缀，深挖出的真实 bug）：场景库「选中留存版本执行」这条路径（`Runner.vue:launch()` → `runStore.ts:start()`）只会把选中版本的 apk `adb install -r` 逐台强制重装，从未把这个版本号回写进 `target.json.app_version`；这个字段只在 `register_app`（首次上传注册）时被 `init_target.py` 现查一次写入，之后不管又装了多少个新 build，都不会跟着更新。`case_result.py`/`adbkit.py`/`doc_report.py` 全都直接读这个静态字段（决定证据落哪个版本目录、Doc 报告「测试版本」显示什么），于是设备上 `dumpsys` 真实装的是 `2.3.5J`，报告和证据目录却停留在上次注册时探测到的 `2.3.5`——两者自洽（都用同一个错的静态值）但都不是真相。
+  - **决定**：新增 `set_target_app_version` 命令（跟 `set_target_scope`/`set_target_dump_backend` 同款：读 target.json → 改字段 → 写回），`runStore.ts` 的 `start()` 里逐台装机成功后立刻调用回写；`Runner.vue:launch()` 把 `selectedVersion` 的 `ver` 通过新增的 `appVersion` 参数传下去（`FOLLOW_DEVICE`/未选版本时不传，`opts.apkPath`/`opts.package` 同时非空才会真正装机+回写，三者门槛保持一致）。回写失败不阻断本轮执行，只提示"报告/证据目录可能仍显示旧版本"。
+  - **残留限制**：`跟随设备`模式（不装机，直接用设备上已装的 App 回归）依然不写 `target.json.app_version`——那个模式下证据版本段是逐台现查（`AITEST_FOLLOW_DEVICE=1`），多台设备本来就可能装的版本彼此不同，没有单一"这一轮的版本"可回写，维持现状（`doc_report.py` 的「测试版本」这行在跟随设备场景下本就不该被信任，得看各设备证据目录）。
+
+## 50. `cmd_reset` 顺手把默认输入法固定成 uiautomator2 自带哑键盘，根治 `input text` 被联想 IME 拦改乱码（2026-08-04）
+
+- **问题**：`docs/gotchas.md` 2026-07-21 就记过这个坑——设备当前 IME 是拼音等联想输入法时，`adb shell input text` 送进去的字符会被联想引擎拦截改写成乱码（如搜索框打 `pcm_s16le-sample-track.wav` 找不到结果），一直停留在"排查思路"层面，没有自动化修复，撞上了只能人工切一下设备键盘再重跑。
+- **调研过程**：先试了"把 Gboard 切到英文 subtype"——`adb shell settings put secure selected_input_method_subtype <en_US的hash>` 真机实测**对 Gboard 读写都不生效**，设置完立刻被冲掉（`dumpsys input_method` 读到的 `mCurrentSubtype` 还是原来那个），这条路走不通，呼应了 `cmd_text` 里"`selected_input_method_subtype` 恒为 -1"的旧观察——不是"读不到"，是这个设置本身对 Gboard 不起作用。
+- **决定**：不跟 Gboard 的语言 subtype 纠缠，直接换掉整个默认 IME——切到 `uiautomator2`（项目已有依赖）自带的 `com.github.uiautomator/.AdbKeyboard`。这个键盘没有任何联想/拼音转写逻辑，`input text` 打进去的字符原样落地，跟设备当前实际选的是哪种语言完全无关。真机验证过 4 台设备（含未预装该键盘的百度输入法机型，`u2.set_input_ime(True)` 会自动推包安装），统一切换后 Chrome 地址栏/搜索框输入乱码文件名测试全部原样落地。
+- **接线位置**：新增 `_ensure_ascii_ime()`，挂在 `cmd_reset` 末尾——各 flow 脚本清一色以 `$AK reset` 开头（见 `flow_cut_save.sh` 头注），挂在这一个入口就覆盖全部固化脚本，不用逐个改。优先走 `uiautomator2` 的 `set_input_ime(True)`（`_u2_device_soft()` 连不上时退化成纯 `adb shell ime set`，前提是设备已装这个键盘）；全程 best-effort，失败只打印提示不阻断 `reset` 本身——输入法环境准备不该因为一次连接抖动就让整轮回归跑不起来。
+- **残留限制**：这个 IME 设置存在设备 `secure settings` 里，重启/恢复出厂会丢；新接入的设备如果连 `uiautomator2` 服务都起不来（比如首次连接、`atx-agent` 还没装），会退化成纯 `adb shell ime set`——若这个键盘本来就没装则这一步静默失败，仍可能撞回乱码坑，`docs/gotchas.md` 对应条目留了排查提示。
+
+## 51. `run_flow.py` 补「兜底失败截图」：exit!=0 且本轮无失败截图时才补拍（2026-08-04）
+
+- **问题**：flow-freeze 现有纪律是"脚本内部各校验点自己就地截 `<step>-fail.png`"，但这只覆盖 UI 断言类失败；logscan/output-check/MediaStore 交叉核对这类非 UI 校验点判失败时不会触发就地截图——于是这类失败会出现"判失败却一张画面证据都没有"。
+- **决定**：在 `run_flow.py` 收尾处（`mine` 证据清单算出来之后），若 `rc != 0` 且本轮登记的证据里没有任何一条「证据类型含 screenshots 且结果=失败」，才补调 `adbkit.py shot 99-flow-failed --result 失败` 截一张兜底图。判断只认「screenshots」类型，不能把 `99-run-log`（证据类型=logs，同样会挂 结果=失败）算作"已经有失败截图"，否则永远误判成"已经有"从而永不兜底。
+- **定位**：只是兜底，不是取代脚本内部就地截图——时序上晚于真正失败的那一刻（脚本还要跑完收尾逻辑），画面不保证和判定瞬间完全对应，纯粹为了"总比一张都没有强"。`scope`（`/<safe_serial>/<attempt>/` 过滤串）改成不再依赖 `ev.exists()`才算，因为兜底截图可能是本轮第一条证据（此时 evidence.csv 还不存在）。

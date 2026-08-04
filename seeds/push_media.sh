@@ -5,6 +5,34 @@ set -e
 cd "$(dirname "$0")/.."
 S="$1"; DST="${2:-/sdcard/Music}"
 [ -z "$S" ] && { echo "用法: bash seeds/push_media.sh <serial> [目标目录]"; exit 1; }
+
+# 跑前清理残留衍生文件：App 自身的裁剪/合并等操作会顺带在设备上留下一份文件名"整段包含"
+# 素材文件名的中间产物（如裁剪会生成 AudioCutter_<原文件名> 这个衍生文件），这类残留不会
+# 自动清理，会一直留在设备上。后续用例用素材文件名做子串搜索选文件时，残留会被一起命中；
+# 命中多条时脚本按列表点第 0 个，列表按 date_added 倒序，越晚产生的残留排得越靠前，就会
+# 顶替真正的素材本体被误选中（2026-08-04 MERGE-CORE-01 复现：搜「mp3-sample-track.mp3」
+# 连带命中 AudioCutter_mp3-sample-track.mp3 并选中它替代真正源文件，合并产物少了一整段
+# 时长，见 BUG-MERGE-FMT-01）。这里只删"文件名含素材名、但路径不是素材本体"的文件（连
+# MediaStore 记录一起删，只删文件的话 App 的选择列表还查得到），不碰其他不相关产物。
+# --where 必须双层引号（外层给设备端 sh 剥、内层单引号才活到 SQL），单层引号会被设备端 sh
+# 吃掉、SQL 报错还被 2>/dev/null 吞掉，看起来像"没这个文件"——同一个坑见
+# tools/flow_media.sh ms_query_data 注释、docs/gotchas.md 2026-07-29 条目。
+for f in assets/*; do
+  [ -f "$f" ] || continue
+  base=$(basename "$f")
+  stale=$(adb -s "$S" shell "find $DST -type f -iname '*$base*' 2>/dev/null" | tr -d '\r')
+  while IFS= read -r p; do
+    [ -z "$p" ] && continue
+    [ "$p" = "$DST/$base" ] && continue
+    esc=$(printf '%s' "$p" | sed "s/'/''/g")
+    adb -s "$S" shell content delete --uri content://media/external/audio/media \
+      --where "\"_data='${esc}'\"" >/dev/null 2>&1 || true
+    adb -s "$S" shell "rm -f '$p'" >/dev/null 2>&1 || true
+    adb -s "$S" shell "am broadcast -a android.intent.action.MEDIA_SCANNER_SCAN_FILE -d file://$p" >/dev/null 2>&1 || true
+    echo "cleaned 残留 $p（文件名含素材「$base」子串，避免污染后续搜索）"
+  done <<< "$stale"
+done
+
 for f in assets/*; do
   [ -f "$f" ] || continue
   base=$(basename "$f")

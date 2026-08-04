@@ -81,8 +81,12 @@
       "match": [
         {"by": "desc", "value": "同意"},
         {"by": "text", "value": "同意"},
+        {"by": "desc", "value": "接受"},
+        {"by": "text", "value": "接受"},
         {"by": "desc", "value": "Consent"},
-        {"by": "text", "value": "Consent"}
+        {"by": "text", "value": "Consent"},
+        {"by": "desc", "value": "Accept"},
+        {"by": "text", "value": "Accept", "partial": true}
       ]
     },
     {

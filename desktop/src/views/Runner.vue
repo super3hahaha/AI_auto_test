@@ -16,6 +16,8 @@ const subTab = ref<"library" | "monitor" | "history">("library");
 // 切到「执行记录」子 tab 时刷新列表（Runner 被 keep-alive 保活，子 tab 用 v-show 不会触发子组件生命周期）
 const historyRef = ref<InstanceType<typeof RunHistory> | null>(null);
 watch(subTab, (v) => { if (v === "history") historyRef.value?.reload(); });
+// 执行台看板常驻挂载，别名/型号缓存靠 loadDevices() 主动催更新（见 loadDevices 内注释）
+const monitorRef = ref<InstanceType<typeof RunMonitor> | null>(null);
 
 // ── 中栏：当前 App 的用例/固化脚本 ──
 const flows = ref<FlowRow[]>([]);
@@ -80,14 +82,24 @@ function resetRowDevs(caseId: string) {
   delete rowSerials[caseId];
 }
 // chips 显示文本：优先设备别名，其次型号（无线设备 serial 是 ip:port，截尾 4 位会变成端口号 5555，
-// 没意义，所以型号优先于截尾兜底），最后才退回 serial 尾 4 位（完整 serial 放 title 悬停可见）
-function chipLabel(serial: string) {
+// 没意义，所以型号优先于截尾兜底），最后才退回 serial 尾 4 位（完整 serial 放 title 悬停可见）。
+// 【必须能区分同名设备】手上两台 Pixel_4 没设别名时 model 完全一样，chips 上是两个"Pixel_4"，
+// 逐格分派时根本不知道点的是哪台（真实踩过：以为在用有线那台，其实选的是另一台无线的）。
+// 所以重名时补一段区分标识——无线取 IP 末段（.239 比端口 5555 有意义），USB 取 serial 尾 4 位。
+// 只在**真有重名**时才补，避免所有 chip 无脑变长。根治办法仍是去「设备」tab 给它们起别名。
+function baseLabel(serial: string) {
   const d = devices.value.find((x) => x.serial === serial);
   return d?.alias || d?.model || serial.slice(-4);
 }
+function chipLabel(serial: string) {
+  const base = baseLabel(serial);
+  if (devices.value.filter((x) => baseLabel(x.serial) === base).length < 2) return base;
+  const tail = serial.includes(":") ? serial.split(":")[0].split(".").pop() : serial.slice(-4);
+  return `${base}·${tail}`;
+}
 function chipTitle(serial: string) {
   const d = devices.value.find((x) => x.serial === serial);
-  return `${serial}${d?.model ? " · " + d.model : ""}`;
+  return `${serial}（${serial.includes(":") ? "无线" : "USB"}）${d?.model ? " · " + d.model : ""}`;
 }
 // 执行计划：serial → caseId[]（用例顺序按中栏列表顺序，即 frozen 的顺序）
 function buildPlan(cases: { case_id: string }[]): Record<string, string[]> {
@@ -120,8 +132,8 @@ async function loadDumpBackend() {
 const err = ref("");
 const confirmNewBoard = ref(false);
 
-const frozen = computed(() => flows.value.filter((f) => f.has_flow));
-const nonFrozen = computed(() => flows.value.filter((f) => !f.has_flow));
+const frozen = computed(() => flows.value.filter((f) => f.has_flow && matchesPriority(f)));
+const nonFrozen = computed(() => flows.value.filter((f) => !f.has_flow && matchesPriority(f)));
 
 // 优先级配色：P0(danger) > P1(warning) > P2(accent，浅蓝区分于 P3) > P3(muted)
 function priorityPill(p: string) {
@@ -131,7 +143,26 @@ function priorityPill(p: string) {
   return "pill-muted";
 }
 
-// 全选/取消全选：只对固化用例生效（非固化用例本来就锁着不可勾）
+// 优先级筛选：勾中的几档只看这几档；一档都不勾 = 不筛选（全部显示），避免"取消到一档不剩=空列表"的反直觉。
+// 只列出当前 flows 里实际出现过的优先级（P0 通常没有用例就不出现按钮），按 P0>P1>P2>P3 固定顺序。
+const priorityFilter = ref<Set<string>>(new Set());
+const showPriorityMenu = ref(false);
+const allPriorities = computed(() => {
+  const present = new Set(flows.value.map((f) => f.priority).filter(Boolean));
+  return ["P0", "P1", "P2", "P3"].filter((p) => present.has(p));
+});
+function togglePriority(p: string) {
+  const set = new Set(priorityFilter.value);
+  if (set.has(p)) set.delete(p);
+  else set.add(p);
+  priorityFilter.value = set;
+}
+function matchesPriority(f: FlowRow) {
+  return priorityFilter.value.size === 0 || (!!f.priority && priorityFilter.value.has(f.priority));
+}
+
+// 全选/取消全选：只对固化用例生效（非固化用例本来就锁着不可勾）；frozen 已按优先级筛选，
+// 筛选生效时「全选」只选中当前可见的那些，符合直觉。
 function selectAllCases() {
   pickedCases.value = frozen.value.map((f) => f.case_id);
 }
@@ -215,6 +246,10 @@ async function loadDevices() {
     const first = devices.value.find((d) => d.state === "device");
     if (first) pickedSerials.value = [first.serial];
   }
+  // list_devices 刚查到的型号已经落盘（config/device_info_cache.json），但执行台看板（RunMonitor）
+  // 靠 v-show 常驻挂载，自己的别名/型号缓存只在首次挂载时读过一次——这里主动催它重读，不然场景库
+  // 这边刷新出了型号，看板标题栏还停在挂载那一刻的旧值（无线设备表现为一直露 ip:port）。
+  await monitorRef.value?.reload();
 }
 
 async function loadAll() {
@@ -277,6 +312,7 @@ async function launch(newBoard: boolean) {
       title: `${slug} · ${cases.length} 用例 × ${planSerials.length} 设备${isMatrix ? "" : `（分派 ${cellCount} 格）`}${ver === FOLLOW_DEVICE ? " · 跟随设备" : ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
       apkPath: apkPath && pkg ? apkPath : undefined,
       package: apkPath && pkg ? pkg : undefined,
+      appVersion: apkPath && pkg && ver ? ver : undefined,
       langCode: langCode.value || undefined,
       followDevice: ver === FOLLOW_DEVICE,
     })
@@ -335,15 +371,19 @@ async function doUpload() {
       const code = await api.installApk(apkPath.value, apkInfo.value.package, serial, (l) => uploadLog.value.push(l));
       if (code !== 0) { uploadStatus.value = `✖ 装机失败（${serial}，exit ${code}）`; uploading.value = false; return; }
     }
-    // 2) 注册（init_target.py + 补 app_slug + 建工作区）：勾了设备用第一台探测；没勾就留空，
-    // 只有一台在线设备时后端会自动选中它，多台在线又没勾选会报错提示用 --serial 指定。
-    const primary = uploadSerials.value[0] || "";
+    // 2) 注册（init_target.py + 补 app_slug + 建工作区）：勾了设备用第一台探测；没勾（仅注册，跳过装机）
+    // 也必须给 --serial，否则多台设备在线时 init_target.py 因无法唯一确定探测设备而报错退出——
+    // 用户明确要求"不勾就该直接注册成功"，所以静默兜底取在线列表第一台。
+    const primary = uploadSerials.value[0] || devices.value.find((d) => d.state === "device")?.serial || "";
     uploadLog.value.push(`$ AITEST_APP=${slug} python3 tools/init_target.py ${apkInfo.value.package}${primary ? ` --serial ${primary}` : ""} --write`);
     const code = await api.registerApp(slug, apkInfo.value.package, primary, (l) => uploadLog.value.push(l));
     if (code !== 0) { uploadStatus.value = `✖ 注册失败（exit ${code}）`; uploading.value = false; return; }
     // 留存这个版本的 apk 文件，供以后同 slug 下多版本切换执行时直接装机用
     await api.saveApkVersion(slug, apkPath.value, apkInfo.value.version || "unknown");
-    delete appVersions[slug]; // 清缓存，下次展开重新拉取（带上刚存的这个版本）
+    // 已展开的话直接重新拉取（带上刚存的这个版本）；没展开就只清缓存，等下次展开再拉——
+    // 光 delete 缓存对已展开的树不够：它不会再触发 toggleAppExpand，会一直卡在清缓存后的空态上。
+    if (expandedApps.has(slug)) await fetchApkVersions(slug);
+    else delete appVersions[slug];
     uploadStatus.value = `✔ 已注册并选中 ${slug}`;
     await store.loadApps();
     await store.setActive(slug);
@@ -372,17 +412,18 @@ const appVersions = reactive<Record<string, ApkVersionInfo[]>>({});
 const FOLLOW_DEVICE = "__follow_device__";
 const selectedVersion = reactive<Record<string, string>>({});
 
+async function fetchApkVersions(slug: string) {
+  try {
+    appVersions[slug] = await api.listApkVersions(slug); // 仅供选择列表用；不自动预选，选不选是用户的事
+  } catch (e: any) {
+    err.value = String(e);
+  }
+}
+
 async function toggleAppExpand(slug: string) {
   if (expandedApps.has(slug)) { expandedApps.delete(slug); return; }
   expandedApps.add(slug);
-  if (!appVersions[slug]) {
-    try {
-      const versions = await api.listApkVersions(slug);
-      appVersions[slug] = versions; // 仅供选择列表用；不自动预选，选不选是用户的事
-    } catch (e: any) {
-      err.value = String(e);
-    }
-  }
+  if (!appVersions[slug]) await fetchApkVersions(slug);
 }
 
 function pickVersion(slug: string, version: string) {
@@ -393,6 +434,25 @@ function pickVersion(slug: string, version: string) {
 function fmtSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+// 从 App 库版本树移出一个留存 APK（apps/<slug>/apks/<version>.apk）。硬删不进回收站——
+// 只是本地缓存的安装包，重新上传即可找回，不像 removeApp 那样牵连用例/账本。
+async function removeApkVersion(slug: string, version: string) {
+  const ok = await confirm(`删除后需要重新上传才能再选到这个版本。`, {
+    title: `确认删除留存版本「${version}」？`,
+    kind: "warning",
+  });
+  if (!ok) return;
+  try {
+    await api.deleteApkVersion(slug, version);
+    // 删的正是当前选中版本：文件已经没了，不能再退回 a.app_version 显示（那只是注册时的元数据，
+    // 跟本地是否还留着安装包无关），显式切成「跟随设备」——跟 FOLLOW_DEVICE 哨兵值本来的语义一致。
+    if (selectedVersion[slug] === version) selectedVersion[slug] = FOLLOW_DEVICE;
+    await fetchApkVersions(slug);
+  } catch (e: any) {
+    err.value = String(e);
+  }
 }
 
 async function removeApp(slug: string) {
@@ -485,6 +545,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
                 >
                   <span class="mono">{{ v.version }}</span>
                   <span class="muted app-version-size">{{ fmtSize(v.size) }}</span>
+                  <button class="app-version-del" title="删除此留存版本" @click.stop="removeApkVersion(a.slug, v.version)">✕</button>
                 </div>
               </div>
             </div>
@@ -520,6 +581,27 @@ onActivated(() => { if (!runStore.running) loadAll(); });
         <div class="col-hd">
           <span>用例（{{ store.activeSlug || "未选 App" }}）</span>
           <div class="case-toolbar">
+            <div v-if="allPriorities.length" class="filter-wrap">
+              <button
+                class="sm icon-btn"
+                :class="{ on: priorityFilter.size }"
+                title="按优先级筛选"
+                @click="showPriorityMenu = !showPriorityMenu"
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M1 2h14l-5 6v5l-4 2v-7L1 2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                </svg>
+                <span v-if="priorityFilter.size" class="filter-badge">{{ priorityFilter.size }}</span>
+              </button>
+              <div v-if="showPriorityMenu" class="menu-backdrop" @click="showPriorityMenu = false"></div>
+              <div v-if="showPriorityMenu" class="priority-menu" @click.stop>
+                <label v-for="p in allPriorities" :key="p" class="priority-menu-item">
+                  <input type="checkbox" :checked="priorityFilter.has(p)" @change="togglePriority(p)" />
+                  <span class="pill sm" :class="priorityPill(p)">{{ p }}</span>
+                </label>
+                <button v-if="priorityFilter.size" class="sm menu-clear" @click="priorityFilter = new Set()">清空</button>
+              </div>
+            </div>
             <button class="sm" @click="selectAllCases">全选</button>
             <button class="sm" @click="selectRange">区间选择</button>
             <button class="sm" @click="clearAllCases">取消全选</button>
@@ -653,7 +735,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
 
     <!-- ══════ 执行台：实时监控（矩阵 + 进度 + 过程 + 中止）══════ -->
     <div v-show="subTab === 'monitor'" class="monitor-wrap">
-      <RunMonitor />
+      <RunMonitor ref="monitorRef" />
     </div>
 
     <!-- ══════ 执行记录：完整跑完（未中止）的历史执行台快照，按 run 记录切换回看 ══════ -->
@@ -702,7 +784,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
             <input v-model="slugEdit" class="slug-input mono" />
           </div>
           <div class="up-dev">
-            <div class="muted small">装到哪些设备（可不选；不选则跳过装机直接注册，仅当该包已装在某台在线设备上时可行——只有一台在线会自动用它探测，多台在线且不选会报错）</div>
+            <div class="muted small">装到哪些设备（可不选；不选则跳过装机直接注册，仅当该包已装在某台在线设备上时可行——多台在线且不选时默认取列表第一台探测）</div>
             <div v-if="!devices.length" class="muted small">无在线设备。</div>
             <label v-for="d in devices" :key="d.serial" class="dev-item">
               <input type="checkbox" :value="d.serial" v-model="uploadSerials" :disabled="d.state !== 'device'" />
@@ -783,6 +865,11 @@ h2 { margin: 0; font-weight: 500; }
 .app-version-item:hover { background: var(--surface-1); }
 .app-version-item.on { background: var(--bg-accent); color: var(--text-accent); }
 .app-version-size { margin-left: auto; font-size: 11px; }
+.app-version-del {
+  padding: 0 5px; font-size: 11px; line-height: 16px;
+  color: var(--text-muted); background: transparent; border: none; border-radius: 4px; cursor: pointer;
+}
+.app-version-del:hover { color: var(--text-danger, #d33); background: var(--surface-2, rgba(0,0,0,0.06)); }
 .follow-device { border-bottom: 0.5px solid var(--border); margin-bottom: 2px; padding-bottom: 6px; }
 
 .case-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius); font-size: 13px; cursor: pointer; }
@@ -802,6 +889,22 @@ h2 { margin: 0; font-weight: 500; }
 .dev-chip:hover { border-color: var(--border-strong, var(--text-accent)); }
 
 .case-toolbar { display: flex; gap: 6px; }
+.filter-wrap { position: relative; }
+.icon-btn { display: inline-flex; align-items: center; justify-content: center; padding: 3px 7px; position: relative; color: var(--text-secondary); }
+.icon-btn.on { color: var(--text-accent); border-color: var(--text-accent); }
+.filter-badge {
+  position: absolute; top: -5px; right: -5px; background: var(--text-accent); color: #fff;
+  font-size: 9px; line-height: 1; padding: 2px 4px; border-radius: 999px;
+}
+.menu-backdrop { position: fixed; inset: 0; z-index: 39; }
+.priority-menu {
+  position: absolute; top: 100%; left: 0; margin-top: 4px; z-index: 40; min-width: 100px;
+  display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  background: var(--surface-2); border: 0.5px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+.priority-menu-item { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.menu-clear { align-self: flex-end; }
 .case-id { flex-shrink: 0; }
 .case-mod { flex-shrink: 0; font-size: 12px; max-width: 25%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .case-purpose { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

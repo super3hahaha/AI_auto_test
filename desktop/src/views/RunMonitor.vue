@@ -62,7 +62,11 @@ function labelizeText(text: string): string {
   }
   return out;
 }
-onMounted(async () => {
+// RunMonitor 靠 v-show 常驻挂载（见 Runner.vue「执行台」容器），onMounted 只会跑这一次——
+// 场景库设备面板之后点「刷新」查到新型号/别名，只会更新磁盘缓存文件，不会自动触发这里重读。
+// 暴露 reload() 给 Runner.vue 在 loadDevices() 里主动调用，两边缓存才能对得上（真实症状：无线设备
+// 首次连接时看板还没查到型号显示 ip:port，场景库刷新后型号已知，看板标题栏却仍卡在 ip:port）。
+async function loadDeviceLabels() {
   try {
     const kvs = await api.readDeviceAliases();
     aliasMap.value = Object.fromEntries(kvs.map((k) => [k.key, k.value]));
@@ -71,7 +75,9 @@ onMounted(async () => {
     const kvs = await api.readDeviceModelCache();
     modelMap.value = Object.fromEntries(kvs.map((k) => [k.key, k.value]));
   } catch { /* 型号缓存读不到无妨，退化为显示 serial */ }
-});
+}
+defineExpose({ reload: loadDeviceLabels });
+onMounted(loadDeviceLabels);
 
 // 设备面板折叠态（按 serial 记，默认展开；纯 UI 态，不放 runStore）
 const collapsedMap = reactive<Record<string, boolean>>({});

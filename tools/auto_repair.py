@@ -22,8 +22,9 @@
 退出码:0=最终通过;2=判定App缺陷已停;3=判定脚本脆但claude未产生改动;
         4=claude无法判定/调用失败;5=自愈3次仍未通过;>0 其余为 run_flow 透传。
 """
-import csv, os, sys, subprocess, shutil, datetime, difflib, argparse
+import csv, os, re, sys, subprocess, shutil, datetime, difflib, argparse, fcntl
 from pathlib import Path
+from contextlib import contextmanager
 
 from _appctx import REPO, LEDGER, load_cfg, ledger_lock  # 多 App 路径解析
 import exec_ledger
@@ -69,6 +70,21 @@ AUTOREPAIR_VERDICT: APP_DEFECT
 AUTOREPAIR_VERDICT: UNKNOWN"""
 
 
+@contextmanager
+def script_lock(script_abs):
+    """固化脚本文件锁——多设备并行对同一用例触发自愈时，同一份 flow_*.sh 同一时刻只允许一个
+    claude 在改，避免三台设备各自诊断/写入互相覆盖(lost update)。跟 ledger_lock 是两把独立的
+    锁(那把只护账本 CSV)。阻塞式独占；进程退出/关闭 fd 自动释放。"""
+    lock_path = script_abs.with_suffix(script_abs.suffix + ".lock")
+    fh = open(lock_path, "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(fh, fcntl.LOCK_UN)
+        fh.close()
+
+
 def find_claude():
     """定位 claude 可执行文件:GUI/子进程 PATH 常不含用户 shell 目录,先查常见位置再 which 兜底。"""
     home = os.environ.get("HOME", "")
@@ -108,12 +124,20 @@ def run_flow_once(python, case, script, serial):
     return proc.returncode, "".join(buf)
 
 
+def _safe(s):
+    """跟 tools/adbkit.py 的 _safe() 用同一套清洗规则(冒号/点等转下划线)。无线设备 serial 形如
+    192.168.x.x:5555，adbkit.evid_dir() 落盘时会先清洗成 192.168.x.x_5555——这里拼路径若不做
+    同样清洗，算出来的 base 目录对无线设备永远对不上磁盘真实目录（2026-08-03 踩过：CUT-EDGE-01
+    因此判成"证据目录不存在"，见 docs/gotchas.md）。"""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", s or "default")
+
+
 def newest_attempt_dir(cfg, case, serial):
     """本次执行落证据的 attempt 目录(evidence/<slug>/<ver>/<run>/<case>/<serial>/<attempt>),取最新。"""
-    slug = cfg.get("app_slug") or cfg.get("app_name", "")
-    ver = cfg.get("app_version", "")
-    run_seg = cfg.get("run_id") or datetime.datetime.now().strftime("%Y%m%d")
-    base = REPO / "evidence" / slug / ver / run_seg / case / serial
+    slug = _safe(cfg.get("app_slug") or cfg.get("app_name", ""))
+    ver = _safe(cfg.get("app_version", ""))
+    run_seg = _safe(cfg.get("run_id") or datetime.datetime.now().strftime("%Y%m%d"))
+    base = REPO / "evidence" / slug / ver / run_seg / case / _safe(serial)
     if not base.exists():
         return base, None
     subs = [d for d in base.iterdir() if d.is_dir()]
@@ -209,6 +233,10 @@ def main():
     _model_note = AUTO_REPAIR_MODEL or "claude CLI 默认"
     print(f"[auto_repair] Claude 已启用(claude={claude_bin};模型={_model_note});最多自愈 {MAX_ATTEMPTS} 次。")
 
+    # 本设备失败时的脚本版本快照——用来识别脚本是否已被别的设备的自愈进程改过，
+    # 避免多设备同一用例并行自愈时重复调 claude、或用自己手里的旧内容覆盖别人的修复。
+    initial_snapshot = script_abs.read_text(encoding="utf-8")
+
     for attempt in range(1, MAX_ATTEMPTS + 1):
         print(f"\n[auto_repair] ===== 第 {attempt}/{MAX_ATTEMPTS} 次执行 {a.case} =====")
         code, out = run_flow_once(python, a.case, a.script, serial)
@@ -224,49 +252,66 @@ def main():
             print(f"\n[auto_repair] ✅ 第 {attempt} 次执行通过(exit 0)。")
             sys.exit(0)
 
-        # —— 异常退出:Claude 接管诊断 ——
+        # —— 异常退出:先看固化脚本是否已被其他设备的自愈进程改过 ——
+        # 三台设备并行跑同一用例都失败时,大概率只需要一台真正调 claude,其余复用它的修复即可。
+        current = script_abs.read_text(encoding="utf-8")
+        if current != initial_snapshot:
+            print("[auto_repair] 检测到固化脚本已被其他设备的自愈进程更新,先用新版本重跑一次,不重复调用 Claude。")
+            initial_snapshot = current
+            continue
+
         print(f"\n[auto_repair] ✖ 第 {attempt} 次异常退出(exit={code})。"
               f"Claude 接管诊断中(可能 1-2 分钟,请稍候)…")
         base, attempt_dir = newest_attempt_dir(cfg, a.case, serial)
         prompt = build_user_prompt(a.case, serial, attempt, a.script, out, base, attempt_dir)
 
-        before = script_abs.read_text(encoding="utf-8")
-        # 改脚本前先备份当前版本(只留最近一次),便于事后 review / 手动回滚
-        shutil.copyfile(script_abs, script_abs.with_suffix(script_abs.suffix + ".bak"))
+        # 同一份固化脚本同一时刻只允许一个设备的自愈在改——避免三台设备的 claude 并发
+        # Read+Edit 同一个文件导致互相覆盖(lost update)。
+        with script_lock(script_abs):
+            # 拿锁期间也可能被另一台设备的自愈进程改过，重新核对一次再决定要不要真调 claude
+            before = script_abs.read_text(encoding="utf-8")
+            if before != initial_snapshot:
+                print("[auto_repair] 等锁期间固化脚本已被其他设备的自愈进程更新,先用新版本重跑一次。")
+                initial_snapshot = before
+                continue
 
-        verdict, diag = run_claude(claude_bin, python, prompt, a.script)
-        print("\n[auto_repair] ── Claude诊断 ──")
-        print(diag or "(无输出)")
-        print("[auto_repair] ──────────────")
+            # 改脚本前先备份当前版本(只留最近一次),便于事后 review / 手动回滚
+            shutil.copyfile(script_abs, script_abs.with_suffix(script_abs.suffix + ".bak"))
 
-        if verdict == "APP_DEFECT":
-            note = f"疑似App缺陷(Claude诊断,未改任何文件):{diag_oneline(diag)};正式判定/登记issues请回 Claude Code"
-            append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
-            print(f"\n[auto_repair] 🛑 判定为被测 App 缺陷——已停,不重试、不改脚本。已记 log.csv「需人工介入」。")
-            sys.exit(2)
+            verdict, diag = run_claude(claude_bin, python, prompt, a.script)
+            print("\n[auto_repair] ── Claude诊断 ──")
+            print(diag or "(无输出)")
+            print("[auto_repair] ──────────────")
 
-        if verdict == "SCRIPT_FIX":
-            after = script_abs.read_text(encoding="utf-8")
-            if before == after:
-                note = f"Claude判脚本脆但未产生实际改动,无法自愈:{diag_oneline(diag)}"
+            if verdict == "APP_DEFECT":
+                note = f"疑似App缺陷(Claude诊断,未改任何文件):{diag_oneline(diag)};正式判定/登记issues请回 Claude Code"
                 append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
-                print("\n[auto_repair] ⚠️ 判为脚本脆却没改动脚本——停,记「需人工介入」。")
-                sys.exit(3)
-            diff = "".join(difflib.unified_diff(
-                before.splitlines(keepends=True), after.splitlines(keepends=True),
-                fromfile=a.script + " (before)", tofile=a.script + " (after)"))
-            print("\n[auto_repair] 📝 Claude改动固化脚本(导航/健壮性):")
-            print(diff)
-            print(f"[auto_repair] (原版本已备份到 {a.script}.bak)")
-            append_log(a.case, "Claude自愈", "执行中", "执行中",
-                       f"第{attempt}次失败后Claude patch固化脚本(导航/健壮性):{diag_oneline(diag)}", serial)
-            continue  # 回到循环重跑
+                print(f"\n[auto_repair] 🛑 判定为被测 App 缺陷——已停,不重试、不改脚本。已记 log.csv「需人工介入」。")
+                sys.exit(2)
 
-        # verdict is None / UNKNOWN
-        note = f"Claude无法判定失败根因(保守不改脚本):{diag_oneline(diag)}"
-        append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
-        print("\n[auto_repair] ❓ Claude无法判定——保守停,记「需人工介入」。")
-        sys.exit(4)
+            if verdict == "SCRIPT_FIX":
+                after = script_abs.read_text(encoding="utf-8")
+                if before == after:
+                    note = f"Claude判脚本脆但未产生实际改动,无法自愈:{diag_oneline(diag)}"
+                    append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
+                    print("\n[auto_repair] ⚠️ 判为脚本脆却没改动脚本——停,记「需人工介入」。")
+                    sys.exit(3)
+                diff = "".join(difflib.unified_diff(
+                    before.splitlines(keepends=True), after.splitlines(keepends=True),
+                    fromfile=a.script + " (before)", tofile=a.script + " (after)"))
+                print("\n[auto_repair] 📝 Claude改动固化脚本(导航/健壮性):")
+                print(diff)
+                print(f"[auto_repair] (原版本已备份到 {a.script}.bak)")
+                append_log(a.case, "Claude自愈", "执行中", "执行中",
+                           f"第{attempt}次失败后Claude patch固化脚本(导航/健壮性):{diag_oneline(diag)}", serial)
+                initial_snapshot = after
+                continue  # 回到循环重跑
+
+            # verdict is None / UNKNOWN
+            note = f"Claude无法判定失败根因(保守不改脚本):{diag_oneline(diag)}"
+            append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
+            print("\n[auto_repair] ❓ Claude无法判定——保守停,记「需人工介入」。")
+            sys.exit(4)
 
     # —— 三次仍未通过 ——
     append_log(a.case, "Claude接管", "执行中", "需人工介入",

@@ -42,6 +42,11 @@ apps/.trash/
 apps/*/apks/
 # 该 App 的多语言文案表（tools/lang_table.py 从翻译包/apk 生成，含该 App 实际业务文案，不入库）
 apps/*/lang/
+# 录制器（tools/recorder.py）产物：中间物，含设备 serial + 逐屏截图 + 该 App 实际业务路径，不入库。
+# 最终资产是它翻出来的 cases/*.yaml + flows/flow_*.sh（那两个自己有白名单规则）。
+apps/*/recordings/
+# 调试用临时 logcat 抓取，不是产物
+.tmp_logcat.txt
 
 # ── 桌面壳构建产物 ──
 desktop/node_modules/

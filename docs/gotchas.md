@@ -12,6 +12,7 @@
 - **坐标随分辨率变**：`tap X Y` 是绝对坐标，换设备/分辨率要重算。优先用 `ui` 拿到控件 bounds 再算中心点。
 - **`screencap` 对视频区可能全黑**（测视频播放器时）：视频常渲染在硬件 overlay / `SurfaceView`，`screencap` 读不到、返回黑块，**DRM 内容永远黑帧**。此时 `framediff` 帧差整个失效（播没播都是黑图）。用前先让视频在播、`screencap` 一张看视频区黑不黑；全黑就退回 `dumpsys SurfaceFlinger --latency`/`gfxinfo` 看帧推进，或人工目视。详见 `docs/evidence-video-playback.md`。
 - **media_session 未必发**（测视频播放器时）：自研/H5/WebView 播放器可能根本不发 MediaSession，`playback --session` 取不到 → "推进"轴改走 UI 进度条文案两次采样递增（归 `screenshots`），别丢掉推进轴。先在被测播放器上验一次取不取得到。
+- **真机跑一段时间会自动熄屏/锁屏**：熄屏后 `am start` 能把 Activity 拉起但界面不可见/不可点，后续 `ui`/`tap` 全部落空，看起来像"App 无响应"。`adbkit.py launch`（`cmd_launch`）已在开头调 `_ensure_awake()` 自愈：读 `dumpsys power` 的 `mWakefulness=`，非 `Awake` 就 `KEYCODE_WAKEUP` + 滑动解锁，无密码锁屏够用；**有密码锁屏这一下解不开**，仍会导致后续步骤失败，遇到了记 `BLOCK-`。
 - **小米/红米(MIUI)设备 ADB 模拟点击可能被系统整体拒绝**：`adb shell input tap/text/swipe` 发出去无报错、`ui dump` 也能正常拿到 bounds，但 App 完全收不到事件——UI 卡在原页面不动，看起来像"App 不响应/脚本失效"。真实原因是 MIUI 的安全限制：`logcat` 里会看到 `InputDispatcher: Permission denied: injecting event from pid X uid 2000 to window ... owned by uid <app_uid>`（2000=shell）。修复：手机上开启 设置→更多设置→开发者选项→**"USB调试(安全设置)"**（USB debugging (Security settings)，部分 ROM 需先登录小米账号联网验证）。这是设备侧手动开关，无法用 ADB 命令绕开（也正是它存在的意义），跑之前先确认这台 MIUI 设备该开关已开。判断优先级：先看 `adb -s <serial> logcat -d | grep "Permission denied: injecting"`，命中就是这个坑，别去怀疑脚本逻辑或 App bug。
 
 ## 三招确认包是否 debuggable（换包必查，决定 oracle 深度）
@@ -119,6 +120,7 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
   - `--assert-fail-result`：失败时写入结果列的判定词（默认「失败」）。
 - **WebView 插屏是 `--assert-gone` 的盲区**：AdMob Creative Preview 这类插屏内容在 WebView 里渲染，不进 uiautomator 树，`--assert-gone` 检测不到它。**兜住"被广告全屏盖住"要靠 `--assert-text` 断言首页控件在屏**——广告在最上层时，底下的首页控件本就不在树里，正向断言自然失败。`--assert-gone` 只对原生广告有效，当 belt-and-suspenders 用。
 - **flow 层同步改了**：`flow_cut_save.sh` 把 `01-home` 从清广告循环**之前**挪到**之后**，并挂 `--assert-text 音频裁剪 --assert-gone 测试广告 --assert-timeout 6`。凡是"截图即断言"的步骤，照此模式挂门控，别再让「通过」纯靠截到图。
+- **后续又撞了一次同类假阳性——这次是门控本身的时序漏洞（2026-08-04）**：`cmd_shot` 原实现是「先 `screencap` 截图 → 再跑 `--assert-text` 轮询」。轮询期间会自己插 `_sweep_loop` 清障，等到轮询判定「通过」时屏幕可能已经被后续清障点干净了，但**截图是轮询开始前就已经截好、写死的**——判定用的是"轮询结束后"的状态，存证截图却是"轮询开始前"的状态，两者对不上。真机实测 `RING-SET-01` 的 `01-home`：截图定格在隐私同意弹窗 + Test Ad 插屏，`evidence.csv` 却记「通过」（`--assert-text 我的铃声 --assert-timeout 10` 轮询过程里把弹窗清掉后才判定成立）。**修**：把 `screencap`/`pull` 挪到 `--assert-text`/`--assert-gone` 轮询**跑完之后**（轮询本身只读 `_dump_tree()`，不依赖截图），最后再截图存证，保证图和判定结果永远对应同一时刻。
 
 ## 选中音频进编辑器会自动播放，dump 可能撞上重绘瞬间产生非法字节（2026-07-03）
 
@@ -136,7 +138,7 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 
 把原来"在长列表里 `taptext` 精确点选"改成"点搜索图标 → 输入文件名 → 点结果"后，真机探路踩了三个坑：
 
-- **系统默认输入法必须是不带联想的英文键盘**：`adbkit text` 命令本身没问题（`shlex.quote` 正确转义），但如果设备当前 IME 是拼音等联想输入法，`adb shell input text "mp3-sample-track.mp3"` 送进去的原始按键会被 IME 拦截联想改写，实测变成"门票－3sample－track。门票3"这种乱码，搜索自然找不到结果。表现上像是"文本被截断/损坏"，实际是 IME 层面的问题，不是 adbkit 或 shell 转义的 bug。**排查时先确认 `adb shell settings get secure default_input_method` 和当前 IME 语言（`dumpsys input_method | grep imeSubtypeListItem`）是不是英文。**
+- **系统默认输入法必须是不带联想的英文键盘**：`adbkit text` 命令本身没问题（`shlex.quote` 正确转义），但如果设备当前 IME 是拼音等联想输入法，`adb shell input text "mp3-sample-track.mp3"` 送进去的原始按键会被 IME 拦截联想改写，实测变成"门票－3sample－track。门票3"这种乱码，搜索自然找不到结果。表现上像是"文本被截断/损坏"，实际是 IME 层面的问题，不是 adbkit 或 shell 转义的 bug。**排查时先确认 `adb shell settings get secure default_input_method` 和当前 IME 语言（`dumpsys input_method | grep imeSubtypeListItem`）是不是英文。** **2026-08-04 已根治**：`cmd_reset` 现在每次都会顺手把默认 IME 切到 `com.github.uiautomator/.AdbKeyboard`（uiautomator2 自带的哑键盘，没有联想引擎，缺包自动推装），走 flow 脚本（都以 `$AK reset` 开头）不会再撞上这个坑；见 `tools/adbkit.py` 的 `_ensure_ascii_ime()`。手工探路/裸调 `adbkit text` 时没经过 `reset` 仍可能撞上，遇到乱码先 `adb shell ime set com.github.uiautomator/.AdbKeyboard` 再试。
 - **搜索结果列表里 `taptext` 精确匹配文件名会命中 2 个节点**：第 0 个是搜索框自身（EditText 回显了刚输入的文本，`text` 属性跟输入内容完全相等），第 1 个才是真正的列表项。~~必须显式传 `--index 1`~~。**⚠️ 2026-07-20 已弃用「文本+--index 1」这套定位，改按列表项 id `tapid tv_name`**——见下方补记：结果行异步渲染 + u2 dump 偶发半份树时匹配数会从 2 掉到 1，`--index 1` 越界挂脚本。搜索框 id=`search_edit_text`、结果行标题 id=`tv_name`，按后者点与搜索框回显彻底解耦。
 - **素材必须在进入「选择音频」页面之前就推送并触发媒体扫描完成**：这个页面进入时把音频列表一次性加载到内存，之后才 `adb push` + 广播扫描的文件，即使 `content query` 已经能查到 MediaStore 记录，页面内搜索仍然"没有结果"——因为它搜的是打开时的快照，不是实时查 MediaStore。退出页面（连按两次返回，第一次退搜索框、第二次退整个 App 到桌面）重新进，让它重新加载列表，新文件才会出现。两个固化脚本都是先 push+扫描、再 launch，顺序本来就对；只是探路/调试时如果先进了页面再补推文件，会被这个坑绊一下，别误判成"文件没推成功"。
 
@@ -173,7 +175,7 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 
 ## Tauri webview 里 `window.confirm()`/`alert()` 不可靠，删除类操作要用 `@tauri-apps/plugin-dialog`（2026-07-22）
 
-- 原生 `window.confirm()` 在 Tauri v2 的 webview 里不会真的阻塞弹出系统对话框，很多情况下静默直接返回——用户没看到确认框，点删除就直接执行了。必须换成 `@tauri-apps/plugin-dialog` 的 `confirm()`/`message()`（项目已装该插件，`api.ts` 里 open/save 已在用），见 `desktop/src/views/Runner.vue` 的 `removeApp`。`Devices.vue` 里删除设备别名那处还是旧的原生 `confirm()`，同款坑没修。
+- 原生 `window.confirm()` 在 Tauri v2 的 webview 里不会真的阻塞弹出系统对话框，很多情况下静默直接返回——用户没看到确认框，点删除就直接执行了；**更隐蔽的反向坑（2026-08-04 实测）：静默返回值也可能是假，导致 `if (!confirm(...)) return` 直接短路，点删除看起来毫无反应，接口压根没被调用**，表现成"这一条设备死活删不掉，别的都正常"（偏随机，不是这一行设备本身有什么特殊）。必须换成 `@tauri-apps/plugin-dialog` 的 `confirm()`/`message()`（项目已装该插件，`api.ts` 里 open/save 已在用），见 `desktop/src/views/Runner.vue` 的 `removeApp`。**`Devices.vue` 的 `removeDevice` 已在 2026-08-04 同步改用 `plugin-dialog`，这条坑不再复现**——以后新增任何"删除/确认"交互，起手直接用 `plugin-dialog`，别再用原生 `confirm`/`alert`。
 - 「删除 App」不做硬删除：`apps/<slug>/` 整个 rename 进 `apps/.trash/<slug>__<时间戳>/`，防手滑误删用例/固化脚本/账本却没法找回；`.trash` 前缀 `.` 让 `list_apps` 天然跳过，不会冒出来当成一个 App，也加进了 `.gitignore`。
 
 ## UI dump 两后端可切；shell/u2 的树可能不同 + 千万别在同进程内交错 dump（2026-07-20）
@@ -515,6 +517,8 @@ App 的 `strings.xml` 本地化文案——固化脚本写死了固化当时设�
 **RunMonitor.vue 专属的第三层坑：日志正文里的 serial 不是模板字段，是文本内容本身**。矩阵/摘要那层是模板插值（`{{ s }}`）能直接换 `deviceLabel()`；但右栏「实时过程」的每一行日志文本，是固化脚本（`tools/flow_media.sh` 约定的 `log(){ echo "[$S] $*"; }`）自己拼好之后原样透传上来的字符串（如 `"[192.168.209.207:5555] 已重推固定素材并触发媒体扫描"`），$S 就是原始 adb serial——这个字符串是**执行时生成的日志内容**，不是渲染时才决定怎么显示的字段，模板层面没有"要不要显示别名"这个可插手的点。子标题「格日志：`${serial}/${caseId}`」同理，来自 `M.selectedKey`（`serial|caseId` 拼出来的 key），也不是模板字段。
 **修法**：只能在渲染前对已知 serial 做字符串替换——`knownSerials`（本轮 `serials()` ∪ 别名表/型号表 key）逐个在文本里 `includes` 命中就 `split/join` 替换成 `deviceLabel()`（`labelizeText()`），`shownLines` 计算属性和 `selectedKeyLabel` 都过一遍这层。**残留限制**：只替换"已知是本轮设备"的 serial 字符串，日志正文里其它偶然出现的数字/IP（比如断言文案里贴的接口地址）不会被误伤，但也意味着如果日志里出现了本轮没连接过、纯手动登记的历史 serial，不会被替换。
 
+**第四处（2026-08-03 才发现）：`tools/doc_report.py` 的 `device_label()`**——之前只有 别名>原始serial 两级，没接 `device_model()`（`config/device_info_cache.json` 的 `model` 字段），无线设备没登记别名时 Doc 报告标题区/复现设备列直接显示 `192.168.209.239:5555` 这种纯地址。同一套优先级补齐：别名 > 型号 > 原始 serial。三处前端 fix 之后这条本该一起补，当时漏了——同一个坑分四次踩，改的时候记得搜一圈"谁还在读 device_aliases.json 却没接 model 兜底"。
+
 ## zip 文件名非 UTF-8 编码（GBK）→ `unzip`/Python `zipfile` 默认按 cp437 解出乱码
 
 某些国内工具（如翻译导出工具）打包的 zip，文件名用 GBK 而非 UTF-8 编码；ZIP 格式
@@ -556,6 +560,17 @@ App，只要设备不是中文，大概率会在这同一个 CMP 弹窗上卡住
 **残留限制**：只覆盖了"中文 / CMP 语言包没覆盖时的英文兜底"这两种，如果某语言 CMP 有
 自己的本地化译文（比如日语真翻成了日语而不是退化成英文），这条规则还是接不住，出现再
 按同样方法（真机 dump 读 `content-desc`）补一条。
+
+**2026-08-04 追加实锤**：即使设备是中文，同一个 CMP 弹窗按钮文案也不保证是"同意"——
+XQ_AT72 真机 MP3Cutter SPLIT-CORE-01 撞到的这版 CMP 弹窗按钮文案是**"接受"**（标题"管理
+数据和隐私偏好设置"），`consent-agree` 规则原来的中/英候选一个都对不上，`sweep` 认识的
+只有另外两条广告关闭规则，弹窗全程没被点掉——后果不是清障死循环，而是 `shot --assert-text`
+在 12s 内反复 sweep 仍等不到首页控件，直接判「失败」（断言不成立），日志上只看得到"清障点
+掉了 2 个广告"，看不出还剩个没人认识的弹窗，容易误判成"sweep 偶发失效"。已把
+`{"by":"text","value":"接受"}`/`{"by":"desc","value":"接受"}` 和英文 `Accept`（partial）追加进
+`consent-agree` 候选列表。**教训**：同一 CMP SDK 不同接入方/不同版本，按钮文案本身就可能不
+统一（"同意"/"接受"/"我同意"...），别假设"中文设备=同意"，排查"断言失败但看着像广告没关
+干净"时，先去失败截图上肉眼确认按钮原文，再决定加哪个词，不要只按语言判断该补哪种兜底。
 
 ## 账本锁 ledger_lock：flock 同进程不可重入，嵌套必须走计数（2026-07-28）
 
@@ -1144,3 +1159,542 @@ caseId + 媒体目录名双锚定，别只匹配六位数字（日志正文里�
 **顺带**：定位这类"只在 WebKit 出现"的布局问题不用瞎猜——`swiftc` 起个 20 行的 WKWebView 壳，
 把 `vite build --base ./` 的产物 + 注入的假 `window.__TAURI_INTERNALS__.invoke` 一起加载，就能在
 真引擎里跑真组件并用 `ResizeObserver` 逐帧打点（本轮探针在 scratchpad，未入库）。
+
+## 2026-08-03：`sweep()` 的通用清障规则会误吞 App 自己的合法确认弹窗
+
+固化「看广告解锁」类流程（`apps/MP3Cutter/flows/flow_unlock_*.sh`）时踩到：`config/ad_rules.json`
+里的 `dialog-outside-tap-fallback` 规则（专治"好评弹窗"这类 `setCanceledOnTouchOutside(true)` 的
+标准 AlertDialog，靠"点弹窗外部空白"关闭）作用域是"任意页面"，如果 App 自己的合法确认弹窗
+（如本例的「Change MP3 audio cover for free」解锁弹窗）也用标准 AlertDialog 外观，会被这条规则
+一并点掉——表现为：流程走到该弹窗这一步之后再调用通用 `sweep()`，弹窗刚出现就消失，下一步断言
+"弹窗弹出了没" 永远查不到，且现象很像"这次没触发"而不是"被清障吞了"，容易误判方向排查半天。
+
+**判据**：某个动作后**该出现的目标弹窗断言一直失败**，但截图/日志里能看到 `sweep` 报告
+`dialog-outside-tap-fallback` 命中过——先怀疑清障把自己的弹窗关了，不是功能没触发。
+
+**修法**：在可能触发 App 自身确认弹窗的动作之后，先 `waitfor text "<目标弹窗特征文案>" --timeout 3`
+探一次，**探不到才**当作"这是普通插屏广告"去调用完整 `sweep()`；不要不分青红皂白先 sweep 一轮再判断。
+
+## 2026-08-03：`bounds`/`tapid` 命中多个同 id 节点默认只返回第 0 个，不是"每行一条"
+
+`adbkit.py bounds id/text/desc <值>` 命中多个匹配节点时，**不带 `--index` 默认只返回第 0 个**
+（跟 `tapid`/`taptext` 的默认行为一致）。写"遍历列表逐行勾选 checkbox"这类脚本时，容易想当然地
+认为一次调用会把所有匹配的 `CENTER=` 行都打印出来、再用 `sed -n "${i}p"` 分行取——实际上**只会
+拿到同一个第 0 个节点的坐标**，导致"选3个只勾中1个"这类难以第一时间联想到根因的失败。
+
+**判据**：批量勾选/批量取同 id 节点坐标的循环，实测总是只对第一项生效——先检查有没有传 `--index`，
+不是 UI 没渲染完/List 没加载够。
+
+**修法**：显式 `for idx in 0 1 2; do bounds id X --index "$idx" ...; done`，每次指定要第几个。
+
+## 2026-08-03：同一个 App 里不同 tab 的"勾选控件"可能不是同一个 resource-id
+
+MP3Cutter 的「选择音频」页里，`All`/`Folders` 本地列表 tab 的勾选框真实 id 是 `checkbox`，但
+`Online Ringtones` tab 的勾选控件真实 id 是 `tv_select`——同一个页面、同一个视觉样式（方框打勾），
+两个 tab 却是完全不同的 Android 布局/id，照抄别的 tab 用过的 id 会直接找不到节点（这条早在
+`MERGE-COUNT-01` 用例头注里记录过，本轮固化在线铃声多选流程时又踩了一次，说明这条坑容易被
+"看起来长得一样"误导而忽略）。
+
+**判据**：勾选框看起来和别处一模一样，但 `find`/`bounds` 就是找不到——换个 tab/页面就必须重新
+`ui` dump 核实真实 id，不能跨 tab 复用。
+
+## 2026-08-03：MP3Cutter Cutter 编辑器左上角返回箭头无 resource-id，退出确认弹窗按钮 id 跟文案对不上
+
+固化 `UNLOCK-ALBUM-01`（验证解锁状态按文件持久化，需要退出编辑器再回选图页重新点 Use）时真机
+dump 确认：Cutter 编辑器工具栏的返回箭头是一个 `resource-id=""`、`text=""`、`content-desc=""` 的
+纯 `android.widget.ImageButton`（bounds 大致在左上角 `[0,83][154,237]`），`tapid`/`taptext`/`find`
+三个选择器都点不到。改用系统 BACK 键（`$AK key 4`）效果等价——真机验证过两种方式触发的是同一个
+「Exit before saving?」二次确认弹窗（跟 `flow_cut_fmt.sh` 回首页绕开的是同一条退出确认逻辑）。
+弹窗里那颗蓝色确认按钮 **resource-id 是 `btn_undo`，但文案显示的是「Exit」**——id 名和实际语义/
+文案完全对不上，容易被 id 名误导以为是"撤销"相关功能；`taptext "Exit"` 按文案点更直观也更不容易
+踩坑。点了 Exit 之后大概率还会弹一次全屏插屏广告（真机复现过 AdMob 测试广告），跟解锁广告无关，
+`sweep()` 清掉即可，不要用 `waitfor` 卡在这一步等。
+
+**判据**：编辑器页需要"返回上一页"时，没有明显 resource-id 的返回箭头 → 优先试系统 BACK 键
+（`key 4`），别死磕坐标点击；退出确认弹窗按钮 `tapid` 找不到预期效果时，先用真机 `ui` dump 核对
+resource-id 和显示文案是否对得上，不要假设 id 名就是文案含义。
+
+**2026-08-03 补充：这类"三属性全空"的控件其实能精确点，不必只能靠 BACK 键兜底。**
+它虽然自身 `resource-id`/`text`/`content-desc` 全空，但**父节点有唯一 id**——返回箭头就是
+`id=toolbar` 的第 0 个子节点。`bounds --child` 本来只支持一层，同日已扩成接受多级路径
+（`--child 2,0,1` 逐级下钻），所以现在统一写法是：
+
+```bash
+set -- $($AK bounds id toolbar --child 0 --timeout 8 | sed -n 's/^BOUNDS=//p')
+$AK tap $(( ($1 + $3) / 2 )) $(( ($2 + $4) / 2 ))   # 坐标现算，脚本里无硬坐标
+```
+
+真机验证过这条路能点出同一个「Exit before saving?」弹窗。`adbkit nodes` 会自动为每个无选择器
+节点算出这个父锚（`anc` 字段：最近的唯一选择器祖先 + `--child` 路径），录制器据此把这类控件
+也画成可点的框（蓝色），不用人肉数子节点序号。
+
+**同一个箭头在不同页属性还不一样**：Cutter 编辑器页三属性全空，但「Audio Saved」页的同位置
+返回箭头有 `content-desc="Navigate up"`（`tapdesc` 直接能点）。所以别把"这个 App 的返回箭头
+没法用选择器点"当成全局结论，**逐页 dump 确认**。BACK 键仍是最省事的兜底，但它跟点箭头不完全
+等价（有些页 BACK 会被 App 拦去做别的处理），要精确复现用户点箭头这个动作时用父锚那条路。
+
+## 2026-08-03：小米设备（23129RN51X / Android 15）`uiautomator dump` 被系统直接 SIGKILL
+
+录制器 demo 在小米 `4PR8CYQ8U8S4FUEE` 上第一次 dump 就失败，adbkit 报「拉取 UI 树失败」。手动跑
+一遍才看清根因：
+
+```
+$ adb -s 4PR8CYQ8U8S4FUEE shell 'uiautomator dump /sdcard/_t.xml; echo rc=$?'
+rc=137        # 137 = 128+9，SIGKILL
+Killed
+```
+
+不是 adbkit 的「null root node」那类偶发抽风（那种 returncode=0、错误只在 stderr，见上文
+2026-07-29 那条），而是 **dump 进程被系统整个杀掉**，一次都没成功过 —— MIUI/HyperOS 的后台进程
+管控会杀掉 shell 起的 uiautomator。同一时刻同一台机器 `adb shell screencap` 正常，说明 adb 通道
+本身没问题，只有 uiautomator 这条被针对。
+
+**影响面**：`shell` 后端（默认）在这台机器上完全不可用 → `ui`/`nodes`/`tapid`/`waitfor`/`sweep`
+全线不可用（它们都依赖 dump）。截图类命令（`shot`）不受影响。
+
+**怎么办**：
+- 换台设备（Pixel 4 上一切正常，demo 就是在它上面验的）；
+- 或在该机上关掉省电/后台限制再试（MIUI 的「省电策略」「后台弹出界面」那组开关），未逐项验证过
+  哪个开关是关键；
+- 或改用 `u2` 后端（atx 常驻组件是个真 app，不受 shell 进程管控那套限制）——但装 atx 有它自己的
+  代价（污染被测环境 + atx server 本身会被省电策略杀，见 decisions #30），换设备通常更划算。
+
+**判据**：某台机器 dump 一次都不成功（不是偶发），先手动跑一遍看 rc 是不是 137；是 137 就别去
+调 adbkit 的重试参数了，那是设备侧管控，重试多少次都一样。
+
+## 2026-08-03：`nodes` 的 w/h 是「节点包围盒」不是屏幕尺寸——拿它当基准画控件框会整体放大
+
+录制器（`tools/recorder.py` + 桌面壳「录制器」tab）画控件框时，把 `adbkit nodes` 输出的 `w`/`h`
+当成了屏幕尺寸。真机上表现为：**前台是普通页面时一切正常，一旦弹出对话框，框就整体放大糊成盖住
+半屏的一大块**（用户看到的是"一块异常色块盖在画面上"，很难联想到是坐标基准问题）。
+
+根因：`w`/`h` 是**所有节点 bounds 的包围盒**（`max(x2)`/`max(y2)`）。前台是对话框时，
+`uiautomator dump` 只报对话框那一个窗口，包围盒因此只有 `1052x1373`；而 `screencap` 截的始终
+是整屏 `1080x2280`。用 1373 当高度基准算百分比，`top=924/1373=67%` 而正确值是 `924/2280=40.5%`，
+高度也被放大 1.66 倍。
+
+**修法**：后端从 PNG 的 IHDR 直接读真实像素，随 probe 一起返回 `shot_w`/`shot_h`（见
+`recorder.py: png_size()`），前端**只用**它当基准，拿不到时退回 `img.naturalWidth`，**绝不退回
+`w`/`h`**——宁可先不画框，也不能画错位置（画错位置比不画更坏：用户会点在错误的控件上）。
+
+**判据/通用教训**：任何"UI 树坐标 ↔ 截图像素"的换算，基准必须来自**截图本身**，不能来自节点树
+推算的任何数值。这两个坐标系的**单位相同（都是设备物理像素）但覆盖范围不同**，普通页面下恰好
+接近、于是测不出问题，只有对话框/浮窗这类"只报单窗口"的场景才暴露——很容易被当成偶发。
+
+**同时修的第二件事**：同一块矩形上常叠着多个 bounds 完全相同的容器节点（该对话框有 6 个：
+`action_bar_root`/`content`/`parentPanel`/`customPanel`/`custom`/`ViewGroup`；普通页面的根
+`FrameLayout` 同理）。给它们各画一个框既无信息量、又在 WKWebView 下叠出诡异的渲染效果，点击还
+不确定命中哪个。现在同 bounds 只保留一个（优先能唯一定位的，同等条件取更内层的），折叠掉几个在
+tooltip 里说明。该对话框屏因此从 9 个框降到 4 个。
+
+## 2026-08-03：keep-alive 保活的视图里，`document.querySelector` 会量到别的 tab（录制器框整屏消失/错位）
+
+桌面壳的 tab 切换是 `App.vue` 里一串 `v-if`，默认切走就销毁重挂。录制器的状态（步骤列表 + 当前屏
+截图）**只在内存里**，所以切去看一眼设备/证据再回来，等于白录一遍——必须进 keep-alive 名单
+（`:include="['Runner', 'Recorder']"`）。但保活之后有两个连带坑：
+
+1. **`document.querySelector(".stage")` 会跨视图串台**。被 keep-alive 挂起的组件 DOM 还在（Vue 把
+   它移到一个游离容器里，不是卸掉），而 `Evidence.vue` 里也有个 `.stage`——切到证据页后，录制器那
+   个 resize 回调一跑，全局选择器量到的是**证据页的 stage**，`imgBox` 被算成垃圾值，切回来控件框
+   整体错位。**保活视图内一律用模板 ref，不用全局选择器**。
+2. **`onMounted` / `onUnmounted` 只在首次挂载/整体销毁跑**。切走走 `onDeactivated`、切回走
+   `onActivated`。录制器有两处非它不可：img 已解码过、切回来**不会再触发 `@load`**，得在
+   `onActivated` 里自己 `nextTick + measure()` 重量一次；挂起期间 `getBoundingClientRect()` 全是
+   0，得在 `onDeactivated` 里 `alive = false` + 断开 ResizeObserver，否则 0 尺寸会覆盖掉
+   `imgBox`（表现：切回来一个框都没有，得手动「重新探屏」才恢复）。
+   注意 `onActivated` **首次挂载时也会跑一次**（紧跟在 `onMounted` 后面），凡是在里面做拉数据的，
+   得用一个 flag 跳过第一次，不然每次冷进这个 tab 都双请求。
+
+**顺手修的**：`window.addEventListener("resize", measure)` 把 Event 当第一个实参传进去了，而
+`measure(retry = 4)` 的第一个形参是重试次数——`retry` 成了个 Event 对象，`retry > 0` 恒 false，
+换屏后那套「等图解码完再量」的重试保护在 resize 路径上等于没有。带默认参数的函数**不要直接**挂给
+事件监听，包一层 `() => measure()`。
+
+## 2026-08-03：录制器控件框「色块 + 偏移」排查复盘（四个独立原因，别只记住一个）
+
+录制器的控件框叠加层，在浏览器（Chromium）里怎么测都对，移植进桌面壳「录制器」tab 后出了色块和
+整体偏移。**这不是一个 bug，是四个独立原因叠在一起**（下面 1~4），排查时我一直在渲染层找，
+方向错了好几轮 —— 真正的大头是第 2 条「取数时序」，跟 CSS 无关。
+
+先说那条一直成立的前提：**Tauri 不打包 Chromium，用系统 WebView** —— macOS 上是 WKWebView
+（Safari 引擎），Windows 上才是 WebView2（Chromium）。所以：
+
+- **验证方法论**：浏览器版能验证的是**逻辑**（选择器推导、diff、坐标换算）；**CSS/渲染必须在桌面壳
+  窗口里看**。拿 Chromium 的结果宣布桌面版没问题，会来回折腾好几轮（这次就是）。
+- 同一个 bug 在 Windows 上可能根本不出现（那边是 Chromium），别当成"全平台都这样"。
+- 同类先例：本文档「`overflow-x: auto` + 自动高度的滚动条条在 WKWebView 下晚一拍改高度」。
+
+**四个原因**：
+
+1. **半透明 `dashed` border 的盒子，在 WKWebView 下会被填上底色、还冒出圆角**。表现为控件框区域出现
+   诡异色块（`getComputedStyle` 查 `backgroundColor` 明明是 `rgba(0,0,0,0)`，Chromium 下也完全正常）。
+   叠得越多越明显——对话框那屏有 6 个 bounds 完全相同的容器节点，6 层框叠在一起时整块糊掉。
+   **修法**：改用 `outline` 画框（不进盒模型、渲染路径也不同）+ 边框色用不透明值；顺便把同 bounds
+   的重复容器折叠成一个（那 6 个框本来也没信息量，见上一条 gotcha）。
+
+2. **控件框整体偏移的真因是「截图和 UI dump 不是同一瞬间的状态」，不是 CSS**（排查绕了一大圈，
+   记下来免得下次又往渲染层找）。`uiautomator dump` 会等 `waitForIdle` 才序列化（~2.2s），报的是
+   **动画结束后的最终布局**；`screencap` ~0.9s 就拍完，拍的是**即时帧**。原来两者并行抓，中间 1s+
+   的窗口里只要有弹窗动画/慢弹窗，按 bounds 画的框就整体偏（真机取证：BACK 弹出退出确认框后 0ms
+   并行抓，Exit 按钮实测像素比 bounds 小一圈、中心偏 40px+；150ms 后才稳定）。
+   **修法**：`probe()` 改成**串行**——先 dump，dump 里的 `waitForIdle` 返回后再截图，让截图落在与
+   节点树同一个稳定时刻。每步慢约 1s，换框和图必然贴合。
+   **判据**：框只在「有弹窗/转场动画的那屏」偏、静止页面正常 → 先怀疑取数时序，别改 CSS。
+
+3. **另有 10px 的固定下移，来自 CSS 类名撞车**：控件框的状态类当时用了裸的 `ok`/`amb`/`anc`，而
+   同组件里 `.ok` 是消息横幅样式（`margin: 10px 0`）。**absolute 元素的 `margin-top` 会叠加在
+   `top` 之上**，于是框固定下移 10px —— 特征是**只偏 y、不偏 x，且是整数 CSS 像素**。
+   **修法**：状态类加前缀（`b-ok`/`b-amb`/`b-anc`）。**判据**：偏移量是"整数 CSS 像素的纯垂直
+   平移"时，先去 grep 类名是否撞上带 margin 的样式，别急着怀疑坐标基准。
+
+4. **框层与图片层的对齐，用 CSS 约束而不是 JS 测量**。曾用「JS 测 img 矩形 → 算比例 → 定位框」，
+   但 `img` 换 `src` 后浏览器会**保留上一张图的尺寸**直到新图解码完，那一刻量到的是旧值；也试过
+   `aspect-ratio`，与 `height:auto` 算出的高度未必逐像素一致。最终写法：框放进 `.overlay`
+   （`position:absolute; inset:0`），它铺满一个由 `img` 撑开的 `.frame` ⇒ 与 `img` 严格同尺寸同
+   位置，不含任何数值计算，跨引擎都成立。`.overlay` 要 `pointer-events:none`、框自身 `auto`，
+   滑动/长拖的 mousedown 才能穿透到底层容器。
+
+**通用教训**：需要两个 DOM 层严格对齐时，优先用 CSS 约束（`aspect-ratio` / 同一个父的同款尺寸规则）
+让它们天然同尺寸，而不是"量一个、算另一个"——后者永远存在测量时机的问题，且跨引擎表现不一致。
+
+## 2026-08-03：`newest_attempt_dir()` 拼路径没清洗 serial，无线设备(`ip:port`)的证据目录永远"找不到"（框架级 bug，已修）
+
+**现象**：`issue_register.py` 自动登记 CUT-EDGE-01（无线设备 `192.168.209.239:5555`）时，headless
+claude 判了 UNCERTAIN：`证据目录 evidence/.../CUT-EDGE-01/192.168.209.239:5555 实际上并不存在
+（ls 报错 No such file or directory）...log.csv 只给出 exit≠0 的框架结论，没有任何可引用的具体
+观测数值`。看起来像"查错了地方"，但 claude 没有瞎猜——它是照着框架喂给它的路径去查的，框架自己
+算错了路径。
+
+**根因**：证据目录落盘时（`tools/adbkit.py` 的 `evid_dir()`）用 `_safe()` 把 serial 里的冒号清洗
+成下划线（`192.168.209.239:5555` → `192.168.209.239_5555`），但 `tools/auto_repair.py` 的
+`newest_attempt_dir()`——被 `judge_result.py` 和 `issue_register.py` 共用，用来定位"本次执行的
+证据目录"——拼路径时直接拿**原始 serial**（带冒号），完全没做同样的清洗。两处清洗规则不一致，
+导致：
+1. `newest_attempt_dir()` 算出的 `base` 目录对**所有无线设备**（serial 带冒号）永远不存在，
+   `attempt_dir` 恒为 `None`；USB 设备（serial 无冒号）不受影响，因为清不清洗结果一样。
+2. `judge_result.py` 把这条错误的（不存在的）冒号路径当"证据链接"写进了 `queue.csv`/
+   `executions.csv`（历史行例：[queue.csv:402](../apps/MP3Cutter/ledger/queue.csv)）。
+3. `issue_register.py` 的 `build_prompt()` 因为 `attempt_dir` 是 `None`，喂给 headless claude 的
+   证据文件列表是空的（"本次 attempt 目录暂无证据文件"），它只能看到 log.csv 里"exit≠0"这句框架
+   结论，判 UNCERTAIN 是**正确执行了"拿不准就停、不要瞎编"的规则**，不是它的锅。
+
+同一现象在早前的人工核对里，误以为是"凭设备型号(Pixel_4)猜错了目录名"——那其实是审阅时把
+Evidence.vue 显示的设备别名(型号)错当成了路径段去核对，跟这条框架 bug 是两回事，一并记录避免
+以后混淆归因。
+
+**修法（已修，见 [tools/auto_repair.py](../tools/auto_repair.py) `_safe()`/`newest_attempt_dir()`）**：
+`newest_attempt_dir()` 拼 slug/ver/run_seg/serial 各段前都先过一遍跟 `adbkit.py` 完全一致的
+`_safe()`（`re.sub(r"[^A-Za-z0-9._-]", "_", s)`），跟磁盘上真实目录对齐。**教训**：任何"把 serial
+当路径段拼"的地方，都必须复用同一套清洗规则，不能各写各的——这是本仓库第二次踩这个坑了（上一次
+是 `Evidence.vue`/`Runner.vue` 反查 aliasMap 时的清洗不一致，见上文"无线连接的设备 serial 是
+`ip:port` 形式"那条）。**历史遗留**：修复前生成的 `queue.csv`/`executions.csv`/`log.csv` 里带冒号
+的证据路径是错的（指向不存在的目录），真实证据在对应的下划线路径下，人工核对时留意甄别；
+CUT-EDGE-01 这条当时判 UNCERTAIN、未真正登记进 `issues.csv`，需要用修复后的代码重新触发一次
+`issue_register.py` 补登记。
+
+## 2026-08-03：录制器截图和 UI dump 并行抓取 ≠ 同一瞬间——弹窗动画期间控件框整体偏移（已修）
+
+**发现经过**：排查「录制器控件框偏移」（真凶最后查明是下一条的类名撞车）时顺藤摸出的**另一个
+真实缺陷**——两个 bug 症状相似（框和图对不上），这条是采集时序问题，只在界面还在动时出现。
+
+**机理**：`tools/recorder.py` 的 `probe()` 为了省时间把 `screencap` 和 `adbkit nodes`（uiautomator
+dump）**并行**抓。但两者天生不是同一瞬间的状态：dump 要等 uiautomator waitForIdle 后才序列化
+（~2.2s），报的是**动画结束后的最终布局**；截图 ~0.9s 就拍完，拍的是**即时帧**。中间 1s+ 的
+窗口里只要界面还在动（对话框缩放淡入、慢弹窗、广告刷新顶开布局…），图和 bounds 就对不上。
+真机取证：BACK 弹出确认框后 0ms 并行抓，Exit 按钮实测像素 (562,1214,864,1288) vs bounds
+(562,1174,947,1307)——小一圈且中心偏 (-42,+10)px，正是用户看到的偏移；150ms 后才稳定。
+
+**修法（已修，`recorder.py probe()`）**：改**串行**——先 dump 后截图。dump 的 waitForIdle 就是
+现成的"等动画结束"栅栏，截图跟在它后面拍到的必然是同一稳定时刻。代价是每次探屏慢 ~1s，换
+框和图严格贴合。**教训**：凡是"两个来源的数据要叠在一起呈现/比对"（截图+节点树、截图+断言），
+就不能并行采集，除非能证明界面静止；"并行提速"这种优化要先问一句两份数据是否要求同一时刻。
+
+## 2026-08-03：录制器控件框整体下移 10px——`:class` 的状态值撞上同组件消息横幅的 `.ok`（已修）
+
+**现象**：桌面壳录制器里黄色虚线控件框相对元素**恒定往下偏**；浏览器版（recorder_ui.html）
+完全正常。肉眼看着像"差一点"，实测特征极有辨识度：**x 分毫不差、宽高分毫不差、y 恒 +10px**。
+
+**排查路径（记下来是因为方法比结论值钱）**：数据侧（bounds vs 截图像素）→ 渲染侧（把
+Recorder.vue 的 stage/frame/overlay 那套 CSS 连真图真 bounds 复刻成独立页面，在 Chromium 和
+playwright-webkit 里量，偏差都 <0.05px）→ 全排除后，**往 dev 模式的 app 里热更临时诊断代码**
+（vite HMR 会直接推进用户开着的 WKWebView 窗口；诊断每 2s 把 img/overlay/各框的
+getBoundingClientRect 与理论位置的偏差 POST 回本机一个小 HTTP 服务）。真实数据一到手，
+"overlay 与 img 完全重合 + 全部框 y 恒 +10px"直接指向了margin。
+
+**根因**：框的状态类是裸单词 `ok`/`amb`/`anc`（`:class="b.cls"`），而同一组件里绿色成功横幅的
+样式也叫 `.ok`，带 `margin: 10px 0`。**绝对定位元素即使有显式 `top`，`margin-top` 仍会追加位移**
+——所有"有唯一选择器"的框（黄框全是）整体下移 10px；margin 左右为 0，所以 x 不偏。scoped 样式
+救不了这种撞车：两条规则在**同一个组件**里。浏览器版没事纯粹因为它是另一套独立 HTML，没这条规则。
+
+**修法（Recorder.vue）**：状态类改带前缀 `b-ok`/`b-amb`/`b-anc`，并给 `.box` 显式 `margin: 0`
+兜底。已用诊断实测收尾：修后全部框偏差 ≤0.02px。
+
+**教训**：
+1. `:class` 动态注入的状态值别用裸单词（ok/err/on/active 这类高危词），带上组件内唯一的前缀——
+   scoped 只隔离组件之间，隔离不了组件内部的类名撞车。
+2. "浏览器里没事、app 里有事"不一定是引擎差异（这次两边引擎行为完全一致），先确认两边跑的是不是
+   **同一份 HTML/CSS**。
+3. dev 模式的桌面壳可以直接热更诊断代码拿真实渲染数据（HMR + fetch 回传），比靠截图肉眼比对快
+   且准——量出来"x 准、尺寸准、y 恒偏固定值"这种指纹后，答案基本就剩 margin/位移一类了。
+
+## Android 16(SDK 36) 起「修改系统设置」授权页改 Compose 渲染，`switch_widget` 这个 id 没了（2026-08-04，RING-SET-01）
+
+**现象**：`flow_ring_set.sh` 首次授权 WRITE_SETTINGS 那步，App 内引导弹窗「好的」点掉后，
+`waitfor id switch_widget --timeout 6` 稳定超时，流程判失败。乍看像 App 卡在授权页之前没弹出
+开关，容易误判成 App 侧 P1 缺陷——**真机连上去看当前前台窗口，才发现根本不是这么回事**。
+
+**排查**：`adb shell dumpsys window | grep mCurrentFocus` 显示当前其实已经在
+`com.android.settings/com.android.settings.spa.SpaActivity`（系统设置页，不是卡在 App 里没弹出）；
+`uiautomator dump` 出来的树里，那个开关是 `class="android.view.View" checkable="true"
+clickable="true" resource-id=""`——**没有任何 resource-id**，`id=switch_widget` 选择器天然找不到。
+外层文案节点是独立的 `text="允许修改系统设置"`（`android.widget.TextView`），落在该 checkable
+节点的 bounds 范围内（同一可点行）。撞到的设备是 Pixel_9_Pro_XL，`ro.build.version.release=16`
+`ro.build.version.sdk=36`——即 Android 16 起，这个系统级 WRITE_SETTINGS 授权页从传统 View
+（`com.android.settings:id/switch_widget`，多年未变的老 id）迁到了 SPA（Settings Panel App，
+Compose 重写），Compose 节点默认不带 resource-id，systemUI/Settings 的这类改版跟被测 App
+本身无关，**任何请求 WRITE_SETTINGS 的 App 在 Android16+ 设备上都会撞上同一个坑**。
+
+**教训**：
+1. 断言失败先看真实前台窗口（`dumpsys window`/`adbkit.py focus`）+ 真实节点树，别急着按"卡在哪一步"
+   的表面现象归因成 App 缺陷——这条如果直接归 P1 产品缺陷会误导开发排查一个不存在的 App 问题。
+2. 系统级设置页（非被测 App 自己的 UI）的控件结构会随 **Android 系统版本**演进，不随 App 版本
+   变化；这类"稳定多年的系统 id 突然找不到"，优先怀疑系统版本升级改了实现，查 `ro.build.version.sdk`。
+3. Compose 重写的界面节点普遍没有 resource-id，选择器要退化成结构定位（唯一 checkable 节点/
+   bounds 相邻的 text 节点），不能死等一个可能已经不存在的 id。
+
+**修法**（`apps/MP3Cutter/flows/flow_ring_set.sh` `set_ringtone_type`）：`switch_widget` id 命中
+失败就退化，dump 当前树找**唯一一个 `checkable="true"` 节点**，取 bounds 中心点直接坐标点击——
+这条兜底不依赖 id/文案，天然跨语言、跨系统版本。
+
+## App 自身操作会在设备上留下"文件名整段包含素材名"的衍生产物，污染后续子串搜索选中的文件（2026-08-04，MERGE-CORE-01）
+
+**现象**：`flow_merge_core.sh` 搜索固定素材「mp3-sample-track.mp3」选文件，日志出现
+`[warn] id='tv_name' 有 2 个匹配，点第 0 个`；合并产物时长只有 81633ms，跟预期 120000ms
+（两个 01:00 素材之和）差 38367ms，超容差判失败。乍看像"预期值写死了/该动态算"——**其实预期
+写死是对的**（这两个素材是测试基础设施自己维护的固定资产，时长本身就是常量；改成动态读取
+"当前实际选中文件的时长之和"会让这类误选完全无法被发现），真正的问题在"选中"这一步。
+
+**排查**：查 `ui/02-selected.xml`，设备上除了真正的源文件 `mp3-sample-track.mp3`（01:00），
+还躺着一个 `AudioCutter_mp3-sample-track.mp3`（00:21≈21633ms）——这是 App 自己在做"裁剪"
+操作时顺带落的一份中间产物，文件名把原文件名整个包了进去，且**不会自动清理**，会一直留在
+设备上。App 自己的搜索是子串匹配，搜「mp3-sample-track.mp3」把这两个文件都命中了；
+`tapid tv_name` 默认点第 0 个，列表按 `date_added` 倒序，这个衍生文件是本次跑之前的
+CUT-CORE-01/02 用例刚产生的（比素材本体的 `date_added` 新），排到了第 0 位，于是被误选中
+替代真正的源文件。核对时长：60000（aac-sample-track.m4a）+ 21633（被误选中的衍生文件）
+= 81633ms，跟产物分毫不差，且 ffprobe 交叉核对（81605ms）也一致——**产物本身没问题，
+是选错了参与合并的文件**。复用历史问题 ID 登记为 BUG-MERGE-FMT-01（同一现象此前已在
+MERGE-FMT-01 用例 07-23/07-29 多轮复现过，这次在 MERGE-CORE-01 核心冒烟路径上再次
+命中，说明具有普遍性）。
+
+**教训**：
+1. 断言写死一个从"受控固定素材"推算出来的常量，本身不是脆弱设计——反而是能让"选择步骤
+   选错了文件"这类问题被抓出来的关键；遇到"预期为什么不动态算"的疑问，先确认预期值是不是
+   建立在受控素材上，是的话说明断言没问题，问题在更上游的选择环节。
+2. 被测 App 自己的正常操作（裁剪/转换等）会在设备上产生文件名含"原文件名子串"的中间产物，
+   这类残留不受测试脚本控制、也不会自动消失，会在下一次任何用到"文件名子串搜索"选择器的
+   用例里被意外命中——**同一类坑之前在 `flow_cut_edge02.sh`（"精确文案匹配 + `--index`" 见
+   该脚本注释）、本次在 `seeds/push_media.sh`（"跑前清理残留"）分别用两种不同思路堵过**，
+   新写选择器/新素材时两种思路都要过一遍脑子：能精确匹配就精确匹配，选不到"当次真正推上去
+   的那份"就该在造数据阶段先清残留。
+3. 排查这类"产物时长/内容跟预期对不上"的问题，别停在"MediaStore/ffprobe 都显示产物本身没错"
+   就归因成"断言写错了"——产物内容忠实反映的是"实际操作的输入"，要往前一步核对"选中的输入
+   是不是预期的那个"（查 `ui/0X-selected.xml` 等中间步骤的截图/dump，不能只看最后产物）。
+
+**修法**：`seeds/push_media.sh` 每次推素材前，先在设备 `/sdcard/Music` 树下用
+`find -iname '*<素材文件名>*'` 扫一遍，把"文件名含素材名、但路径不是素材本体"的文件连
+MediaStore 记录一并删掉（`content delete --where` 要用双层引号，见 `tools/flow_media.sh`
+`ms_query_data` 注释里那条 `--where` 转义坑，单层引号会被设备端 sh 剥掉、SQL 报错还被
+`2>/dev/null` 吞掉），只清跟当次素材同名的残留，不动其他不相关产物。
+
+## `grep -c` 零命中返回 exit 1，配合 `set -e` 会在任何 log() 输出之前直接杀死整条流程（2026-08-04，MIX-CORE-01）
+
+**现象**：`MIX-CORE-01` 在三台真机上先后失败，日志文件 0 字节、无任何截图/证据，耗时仅 3.8s，
+一台被系统标"需人工/不登记"，另外两台触发了自愈重跑才过。看起来像"App 还没拉起来就崩了"，
+实际排查 exit 码定位在脚本最开头——`push_media.sh` 素材推送完之后统计 pushed/skip/cleaned
+三行数量用于打日志的那三行 `grep -c`。
+
+**根因**：这三行是刚加的"如实反映素材同步结果"日志（见本文件 2026-08-04 上一条 `push_media.sh`
+残留清理相关改动同批引入），写法是：
+```bash
+PM_PUSHED=$(grep -c '^pushed ' <<<"$PM_OUT")
+```
+设备上素材已经推送过、这次 `push_media.sh` 输出全是 `skip` 行，没有一行 `pushed`——`grep -c`
+在**零命中时会正确打印 `0`，但退出码是 1**（`grep` 的退出码语义是"有没有匹配到"，不是"命令
+本身有没有出错"）。这三行赋值语句配合脚本头部的 `set -e`：bash 里 `VAR=$(cmd)` 这种纯赋值语句，
+它的"退出状态"就是命令替换里最后那条命令的退出状态，`grep` 返回 1 会让整条赋值语句被 `set -e`
+判定为失败，脚本当场终止——发生在这一步之后所有 `log()`/`shot`/App 启动之前，跟被测 App 完全
+无关，纯粹是新加的统计代码自身不健壮。
+
+**教训**：
+1. `grep -c` 是"统计计数"用途时（不是拿它的退出码做真正的存在性断言），必须显式 `|| true` 兜底，
+   否则"零命中"这个最常见的场景（素材没变化、这次全 skip）会变成随机性崩溃，且崩得早、无证据，
+   比被测 App 真的坏了更难排查——`grep`/`grep -c`/`grep -q` 只要不是拿退出码做条件判断，在
+   `set -e` 脚本里配合命令替换赋值使用时都要留意这个坑，不止这一处。
+2. 新加的"日志/统计"这类非断言性代码，改完要么真机跑一遍覆盖"零命中"这个边界（这次三台设备
+   刚好都撞上了，实际是最常见路径，不是边角情况），要么写的时候就把`set -e` 下命令替换赋值的
+   退出码语义过一遍脑子，别假设"只是打日志不影响逻辑"就没有崩脚本的风险。
+
+**修法**：`flow_cut_fmt.sh`/`flow_cut_fmt02.sh`/`flow_merge_core.sh`/`flow_merge_fmt.sh`/
+`flow_mix_core.sh`/`flow_mix_shortest.sh` 六个脚本里统计 `PM_PUSHED`/`PM_SKIP`/`PM_CLEAN`
+的三行 `grep -c` 全部补上 `|| true`；同步更新到 `flow-freeze` skill 的"标准写法"里，避免以后
+新固化的脚本照抄旧版本再踩一次。
+
+## 点击「下一步」进入混合/合并编辑页，偶发被插屏广告卡住，`waitfor` 内置的轻量重试顶不住（2026-08-04，MIX-CORE-02）
+
+**现象**：`flow_mix_shortest.sh`（MIX-CORE-02）在 Pixel_4 上选完 2 个文件、点 `next_tv` 后，
+`waitfor id='tv_total_time' --timeout 8` 超时，脚本在 `set -e` 下直接终止，没有任何失败截图/
+dump（选择器本身没错，`next_tv` 点击本身也成功——问题在点击之后）。
+
+**根因**：点完「下一步」偶发弹出 AdMob 插屏广告（`AdActivity`）盖住混合编辑页，`waitfor` 命令
+内置的轻量 `sweep_on_wait`（8s 超时窗口内只轮询 2 轮、间隔 0.4s、patience 1）清不掉这类插屏，
+直接原地超时。**这个坑在 `flow_mix_core.sh`（MIX-CORE-01，同一天）已经复现并修过**，但当时
+没有同步到结构几乎一样的 `flow_mix_shortest.sh`（MIX-CORE-02）——两个脚本"选择音频→点下一步
+→等混合编辑页"这段代码同源，修一个不代表另一个也修了。
+
+**教训**：这类"点几个字数一样、逻辑同源的姊妹脚本"（`flow_mix_core.sh`/`flow_mix_shortest.sh`，
+`flow_cut_fmt.sh`/`flow_cut_fmt02.sh` 等）里，任何一个在某个共享代码段踩坑修好后，**都要顺手
+检查其余姊妹脚本是不是抄的同一段代码、要不要一起补**，别指望"这次只有这台设备/这条用例撞上了
+广告"，等下次巧合命中另一个姊妹脚本时才发现漏改。
+
+**修法**：跟入口页 `MIX_ENTRY` 那段循环同款做法——点完 `next_tv` 后不要直接裸 `waitfor` 长
+超时，改成"`waitfor --timeout 1` 短超时轮询 + 命中就 break，否则显式跑一轮更耐心的独立
+`sweep --rounds 5 --interval 0.8 --patience 3` 清障，最多 10 轮，最后再正式 `waitfor` 兜底"，
+两个 mix 脚本现在写法一致。
+
+## 2026-08-03：录制器提速——`--from-cache` 只属于录制当下，绝不能写进导出的脚本
+
+录制器每一步原来要 dump 两次：`probe` 拿节点树画框（一次），紧接着 `tapid` 为了算坐标又原样
+dump 一次（第二次内容完全相同）。实测（无线 adb）**`tapid` 自己 dump 要 3.4s，改读 `.dumpcache`
+只要 0.04s**——`probe` 时加 `nodes --cache rec`、点击时加 `--from-cache rec`，一步省 3s+。
+仍走 `tapid/taptext/tapdesc` 选择器链路，所以"这个选择器点得中"照样被真实验证。
+
+**踩点**：`--from-cache` 一度被直接拼进 `do_action` 返回的 cmd，而那个 cmd 会落进 `rec.json` 和
+**导出的固化脚本**。脚本将来跑的时候，缓存槽里是上次录制留下的**过时 dump**，`adbkit` 命中缓存就
+不会活 dump → 按陈旧坐标点击，点错了还看起来一切正常（exit 0）。修法是把两者分开：`do_action`
+返回的 cmd 永远是"脚本里的样子"，`--from-cache` 在 `act_once` 执行的那一刻才追加。
+
+**判据/通用教训**：录制期（一次性、有上下文）的优化参数和脚本产物（反复执行、无上下文）必须严格
+分开。凡是"因为我刚好知道当前状态所以能省一步"的参数，都不能出现在产物里。
+
+**另：录制慢的大头往往是无线 adb，不是 dump 本身**。同一张截图 USB 0.01-0.02s、WiFi 0.53-1.13s；
+dump 的 XML（19KB）pull 走 WiFi 也要 0.73s。设备端 `uiautomator dump` 本身（waitForIdle + 序列化，
+~2.2s）换通道省不了，那部分要靠 u2 后端（但装 atx 有环境污染代价，见 decisions #30）。
+**先插 USB 线，再考虑换后端。**
+
+## 2026-08-03：同型号设备在 UI 上重名——排查时先用 `ro.serialno` 确认"是几台机器"
+
+手上两台 Pixel_4 都没设别名，`alias || model` 都是 `Pixel_4`：执行台的设备 chips、录制器的设备下拉
+里就是两个一模一样的选项，**根本不知道自己选的是哪台**。真实后果：一轮排查里我以为测的是用户在用
+的那台（USB），实际全程测的是另一台（无线），得出的性能结论差一倍、方向也带偏了。
+
+**判定"两条连接是不是同一台真机"只能看 `ro.serialno`**，不能看 model：
+
+```bash
+adb -s 9B051FFAZ002M1 shell getprop ro.serialno        # → 9B051FFAZ002M1
+adb -s 192.168.209.239:5555 shell getprop ro.serialno  # → 99261FFAZ00E2G ← 是另一台机器
+```
+
+USB 的 adb serial 通常就是 `ro.serialno`，无线的是 `ip:port`——**看不出背后是哪台**。同一台设备
+`adb tcpip 5555` 之后 USB 和无线会同时在线、`ro.serialno` 相同，那种情况才是"一台机器两条通道"
+（本次不是，但会发生；真发生时若两条都被勾选，账本会按 `(run_id, 用例, serial)` 记成两组，
+实际在同一台真机上抢同一个 App，结果互相干扰且看不出原因）。
+
+**已做**：录制器下拉始终显示通道 + serial 尾段（`Pixel_4（USB 02M1）`），并**默认优先选 USB**
+（同型号实测探一屏 USB 2.6s / 无线 4.7s）；执行台 chips 仅在**真有重名**时补区分尾段（无线取 IP
+末段比端口 5555 有意义），避免所有 chip 无脑变长。
+
+**判据/教训**：性能或行为对比的第一步是确认"测的是同一个对象"。多设备环境里 `model` 不是身份，
+`serial` 才是，而无线 serial 还不等于硬件序列号。根治重名靠去「设备」tab 起别名。
+
+## 2026-08-04：`run_flow.py` 判定提醒对网络设备无差别常年误报——scope 用了带冒号的原始 serial
+
+`run_flow.py` 收尾那句"注意：本脚本未内联跑过 output-check / logscan"提醒，靠拿 `f"/{serial}/{attempt}/"`
+去匹配 `evidence.csv` 的「文件/链接」列判断本轮有没有登记这两类证据。但证据路径里的设备段是
+`adbkit.py _safe()` 清洗过的（冒号→下划线，`192.168.209.20:5555` → `192.168.209.20_5555`），
+`run_flow.py` 这里却直接拿原始 `serial`（带冒号）拼 scope，字符串永远匹配不上——导致**只要是
+网络连接的设备（多设备并行常态），不管 output-check/logscan 有没有真的跑、跑没跑成功，这条提醒
+都会无条件出现**，USB 直连设备（serial 不带冒号）不受影响所以之前没暴露。修法：`scope` 拼接前
+对 `serial` 做跟 `adbkit._safe()` 同规则的清洗（`re.sub(r"[^A-Za-z0-9._-]", "_", serial)`）。
+
+**判据/教训**：证据路径里凡是拿 `serial` 当目录/文件名的一段，只要不是从 `evidence.csv` 里读回
+的现成整行（而是自己现拼字符串去匹配），必须先过一遍跟 `adbkit._safe()` 一致的清洗规则——
+`auto_repair.py`/`judge_result.py`/`issue_register.py` 早就通过复用 `auto_repair.newest_attempt_dir()`
+天然规避了这个坑，`run_flow.py` 是唯一现拼字符串的漏网之处。以后新增任何"读 evidence.csv 按
+`serial`/`attempt` 过滤"的逻辑，照抄这条清洗，不要凭直觉直接用原始 serial 拼路径片段。
+
+## 2026-08-04：`logscan` 光调用不等于真判定——`>/dev/null 2>&1 || true` 会让崩溃扫描形同虚设
+
+审计 `apps/MP3Cutter/flows/` 全部 30 个固化脚本时发现两类缺口（均已修复，见 skill flow-freeze
+「失败判定标准」第 7 条）：
+1. `flow_cut_save.sh`/`flow_merge_fmt.sh` 头部注释写了"失败判定标准含 logscan"，但脚本正文
+   实际从没调用过 `$AK logscan`——纯粹是判定标准声明和实现脱节。
+2. 10 个 `flow_unlock_*.sh` 都写了 `$AK --case "$CASE" logscan final >/dev/null 2>&1 || true`——
+   命令确实跑了、`evidence.csv` 也确实登记了一条 logscan 证据行，**但输出被丢进 `/dev/null`，
+   从没被 `grep` 检查命中数，也从不置位 `FAILED`**。等于只留了个"跑过"的假象，即使真崩溃也
+   不会让脚本判失败。这类问题不会在语法检查/单次冒烟里暴露，只有故意造一次真崩溃再看 exit
+   code 才能发现，容易长期潜伏。
+
+**判据/教训**：审查/新写任何"内联跑校验"的调用（output-check/logscan/自定义 validate_*）时，
+光看"有没有调用这个命令"不够，必须确认**调用结果有没有被捕获并接进判定**——`>/dev/null` +
+`|| true` 是明显信号（说明这行只求"跑过、不阻断"，没有走判定路径），排查现有脚本用
+`grep -B1 'logscan.*>/dev/null.*|| true' apps/*/flows/flow_*.sh` 能快速定位这类"调了但不判定"
+的脚本。
+
+## 无线设备 `adb: device offline` 的真根因是**企业 WiFi 的 AP 漫游**，不是并行抢带宽（2026-08-04 实测定位）
+
+**现象**：`CUT-CORE-01`/`CUT-CORE-02`（`192.168.209.20:5555`，Pixel_9_Pro_XL，Android 16）在一轮
+三台无线设备并行执行中，先是 `[dump] 拉取 UI 树失败（设备在线吗？先 adb devices 确认）`，紧接着
+下一条用例 0 秒失败于 `adb: error: failed to get feature set: device offline`。同一时刻同一个
+2.5MB 素材，这台 push 花 30.6s（0.1 MB/s），另两台分别 1.0s（2.4 MB/s）和 0.32s（7.6 MB/s）。
+
+**排错时被否掉的三个假设（别再重复走一遍）**：
+1. **"三台并行抢空口带宽"——否**。若是共抢，三台应一起变慢；实测 210.223 同时段满速 7.6 MB/s。
+   且 209.20 历次 push 同一素材是 `0.1/1.0/1.3/1.8/1.9/2.0/2.2/2.3/4.7 MB/s`，**0.1 是唯一离群值**，
+   说明链路质量是「时好时坏」，不是被并发压垮。
+2. **"这台链路天生差 / 信号弱"——否**。四台 RSSI 全在 -52~-60，都不算弱。
+3. **"低电量未充电导致 WiFi 省电"——否**。做过四台对照：RTT 最好的 210.223（20ms）**没**充电，
+   唯一在充电的 211.121（65ms）反而不是最好的。电量/充电与 RTT 无相关性。
+
+**真根因（实测证据）**：`ping -c 20` 四台对比——209.20 平均 RTT **313.9ms**、峰值 **1090ms**、
+抖动 stddev 298ms，而 210.223 平均仅 **20.3ms**，两者差 15 倍，**丢包却都是 0%**。所以问题是
+**延迟抖动，不是带宽也不是丢包**。抖动来源查 `dumpsys wifi` 历史记录：209.20 的 BSSID 在
+`8c:96:a5:6c:c9:81` → `c6:01` → `c4:81` 之间跳，**在同一企业 AP 集群的至少三个 AP 之间频繁漫游**；
+RTT 最好的 210.223 则稳定待在单个 `c6:11`。漫游瞬间 TCP 连接中断/RTT 尖峰，正是 adb socket 等不到
+响应判 offline 的窗口。频段已是 5GHz（`frequencyMhz: 5220`），所以**与 2.4G 拥挤无关**。
+
+**为什么 RTT 抖动比带宽更致命**：adb 协议是海量小包请求-响应，一次 `adb shell` 就是若干个 RTT。
+RTT 313ms 时每条命令都要等三分之一秒，`push` 的窗口确认直接卡死（2.5MB 拖到 30s 就是这么来的）。
+**推论：优化方向应该是减少 adb 往返次数，而不是减少传输字节数**——`seeds/push_media.sh` 早已做了
+体积比对跳过重推，字节数这条路已经走到头了；真正还有空间的是 `screencap→/sdcard→pull` 这类
+两步往返（可改 `adb exec-out screencap -p >local` 一步到位）。
+
+**环境拓扑（排错前先搞清，否则容易归因错）**：Mac 走**千兆有线** `en5`（`1000baseT full-duplex`，
+网关 `192.168.200.1`，IP `192.168.201.x`），Mac 侧不是瓶颈；设备分散在 `192.168.209.x`/`210.x`/
+`211.x` **三个不同网段**，要过网关跨网段转发，且挂在不同企业 AP 上。这是办公网环境，负载和漫游
+都不可控——不是"你家路由器被三台设备占满"那种模型。
+
+**根治方向（按彻底程度排序，截至记录时都还没实施）**：
+1. **USB hub 直连（最彻底）**：RTT 313ms → <1ms，漫游/拥堵/IP 变化三个概念一起消失；且 USB 的
+   adb serial 是**硬件序列号、永久稳定**，不像无线 `ip:port` 会变（`device_aliases.json` 里那 18
+   条别名全是硬件 serial，正是 USB 时代留下的）。顺带解决充电。代价是线缆管理。
+2. **Mac 开热点让设备连过来**：精准命中漫游这个根因（只有一个 AP，无处可漫游）+ 同网段二层直达
+   + 专用网络无外部流量。本机 M5 MacBook Air 支持 802.11be/5GHz 全信道，且 `en0` WiFi 因走有线
+   上网而完全空闲，是理想配置。**两个坑**：① macOS 互联网共享历史上默认开 2.4GHz，若退回 2.4G
+   三台挤一起可能比现在的 5GHz 更差，开完必须实测确认
+   （`adb -s <ip>:5555 shell "dumpsys wifi | grep -oE 'frequencyMhz: [0-9]+' | tail -1"` 出 5xxx 才对）；
+   ② 换网段后所有 IP 变化，`config/device_info_cache.json`/`device_aliases.json` 的 `ip:port` key
+   全部失效（见上文"无线设备 serial 是 ip:port"那条坑），需配 DHCP 静态租约否则要反复维护别名。
+3. **代码层健壮性兜底**：`run_flow.py`/`adbkit.py` 目前**没有任何**"用例开始前测在线状态、掉线
+   自动重连再继续"的逻辑，掉线后同设备后续用例会一路 0 秒秒败直到人工干预。可在关键 adb 调用
+   （尤其 dump）前加 `adb -s <serial> get-state` 检测 + 掉线时 `adb reconnect offline` 重试一次。
+
+**排查时的区分**：别把"这台设备今天老失败"和"这次是真掉线"混为一谈——同一台当天其它失败
+（等元素超时、断言不成立）都是 UI 层面问题，与 adb 连接层的 offline 性质不同。看日志尾部有没有
+`device offline` / `拉取 UI 树失败...设备在线吗` 字样来判别。另注意掉线**不会**自动拖垮其他设备，
+这次是人工发现后主动中止整轮，才把另两台正常跑着的设备连带记成"任务被用户中止 SIGTERM"。
+
+## 桌面壳：删设备登记删了别名，行还在列表里——因为设备列表来自实时 `adb devices` 扫描不是别名文件（2026-08-04，`Devices.vue`/`commands.rs delete_device_alias`）
+
+- **现象**：点「删除」提示"已删除设备登记"，列表刷新后那一行（尤其网络 adb `ip:port`，状态"离线"）依然在，看起来像前端没刷新。
+- **根因**：`list_devices`（`adb_devices()`）的行来源是每次现跑一遍 `adb devices` 的解析结果 + 别名文件里"这次没扫到"的补充行；删别名只清 `config/device_aliases.json`，不影响本地 `adb server` 记着的连接——网络 adb 连过一次后，即使目标不可达，`adb devices` 仍会把它列成 `offline`，直到显式 `adb disconnect` 或 `adb kill-server`。所以删别名对这类行没用，下次扫描该行原样冒出来。USB 设备物理插着同理删不掉（本就没有软件层面的"断开 USB"）。
+- **修**：`delete_device_alias` 里 serial 若含 `:`（网络 adb 特征），额外 best-effort 跑一次 `adb disconnect <serial>`，让 adb server 真正忘掉这个地址，下次扫描就不会再把它列进去。USB 物理连接的行则维持原状（软件侧本来就管不了，符合"删除只影响登记不影响物理连接"的既有设计）。断开后要用再 `adb connect` 回来；跑用例时 `adbkit.py` 的掉线自愈已会自动重连，不受影响。

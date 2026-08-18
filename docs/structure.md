@@ -26,7 +26,8 @@ AI_auto_test/
 │                              #   （list_devices 默认不查 getprop，只有 force=true 才重查，见 decisions #45）
 ├── apps/                # ★ 每个被测 App 一套独立工作区（per-app）
 │   └── <slug>/               # 如 MP3Cutter/
-│       ├── target.json       # 该 App 配置（package/serial/version/sheet_id/doc_id/run_id…；gitignore）
+│       ├── target.json       # 该 App 配置（package/sheet_id/doc_id/run_id…；不存 serial/app_version，
+│       │                     #   这两个是设备实时状态,由代码每次现查,见 decisions #52；gitignore）
 │       ├── flows/            # 该 App 的固化回归脚本（flow_*.sh，绑定该 App UI）；见 skill flow-freeze
 │       ├── lang/              # 该 App 的多语言文案表（strings_table.json，tools/lang_table.py build 生成）
 │       │   └── strings_table.json  # {资源key: {locale: 译文}}，供固化脚本按语言查表换算选择器文案

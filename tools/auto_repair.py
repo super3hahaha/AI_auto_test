@@ -26,7 +26,7 @@ import csv, os, re, sys, subprocess, shutil, datetime, difflib, argparse, fcntl
 from pathlib import Path
 from contextlib import contextmanager
 
-from _appctx import REPO, LEDGER, load_cfg, ledger_lock  # 多 App 路径解析
+from _appctx import REPO, LEDGER, load_cfg, ledger_lock, probe_installed_version  # 多 App 路径解析
 import exec_ledger
 
 MAX_ATTEMPTS = 3
@@ -133,9 +133,11 @@ def _safe(s):
 
 
 def newest_attempt_dir(cfg, case, serial):
-    """本次执行落证据的 attempt 目录(evidence/<slug>/<ver>/<run>/<case>/<serial>/<attempt>),取最新。"""
+    """本次执行落证据的 attempt 目录(evidence/<slug>/<ver>/<run>/<case>/<serial>/<attempt>),取最新。
+    ver 必须现查这台设备真实安装的版本——跟 run_flow.py 落盘证据时用的是同一份探测逻辑
+    （_appctx.probe_installed_version），否则两边算出来的目录对不上，自愈会找错地方。"""
     slug = _safe(cfg.get("app_slug") or cfg.get("app_name", ""))
-    ver = _safe(cfg.get("app_version", ""))
+    ver = _safe(probe_installed_version(cfg.get("package", ""), serial) or "unknown")
     run_seg = _safe(cfg.get("run_id") or datetime.datetime.now().strftime("%Y%m%d"))
     base = REPO / "evidence" / slug / ver / run_seg / case / _safe(serial)
     if not base.exists():

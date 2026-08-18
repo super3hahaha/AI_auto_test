@@ -46,16 +46,13 @@ def run_seg():
 
 
 def app_version():
-    """版本号：跟随设备模式（env AITEST_FOLLOW_DEVICE=1，桌面壳「跟随设备」选项不装机执行时
-    注入）现查本机真实安装版本并按进程缓存；否则优先 config.app_version，为空时才退回现查
-    （老逻辑，兼容没配 app_version 的机器）。探测逻辑见 _appctx.probe_installed_version，
+    """版本号：现查本机真实安装版本（dumpsys package），按进程缓存避免重复起 adb 子进程。
+    target.json 不再存静态 app_version 字段——那只是注册时刻的快照，装的包随时可能换
+    （升级/降级/重装），每次都该反映"这次真的在跑什么"。探测逻辑见 _appctx.probe_installed_version，
     与 run_flow.py 的证据链接拼接共用同一份实现。"""
     global _VER
-    follow_device = os.environ.get("AITEST_FOLLOW_DEVICE") == "1"
-    if not follow_device and CFG.get("app_version"):
-        return CFG["app_version"]
     if _VER is None:
-        _VER = probe_installed_version(PKG, SERIAL) or CFG.get("app_version") or "unknown"
+        _VER = probe_installed_version(PKG, SERIAL) or "unknown"
     return _VER
 
 

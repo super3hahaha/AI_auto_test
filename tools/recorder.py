@@ -121,7 +121,41 @@ def screencap():
     return None, "；".join(errs)
 
 
-def probe():
+# 录制器默认自动清掉已知广告 SDK 全屏页（scope 卡死在具体 Activity/SDK 组件串，不会误伤正常
+# 界面），只挑 config/ad_rules.json 里 id 前缀 ad- 的那几条——consent-agree/perm-allow 等
+# scope="任意页面" 的规则文案更宽（"关闭"/"同意"），录制时人在盯着屏幕手动点更放心，不纳入自动。
+AD_RULE_IDS = "ad-admob-close,ad-applovin-close,ad-unity-close,ad-fan-close,ad-vungle-close"
+
+
+def _auto_sweep_ads():
+    """探完一屏后被 probe() 调用一次：单轮扫一下当前是否卡在已知广告全屏页，命中就点掉一个。
+    返回本轮点掉的个数（0 或 1）。复用 adbkit 的 sweep 子命令而不是自己重新实现规则匹配——
+    `--only` 把范围锁死在广告规则，`--rounds 1` 是因为外层 probe() 自己在循环（见其头注）。"""
+    r = ak("sweep", "--rounds", "1", "--patience", "1", "--only", AD_RULE_IDS)
+    out = ((r.stdout or "") + (r.stderr or ""))
+    m = re.search(r"处理 (\d+) 个", out)
+    return int(m.group(1)) if m else 0
+
+
+def probe(auto_sweep=True):
+    """对外的探屏入口：探一屏，若命中已知广告全屏页就自动清掉再重探，最多再核对 2 轮
+    （见 gotchas.md「广告瀑布流」——同一个广告位偶尔连着刷两层不同 SDK 的插屏，一轮不够）。
+    干净就是干净：连续一轮没清到东西立刻停，不多耗一次 dump。auto_sweep=False 时完全跳过，
+    给内部重探（避免自己触发的重探又递归触发一次判定）和前端的手动开关用。"""
+    swept = 0
+    for _ in range(3):
+        data = _probe_once()
+        if not auto_sweep:
+            break
+        hit = _auto_sweep_ads()
+        if not hit:
+            break
+        swept += hit
+    data["auto_swept"] = swept
+    return data
+
+
+def _probe_once():
     """探一屏：先 dump、后截图，**必须串行**（截图跟在 dump 之后）。
 
     曾经为省时间并行抓（各 ~0.5-3s），但两者不是同一瞬间的状态：dump（uiautomator 等
@@ -295,7 +329,7 @@ def rec_dir(case):
     return REPO / "apps" / APP / "recordings" / case
 
 
-def act_once(kind, body, case, n, before=None, before_labels=None):
+def act_once(kind, body, case, n, before=None, before_labels=None, auto_sweep=True):
     """录一步：（可选先探 before）→ 执行 → 等稳 → 探 after → diff → 落这一步的截图。
 
     无状态：case/n 由调用方给（桌面壳那边步骤列表在前端），before_labels 也可以由调用方回传
@@ -303,7 +337,7 @@ def act_once(kind, body, case, n, before=None, before_labels=None):
     """
     if before is None:
         # anchor_of（滑动/长拖锚控件、硬坐标兜底）需要节点树，光有 labels 不够，所以这两类必须现探
-        before = probe() if (before_labels is None or kind in ("swipe", "longdrag")
+        before = probe(auto_sweep) if (before_labels is None or kind in ("swipe", "longdrag")
                              or (kind == "tap" and not body.get("sel") and not body.get("anc"))) else None
     b = set(before_labels if before_labels is not None else labels(before))
     cmd, label, extra = do_action(kind, body, before or {"nodes": []})
@@ -324,13 +358,13 @@ def act_once(kind, body, case, n, before=None, before_labels=None):
             # 不静默吞掉：录制时就点不中，比留到回放才炸好得多
             raise RuntimeError(f"{' '.join(str(c) for c in run)} 失败：{out}")
         time.sleep(SETTLE)
-    after = probe()
+    after = probe(auto_sweep)
     a = set(after["labels"])
     step = {
         "n": n, "kind": kind, "label": label,
         "cmd": [str(c) for c in cmd] if cmd else None,
         "diff": {"appeared": sorted(a - b), "disappeared": sorted(b - a)},
-        "out": out, **extra,
+        "out": out, "auto_swept": after.get("auto_swept", 0), **extra,
     }
     step["script"] = action_lines(step)  # 导出脚本里的那几行，给 UI 直接显示，见 action_lines 头注
     if after.get("raw_png") and case:
@@ -343,17 +377,18 @@ def act_once(kind, body, case, n, before=None, before_labels=None):
 
 def record(kind, body):
     """serve 模式（浏览器版）：在 SESSION 里累积步骤。"""
+    auto_sweep = body.pop("auto_sweep", True)
     with LOCK:
         n = len(SESSION["steps"]) + 1
-        step, after = act_once(kind, body, SESSION["case"], n, before=SESSION["screen"])
+        step, after = act_once(kind, body, SESSION["case"], n, before=SESSION["screen"], auto_sweep=auto_sweep)
         SESSION["steps"].append(step)
         SESSION["screen"] = after
         return step, after
 
 
-def refresh():
+def refresh(auto_sweep=True):
     with LOCK:
-        SESSION["screen"] = probe()
+        SESSION["screen"] = probe(auto_sweep)
         return SESSION["screen"]
 
 
@@ -497,7 +532,7 @@ class H(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(n) or b"{}")
         try:
             if self.path == "/api/refresh":
-                return self._send(200, {"screen": public(refresh())})
+                return self._send(200, {"screen": public(refresh(body.get("auto_sweep", True)))})
             if self.path == "/api/act":
                 step, screen = record(body.pop("kind"), body)
                 return self._send(200, {"step": step, "screen": public(screen)})
@@ -537,7 +572,8 @@ def main():
     s = sub.add_parser("serve", help="起本地 HTTP 服务，浏览器里录")
     s.add_argument("--case", default="")
     s.add_argument("--port", type=int, default=8760)
-    sub.add_parser("probe", help="探一屏 → {png,nodes,labels,w,h}")
+    s = sub.add_parser("probe", help="探一屏 → {png,nodes,labels,w,h}")
+    s.add_argument("--json", dest="payload", default=None, help="可选 {auto_sweep:bool}，默认自动清障开")
     for name, helptext in (("act", "录一步 → {step,screen}"), ("export", "落 rec.json + flow 草稿")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("--json", dest="payload", required=True, help="入参 JSON（act: {kind,case,n,...}；export: {case,steps}）")
@@ -550,12 +586,13 @@ def main():
         return ThreadingHTTPServer(("127.0.0.1", a.port), H).serve_forever()
 
     if a.cmd == "probe":
-        return print(json.dumps(public(probe()), ensure_ascii=False))
+        payload = json.loads(a.payload) if a.payload else {}
+        return print(json.dumps(public(probe(payload.get("auto_sweep", True))), ensure_ascii=False))
 
     body = json.loads(a.payload)
     if a.cmd == "act":
         step, screen = act_once(body.pop("kind"), body, body.get("case"), int(body.get("n") or 1),
-                                before_labels=body.get("before_labels"))
+                                before_labels=body.get("before_labels"), auto_sweep=body.pop("auto_sweep", True))
         return print(json.dumps({"step": step, "screen": public(screen)}, ensure_ascii=False))
     if a.cmd == "export":
         return print(json.dumps(export(body["case"], body["steps"]), ensure_ascii=False))

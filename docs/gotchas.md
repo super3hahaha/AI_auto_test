@@ -128,11 +128,13 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 - **推测根因**：MP3Cutter 选中音频进编辑器会**自动开始播放**，`progress_time_text` 等控件在播放中持续重绘；`ui` dump 可能撞上重绘中间态，拿到不完整/不稳定的文本。这类不合法字节作为 CLI 参数传给 python 时，POSIX 下 argv 解码走 `surrogateescape`（PEP 383）会变成 lone surrogate 字符——这种字符只有在**真正写入**时才报错（比如 `csv.writer` 用 `encoding="utf-8"` 严格模式），纯打印或中途传递不会提前暴露，所以第一次表现是"过程日志正常、最后写账本时才炸"。
 - **修**：①进编辑器后先 `tapid play_btn`（best-effort）暂停播放再 dump，让屏幕稳定下来；②`xml_field` 提取结果统一过一遍 `iconv -c -f UTF-8 -t UTF-8` 兜底丢弃非法字节，即使还是撞上了也只是这个字段显示不全，不会让 `set -e` 直接终止整条流程。两层防御叠加，别只指望"先暂停"就能百分百避免。
 
-## `tools/init_target.py`：给包名自动探测 target.json，但 app_name 不能无脑覆盖（2026-07-03）
+## `tools/init_target.py`：给包名自动探测 target.json，但 app_name 不能无脑覆盖（2026-07-03，2026-08-18 更新）
 
-给包名就能自动查到 `serial`（`adb devices` 单设备自动选）/`app_version`（`dumpsys package` versionName）/`main_activity`+`app_name`（pull apk 后 `aapt dump badging`）/`build`（`dumpsys package flags` 是否含 DEBUGGABLE，拼出黑盒/白盒 oracle 深度说明）/`db_name`（debuggable 时 `run-as ls databases/`）。
+给包名就能自动查到 `serial`（`adb devices` 单设备自动选，仅本次探测连哪台设备用）/`app_version`（`dumpsys package` versionName，仅嵌进 `build` 说明文本）/`main_activity`+`app_name`（pull apk 后 `aapt dump badging`）/`build`（`dumpsys package flags` 是否含 DEBUGGABLE，拼出黑盒/白盒 oracle 深度说明）/`db_name`（debuggable 时 `run-as ls databases/`）。
 
-**坑**：aapt 读到的 `application-label` 是 apk 里的**完整展示名**（如 "MP3 Cutter & Ringtone Maker"），但 target.json 的 `app_name` 字段实际是**证据目录的 slug**（[adbkit.py](../tools/adbkit.py) `evid_dir()` 拿它过 `_safe()` 拼 `evidence/<app_name>/<version>/...`），历史证据已经按旧 slug（如 "MP3Cutter"）归档。若探测后直接覆盖 `app_name`，新证据会落到跟历史对不上的新目录名下。同理 `app_version` 也可能探出比 target.json 记录更新的版本（设备包已升级但你还没打算切换测试）。**所以 `init_target.py` 默认只打印探测结果、不落盘**，`main_activity`/`build`/`db_name` 可以放心信，`app_name`/`app_version` 要人工核对是否要延续旧 slug 再决定加 `--write`。
+**坑**：aapt 读到的 `application-label` 是 apk 里的**完整展示名**（如 "MP3 Cutter & Ringtone Maker"），但 target.json 的 `app_name` 字段实际是**证据目录的 slug**（[adbkit.py](../tools/adbkit.py) `evid_dir()` 拿它过 `_safe()` 拼 `evidence/<app_name>/<version>/...`），历史证据已经按旧 slug（如 "MP3Cutter"）归档。若探测后直接覆盖 `app_name`，新证据会落到跟历史对不上的新目录名下。**所以 `init_target.py` 默认只打印探测结果、不落盘**，`main_activity`/`build`/`db_name` 可以放心信，`app_name` 要人工核对是否要延续旧 slug 再决定加 `--write`。
+
+**2026-08-18 起 `serial`/`app_version` 不再是 target.json 的字段**（见 decisions.md #52）：`serial` 没有"默认设备"这回事（多设备并行下 executions.csv 才是逐台真值），`app_version` 是装的包随时可能变的运行时状态，注册时写死的快照只会越放越过期——`adbkit.py`/`run_flow.py`/`case_result.py`/`auto_repair.py` 现在都改成每次现查（`_appctx.probe_installed_version`），`--write` 时会把这两个键从 target.json 里 pop 掉（含老文件里的历史残留）。
 
 ## 「选择音频」改用搜索定位后的三个坑（2026-07-17，`flow_cut_save.sh`/`flow_cut_edge_wav40000.sh`）
 
@@ -165,7 +167,7 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 - **App 库 UI**：从"一条记录一行"改成可折叠树（参照 `Evidence.vue` 设备>用例那套折叠交互）——`▸`/`▾` 展开箭头点击懒加载该 slug 的版本列表（第一次展开才查、查过缓存），点具体版本行 = `selectedVersion[slug]` 记下来（默认选最新那个）。
 - **执行前装机**：`runStore.start()` 新增可选 `apkPath`/`package`，如果 Runner.vue 传了（即当前 slug 选中了某个留存版本），跑用例前先对每台目标设备逐个 `install_apk`（复用已有的、带版本降级自动卸载重装的命令），**不检测设备当前版本，每次都强制重装**——用户已确认这个策略：`adb install -r` 本身幂等,省下的一次装机时间远不如"跑错版本"的代价大。任一台装机失败就整轮放弃（`finish()` 提前返回），不会带着错误版本继续跑。
 - **向后兼容**：老 App（这个功能上线前注册的）`apps/<slug>/apks/` 目录不存在，`list_apk_versions` 返回空数组，`selectedVersion[slug]` 就不会被设置，执行时 `apkPath`/`package` 是 `undefined`，`runStore.start()` 走回原来"默认设备已装好"的老路径，不强制加装机步骤。
-- **`selectedVersion` 只在用户显式点选版本行时才会被设置**（`pickVersion()`），展开树只是拉列表展示，不会自动预选"最新版本"——这样 App 库卡片上 `app-sub` 那行版本号（点选前展示 `a.app_version`，即上次上传注册时探测到的版本；点选后展示 `selectedVersion[slug]`）才符合直觉：不点它就不变，点了才跟着切。这个显示值只是前端本地状态，不会写回 `target.json`——重启桌面壳后又会退回显示 `a.app_version`。
+- **`selectedVersion` 只在用户显式点选版本行时才会被设置**（`pickVersion()`），展开树只是拉列表展示，不会自动预选"最新版本"——这样 App 库卡片上 `app-sub` 那行版本号（点选前展示 `"—"`；点选后展示 `selectedVersion[slug]`）才符合直觉：不点它就不变，点了才跟着切。这个显示值只是前端本地状态，不会写回 `target.json`——重启桌面壳后又会退回显示 `"—"`（2026-08-18 起 `target.json` 不再存 `app_version` 快照，见 decisions.md #52，没有旧值可退）。
 
 ## 上传 APK 弹窗：装机改成可选（2026-07-22，`Runner.vue doUpload`）
 
@@ -1698,3 +1700,21 @@ RTT 313ms 时每条命令都要等三分之一秒，`push` 的窗口确认直接
 - **现象**：点「删除」提示"已删除设备登记"，列表刷新后那一行（尤其网络 adb `ip:port`，状态"离线"）依然在，看起来像前端没刷新。
 - **根因**：`list_devices`（`adb_devices()`）的行来源是每次现跑一遍 `adb devices` 的解析结果 + 别名文件里"这次没扫到"的补充行；删别名只清 `config/device_aliases.json`，不影响本地 `adb server` 记着的连接——网络 adb 连过一次后，即使目标不可达，`adb devices` 仍会把它列成 `offline`，直到显式 `adb disconnect` 或 `adb kill-server`。所以删别名对这类行没用，下次扫描该行原样冒出来。USB 设备物理插着同理删不掉（本就没有软件层面的"断开 USB"）。
 - **修**：`delete_device_alias` 里 serial 若含 `:`（网络 adb 特征），额外 best-effort 跑一次 `adb disconnect <serial>`，让 adb server 真正忘掉这个地址，下次扫描就不会再把它列进去。USB 物理连接的行则维持原状（软件侧本来就管不了，符合"删除只影响登记不影响物理连接"的既有设计）。断开后要用再 `adb connect` 回来；跑用例时 `adbkit.py` 的掉线自愈已会自动重连，不受影响。
+
+## 2.3.6 把「选择音频」页「下一个」按钮 id 从 `next_tv` 改成 `tv_next`——固化脚本全线 8s 超时，且极易被误判成产品缺陷（2026-08-17）
+
+- **现象**：CONV-CORE-01 在 2.3.6 上稳定失败于 `[find] 等待 8.0s 仍未出现 id='next_tv'`。人肉看屏幕，「下一个」按钮清晰可见、蓝底已激活、手点也正常，完全不像坏了。
+- **根因**：`PickerActivity`（音频转换/合并/混合三个模块**共用**同一个选择页）在 2.3.6 重构了底部栏：
+  - 「下一个」文案控件 `next_tv` → **`tv_next`**（旧 id 在 2.3.6 dump 里彻底消失）；
+  - 外层新增一个真正 `clickable=true` 的 `ll_next` FrameLayout，`tv_next` 自身 `clickable=false`。
+    `tapid` 是按 bounds 中心 `input tap`，落点在 `ll_next` 内，所以点 `tv_next` 照样能触发，不必改点 `ll_next`。
+- **影响面**：6 个固化脚本一起坏——`flow_conv_core.sh` / `flow_merge_core.sh` / `flow_merge_count.sh` /
+  `flow_merge_fmt.sh` / `flow_mix_core.sh` / `flow_mix_shortest.sh`。统一改成先试新名、失败退回旧名：
+  `$AK tapid tv_next --timeout 8 >/dev/null 2>&1 || $AK tapid next_tv --timeout 5 >/dev/null`
+- **教训（比 id 本身更重要）**：这次先被自动登记成了 P1 产品缺陷 `BUG-CONV-CORE-01`（两台设备"复现"），
+  而登记文字里自己就写着"按钮清晰可见且已激活（蓝底）"——**「控件按选择器定位不到」和「功能坏了」是两回事**。
+  版本升级后出现"某个 id 等不到、但界面上东西明明在"的失败，第一反应应是 `ui dump` 比对新旧版控件树、
+  确认 id 是否改名，而不是直接开缺陷单。判缺陷前先看这一步能省掉一整轮误报。
+- **negative 断言处要额外小心**：`flow_merge_count.sh` 有一处是"1 个已选中时点「下一个」应无反应"的
+  负向断言。那里**必须真的定位到按钮**（两个 id 都找不到就让 `set -e` 停），不能把定位失败吞成"点了没反应"
+  ——否则脚本会把"控件改名找不到"误判成"断言通过"，比直接失败更危险。

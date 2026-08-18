@@ -128,20 +128,15 @@ def read_exec_rows():
     return mine or rows
 
 
-def run_devices(exec_rows, cfg):
+def run_devices(exec_rows):
     """本轮实际跑过的设备 serial 列表（按 executions.csv 里首次出现的顺序去重）。
-    executions 为空（老轮次没有这张表 / 全靠单机 CLI 跑的）才退回 target.json 的单台 serial。
-    标题区「测试设备」必须列全部设备：多机回归时只显示 cfg.serial（编排最后写进去的那台）
-    会让报告读起来像只在一台上跑过，跟"本轮范围"一样属于阅读者必须先看到的执行前提。"""
+    target.json 不再记录单台 serial（多设备并行下那只是某次注册时的历史快照，早被
+    executions.csv 的逐台记录取代），executions 查不到就是真的没有——不再兜底。"""
     serials = []
     for r in exec_rows:
         s = (r.get("serial") or "").strip()
         if s and s not in serials:
             serials.append(s)
-    if not serials:
-        s = (cfg.get("serial") or "").strip()
-        if s:
-            serials = [s]
     return serials
 
 
@@ -160,14 +155,36 @@ def case_device_links(cid, serials, exec_rows):
     return [(s, link) for s in serials if (link := device_evidence_link(cid, s, exec_rows))]
 
 
-def issue_devices(issue, exec_rows, default_serial=""):
+def version_from_link(link):
+    """从证据路径 evidence/<app_slug>/<version>/<run_seg>/<case>/<serial> 里抠出真实版本段——
+    run_flow.py 写这条路径时已经现查过设备真实安装版本（见 _appctx.probe_installed_version），
+    比 target.json 的静态字段可靠（那个字段在"跟随设备"模式下装不下多设备各自的真实版本）。"""
+    parts = (link or "").split("/")
+    return parts[2] if len(parts) > 2 and parts[0] == "evidence" else ""
+
+
+def versions_label(pairs):
+    """[(serial, link)] → 版本展示文案。全设备同版本只显示一次；不同版本按设备分别标注，
+    避免把"各台可能装的版本不一样"这件事含糊成一个数字。"""
+    by_version = {}
+    for serial, link in pairs:
+        v = version_from_link(link)
+        if v:
+            by_version.setdefault(v, []).append(serial)
+    if not by_version:
+        return ""
+    if len(by_version) == 1:
+        return next(iter(by_version))
+    return "、".join(f"{v}（{devices_label(sers)}）" for v, sers in by_version.items())
+
+
+def issue_devices(issue, exec_rows):
     """这条问题记录复现在哪些设备上（serial 列表）。
 
     优先 issues.csv 的「执行设备」列（case_issue.py --serial 登记的，就是"哪台复现"的一手信息）；
     没登记（老问题行/登记时没传 --serial）退回 executions.csv 里这条用例判失败的设备；
-    再找不到就退回该用例本轮跑过的全部设备，最后兜到 target.json 的 serial。
-    宁可给"本轮跑过的这几台"这种略宽的范围，也不能一个设备都不写——多机回归时"在哪台上出的"
-    是复现问题的第一前提。"""
+    再找不到就退回该用例本轮跑过的全部设备。宁可给"本轮跑过的这几台"这种略宽的范围，
+    也不能一个设备都不写——多机回归时"在哪台上出的"是复现问题的第一前提。"""
     own = (issue.get("执行设备") or "").strip()
     if own:
         return [s.strip() for s in own.split(",") if s.strip()]
@@ -179,7 +196,7 @@ def issue_devices(issue, exec_rows, default_serial=""):
     for s in cands:
         if s and s not in out:
             out.append(s)
-    return out or ([default_serial] if default_serial else [])
+    return out
 
 
 def devices_label(serials):
@@ -826,12 +843,15 @@ def build_report(live, drive, folder_id, want_images):
     b.para([("Automated Regression Test Report", {"color": GREY, "italic": True})])
     b.newline()
     b.para([("项目名称：", {"bold": True, "color": DARK}), (cfg.get("app_name") or cfg.get("package", "-"), {"color": GREY})])
-    if cfg.get("app_version"):
-        b.para([("测试版本：", {"bold": True, "color": DARK}), (cfg["app_version"], {"color": GREY})])
-    # 测试设备：多机并行回归必须列全部设备，不能只显示 target.json 的 cfg.serial（编排收尾
-    # 最后写进去的那台）——那样读起来像只在一台上跑过。优先用 executions.csv 本轮出现过的全部
-    # serial（run_devices），没有才退回单台 cfg.serial；每台都走 device_label 拼"别名 (Android x)"。
-    run_serials = run_devices(exec_rows, cfg)
+    # 测试版本：从 executions.csv 各设备的证据路径解析真实安装版本（run_flow.py 落盘时已现查过），
+    # 不读 target.json 的静态字段——那个字段装不下"跟随设备"模式下各台可能不同的真实版本。
+    ver_label = versions_label([(r.get("serial", ""), r.get("证据链接", "")) for r in exec_rows])
+    if ver_label:
+        b.para([("测试版本：", {"bold": True, "color": DARK}), (ver_label, {"color": GREY})])
+    # 测试设备：多机并行回归必须列全部设备，不能只显示编排收尾最后写进去的那台——那样读起来
+    # 像只在一台上跑过。用 executions.csv 本轮出现过的全部 serial，每台走 device_label 拼
+    # "别名 (Android x)"。
+    run_serials = run_devices(exec_rows)
     b.para([("测试设备：", {"bold": True, "color": DARK}), (devices_label(run_serials), {"color": GREY})])
     start_t, end_t = read_log_span()
     exec_span = format_exec_span(start_t, end_t, now)
@@ -885,7 +905,7 @@ def build_report(live, drive, folder_id, want_images):
             cid = r.get("用例ID", "")
             qrow = queue_by_cid.get(cid)
             name = (qrow.get("一句话测试目标") or qrow.get("测试目的", "")) if qrow else ""
-            devs = devices_label(issue_devices(r, exec_rows, cfg.get("serial", "")))
+            devs = devices_label(issue_devices(r, exec_rows))
             rows.append([cid, name, qrow.get("模块", "") if qrow else "", devs])
         live.table(
             headers=["用例编号", "用例名称", "所属模块", "复现设备"],
@@ -912,7 +932,7 @@ def build_report(live, drive, folder_id, want_images):
     for r in issues:
         cid = r.get("用例ID", "")
         qrow = queue_by_cid.get(cid)
-        devs = issue_devices(r, exec_rows, cfg.get("serial", ""))
+        devs = issue_devices(r, exec_rows)
         dev_links = case_device_links(cid, devs, exec_rows)  # [(serial, 该设备自己的证据目录)]
         # 证据地址优先按设备取 executions.csv 的逐台真值——多设备并行下 queue「证据链接」是
         # 概览列（最后写入那台），拿它当"这条问题的证据"在多机场景会指错设备/漏掉其它复现设备。
@@ -930,8 +950,9 @@ def build_report(live, drive, folder_id, want_images):
         kv = []
         if symptom:
             kv.append(["失败原因", symptom])
-        if cfg.get("app_version"):
-            kv.append(["测试版本", cfg["app_version"]])
+        case_ver = versions_label(dev_links)
+        if case_ver:
+            kv.append(["测试版本", case_ver])
         if date_str:
             kv.append(["测试日期", date_str])
         if devs:  # 至少给"设备别名 + 安卓版本"，多台复现的问题必须知道是哪几台，不能被概览列盖过去

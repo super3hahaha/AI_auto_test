@@ -439,3 +439,12 @@
 - **问题**：flow-freeze 现有纪律是"脚本内部各校验点自己就地截 `<step>-fail.png`"，但这只覆盖 UI 断言类失败；logscan/output-check/MediaStore 交叉核对这类非 UI 校验点判失败时不会触发就地截图——于是这类失败会出现"判失败却一张画面证据都没有"。
 - **决定**：在 `run_flow.py` 收尾处（`mine` 证据清单算出来之后），若 `rc != 0` 且本轮登记的证据里没有任何一条「证据类型含 screenshots 且结果=失败」，才补调 `adbkit.py shot 99-flow-failed --result 失败` 截一张兜底图。判断只认「screenshots」类型，不能把 `99-run-log`（证据类型=logs，同样会挂 结果=失败）算作"已经有失败截图"，否则永远误判成"已经有"从而永不兜底。
 - **定位**：只是兜底，不是取代脚本内部就地截图——时序上晚于真正失败的那一刻（脚本还要跑完收尾逻辑），画面不保证和判定瞬间完全对应，纯粹为了"总比一张都没有强"。`scope`（`/<safe_serial>/<attempt>/` 过滤串）改成不再依赖 `ev.exists()`才算，因为兜底截图可能是本轮第一条证据（此时 evidence.csv 还不存在）。
+
+## 52. `app_version`/`serial` 彻底从 `target.json` 移除，`doc_report.py`「测试版本」改按设备解析证据路径（2026-08-18）
+
+- **问题**（用户实测「跟随设备」发现）：报告「测试版本」显示 `2.3.5J`，设备上 `dumpsys` 真实装的是 `2.3.6`（用 `192.168.209.171:5555` 现查确认）。根因排查发现比 #49 记录的更深一层：`doc_report.py` 的「测试版本」字段从来没走过 `probe_installed_version` 这条探测链路，一直是直接读 `target.json.app_version` 静态字段；#49 新增的 `set_target_app_version` 回写命令只覆盖"选留存版本强制重装"这一条路径，"跟随设备"（不装机）执行完全不会调它，字段停留在**上一次真正装机**（可能是几个月前的注册）时探测到的值。
+- **决定**：不再修补"装机后记得回写"这条链路本身有结构性缺陷——多设备并行下，`app_version` 装的是"哪一台"都不确定，单值字段天生表达不了"各台可能不同的真实版本"。改为彻底删除 `app_version`/`serial` 这两个字段，回到#39/#43 的同一条原则（executions.csv 逐台真值取代 target.json 单值快照）：
+  - `adbkit.py::app_version()`/`run_flow.py`/`case_result.py::detect_coverage()`/`auto_repair.py::newest_attempt_dir()` 全部改成**无条件**现查（`_appctx.probe_installed_version`），不再区分"跟随设备"与否——反正 target.json 已经没有静态值可退，直接现查最简单也最对。`AITEST_FOLLOW_DEVICE` 环境变量因此不再被 Python 侧读取（Rust 仍会注入，纯粹是把"这次是跟随设备"的语义透传下去，供将来调试用，当前不影响正确性）。
+  - `doc_report.py` 新增 `version_from_link()`/`versions_label()`：从 `executions.csv` 每行的证据链接 `evidence/<slug>/<version>/<run>/<case>/<serial>` 里解析出 `run_flow.py` 落盘时已经现查过的真实版本，标题区汇总本轮全部设备、失败详情按该问题实际复现的设备汇总；同版本只显示一次，不同版本按设备分别标注（如 `2.3.6（设备A）、2.3.5（设备B）`）。彻底不读 `target.json`，也就不存在"跟随设备"模式下失真的问题。
+  - `set_target_app_version` 命令（#49 引入）随字段一起删除；`init_target.py --write` 时用 `cfg.pop("serial", None)`/`cfg.pop("app_version", None)` 顺手清掉老 target.json 里的历史残留。`AppInfo`（`commands.rs`/`api.ts`）同步去掉这两个字段，`Runner.vue` App 库卡片未点选版本时的展示从退回 `a.app_version` 改成直接显示 `"—"`（没有旧值可退，比显示一个可能错的版本更诚实）。
+  - **连带修的另一个真实 bug**：`auto_repair.py::newest_attempt_dir()` 原来也读 `cfg.get("app_version", "")` 拼自愈要找的证据目录路径；字段删除后这行如果不改，`_safe("")` 会退到字面量 `"default"`，导致自愈流程永远找错证据目录——已同步改成现查，跟 `run_flow.py` 落盘时用同一份探测逻辑，两边算出来的路径不会再分岔。

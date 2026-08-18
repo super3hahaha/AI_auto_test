@@ -312,7 +312,6 @@ async function launch(newBoard: boolean) {
       title: `${slug} · ${cases.length} 用例 × ${planSerials.length} 设备${isMatrix ? "" : `（分派 ${cellCount} 格）`}${ver === FOLLOW_DEVICE ? " · 跟随设备" : ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
       apkPath: apkPath && pkg ? apkPath : undefined,
       package: apkPath && pkg ? pkg : undefined,
-      appVersion: apkPath && pkg && ver ? ver : undefined,
       langCode: langCode.value || undefined,
       followDevice: ver === FOLLOW_DEVICE,
     })
@@ -404,8 +403,9 @@ function selectApp(slug: string) {
 // 懒加载：第一次展开某个 App 才去查它的版本列表，查过就缓存，不用一次性把所有 App 的版本都拉一遍。
 const expandedApps = reactive(new Set<string>());
 const appVersions = reactive<Record<string, ApkVersionInfo[]>>({});
-// slug -> 用户手动点选的版本。不点选就一直是 undefined——展示用 a.app_version（上次上传注册时探测到的版本）、
-// 执行时也不强制重装，都走老逻辑。只有显式点了某个版本行，这两处才会跟着切换到点选的那个版本。
+// slug -> 用户手动点选的版本。不点选就一直是 undefined——展示为"—"（target.json 不再存静态
+// app_version 快照，没有旧值可退），执行时也不强制重装，都走老逻辑。只有显式点了某个版本行，
+// 这两处才会跟着切换到点选的那个版本。
 // 哨兵值 FOLLOW_DEVICE：显式选择"跟随设备"——语义上等同于不选任何版本（执行前不装机），
 // 但作为列表里一个可点选的条目存在，让用户能从"之前点过某个版本"的状态显式切回来
 // （原逻辑里 selectedVersion 一旦点过某个版本就没有办法回到"不强制装机"，见本次需求）。
@@ -446,8 +446,8 @@ async function removeApkVersion(slug: string, version: string) {
   if (!ok) return;
   try {
     await api.deleteApkVersion(slug, version);
-    // 删的正是当前选中版本：文件已经没了，不能再退回 a.app_version 显示（那只是注册时的元数据，
-    // 跟本地是否还留着安装包无关），显式切成「跟随设备」——跟 FOLLOW_DEVICE 哨兵值本来的语义一致。
+    // 删的正是当前选中版本：文件已经没了，没有旧元数据可退，显式切成「跟随设备」——
+    // 跟 FOLLOW_DEVICE 哨兵值本来的语义一致。
     if (selectedVersion[slug] === version) selectedVersion[slug] = FOLLOW_DEVICE;
     await fetchApkVersions(slug);
   } catch (e: any) {
@@ -521,7 +521,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
                     <span v-if="a.slug === store.activeSlug" class="dot">●</span>
                     <button class="app-del" title="删除此 App" @click.stop="removeApp(a.slug)">✕</button>
                   </div>
-                  <div class="app-sub muted">{{ selectedVersion[a.slug] === FOLLOW_DEVICE ? "跟随设备" : (selectedVersion[a.slug] || a.app_version || "—") }} · {{ a.package }}</div>
+                  <div class="app-sub muted">{{ selectedVersion[a.slug] === FOLLOW_DEVICE ? "跟随设备" : (selectedVersion[a.slug] || "—") }} · {{ a.package }}</div>
                 </div>
               </div>
               <div v-if="expandedApps.has(a.slug)" class="app-version-list">

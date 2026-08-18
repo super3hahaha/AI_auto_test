@@ -14,9 +14,7 @@ export interface AppInfo {
   slug: string;
   app_name: string;
   package: string;
-  app_version: string;
   sheet_id: string;
-  serial: string;
   updated_at: number;
 }
 export interface ApkInfo {
@@ -110,6 +108,7 @@ export interface RecScreen {
   nodes: RecNode[];
   labels: string[]; // 本屏可见文案（已去广告噪声）；下一步 act 回传当 diff 基线
   backend: string; // 实际用的 dump 后端：u2 约 7× 于 shell；退回 shell 时用户该知道为什么变慢
+  auto_swept: number; // 本次探屏顺带自动清掉的广告全屏页个数（0=没遇到），见 recorder.py probe()
 }
 export interface RecStep {
   n: number;
@@ -119,6 +118,7 @@ export interface RecStep {
   script: string[]; // 这一步落进固化脚本时的样子：滑动/无选择器点击都是 bounds 现算，不含硬坐标
   diff: { appeared: string[]; disappeared: string[] };
   out?: string;
+  auto_swept?: number; // 这一步执行后顺带自动清掉的广告全屏页个数
   warn?: string;
   needs_attention?: string;
   child_anchor?: { by: string; v: string; child: string };
@@ -215,8 +215,10 @@ export const api = {
     invoke<DeviceRow[]>("list_devices", { appSlug: slug, force }),
   // ── 录制器：三个无状态子命令，步骤列表由 Recorder.vue 持有（见 Rust 侧 recorder_cmd 注释）──
   // probe ≈ 1-3s，act ≈ 3-5s，调用方必须上 loading
-  recProbe: (slug: string, serial: string) =>
-    invoke<RecScreen>("recorder_cmd", { appSlug: slug, sub: "probe", serial }),
+  recProbe: (slug: string, serial: string, autoSweep = true) =>
+    invoke<RecScreen>("recorder_cmd", {
+      appSlug: slug, sub: "probe", serial, payload: JSON.stringify({ auto_sweep: autoSweep }),
+    }),
   recAct: (slug: string, serial: string, body: Record<string, unknown>) =>
     invoke<{ step: RecStep; screen: RecScreen }>("recorder_cmd", {
       appSlug: slug, sub: "act", serial, payload: JSON.stringify(body),
@@ -235,8 +237,6 @@ export const api = {
     invoke<void>("set_target_scope", { appSlug: slug, scope }),
   setTargetDumpBackend: (slug: string, dumpBackend: string) =>
     invoke<void>("set_target_dump_backend", { appSlug: slug, dumpBackend }),
-  setTargetAppVersion: (slug: string, appVersion: string) =>
-    invoke<void>("set_target_app_version", { appSlug: slug, appVersion }),
   readSummary: (slug: string) => invoke<KV[]>("read_summary", { appSlug: slug }),
   readStructure: (slug: string) => invoke<StructureRow[]>("read_structure", { appSlug: slug }),
 
@@ -280,7 +280,8 @@ export const api = {
 
   // 流式：返回 promise（resolve 退出码）；onLine 收每行日志。langCode 不传/空串=不注入
   // LANG_CODE，固化脚本里的 t() 走原文直通（未接过语言机制的脚本行为不变）。followDevice=true
-  // 时给子进程注入 AITEST_FOLLOW_DEVICE=1，让证据版本段现查设备真实安装版本（见「跟随设备」）。
+  // 时给子进程注入 AITEST_FOLLOW_DEVICE=1（当前 run_flow.py/adbkit.py 无条件现查真实安装版本，
+  // 不再依赖这个变量分支，仅保留把"跟随设备"语义透传下去）。
   runFlow(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, followDevice: boolean, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;

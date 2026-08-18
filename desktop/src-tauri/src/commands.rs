@@ -177,9 +177,7 @@ pub struct AppInfo {
     pub slug: String,
     pub app_name: String,
     pub package: String,
-    pub app_version: String,
     pub sheet_id: String,
-    pub serial: String,
     // target.json 的文件修改时间（unix 秒），仅用于同包名多条历史记录时取"最近使用的一条"
     pub updated_at: i64,
 }
@@ -220,9 +218,7 @@ pub fn list_apps(app: AppHandle) -> Result<Vec<AppInfo>, String> {
                     if n.is_empty() { slug.clone() } else { n }
                 },
                 package: s("package"),
-                app_version: s("app_version"),
                 sheet_id: s("sheet_id"),
-                serial: s("serial"),
                 slug,
                 updated_at,
             });
@@ -1056,26 +1052,6 @@ pub fn set_target_dump_backend(app: AppHandle, app_slug: String, dump_backend: S
     Ok(())
 }
 
-/// 设本次实际装机的 App 版本：写回 apps/<slug>/target.json 的 app_version。
-/// 场景库「选中留存版本执行」这条路径只会 `adb install -r` 逐台强制重装选中的 apk（见
-/// runStore.ts `start()` 装机段），却从没把选中的版本号回写进 target.json——`app_version`
-/// 只在 `register_app`（首次上传注册）时被 init_target.py 现查一次，之后哪怕又跑了别的
-/// build，这个字段也不会跟着变。case_result.py/adbkit.py/doc_report.py 全都直接读这个静态
-/// 字段（决定证据落哪个版本目录、Doc 报告「测试版本」显示什么），跟不上就会自相矛盾
-/// （2026-08-04 发现：设备上 dumpsys 真实装的是 2.3.5J，报告却显示成上次注册时的 2.3.5）。
-/// 装机成功后立刻调用本命令，让 target.json 跟"这一轮实际跑的是哪个版本"保持一致。
-#[tauri::command]
-pub fn set_target_app_version(app: AppHandle, app_slug: String, app_version: String) -> Result<(), String> {
-    let root = root_of(&app)?;
-    let p = app_root(&root, &app_slug).join("target.json");
-    let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
-    v["app_version"] = Value::String(app_version);
-    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // 概览 summary.csv
 // ---------------------------------------------------------------------------
@@ -1460,9 +1436,10 @@ pub async fn run_flow(
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
             cmd.env("LANG_CODE", lc);
         }
-        // 场景库选了「跟随设备」（不装机，用设备上已装的 App 回归）时注入，让 run_flow.py /
-        // adbkit.py 的证据版本段现查设备真实安装版本，而不是信任 target.json 里可能过期的
-        // app_version（见 _appctx.probe_installed_version）。
+        // 场景库选了「跟随设备」（不装机，用设备上已装的 App 回归）时注入。注意：run_flow.py/
+        // adbkit.py 现在无条件现查设备真实安装版本（target.json 已不存静态 app_version 字段），
+        // 不再依赖这个环境变量做分支——这里保留注入只是把"这次是跟随设备"的语义透传下去，
+        // 供将来调试/扩展用，当前 Python 侧不读它也不影响正确性。
         if follow_device.unwrap_or(false) {
             cmd.env("AITEST_FOLLOW_DEVICE", "1");
         }

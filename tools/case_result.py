@@ -33,14 +33,13 @@ def detect_coverage(serial):
     if not pkg:
         return "未知（config 缺 package）"
     base = ["adb"] + (["-s", serial] if serial else [])
-    ver = cfg.get("app_version", "")
-    if not ver:
-        r = subprocess.run(base + ["shell", "dumpsys", "package", pkg], capture_output=True, text=True)
-        for ln in r.stdout.splitlines():
-            if "versionName=" in ln:
-                ver = ln.strip().split("versionName=", 1)[1].split()[0]
-                break
-        ver = ver or "未知版本"
+    r = subprocess.run(base + ["shell", "dumpsys", "package", pkg], capture_output=True, text=True)
+    ver = ""
+    for ln in r.stdout.splitlines():
+        if "versionName=" in ln:
+            ver = ln.strip().split("versionName=", 1)[1].split()[0]
+            break
+    ver = ver or "未知版本"
     r = subprocess.run(base + ["shell", "run-as", pkg, "echo", "ok"], capture_output=True, text=True)
     mode = "debug(可run-as，DB/SP/privls可用)" if r.stdout.strip() == "ok" else "release(黑盒:UI/output-check/logscan)"
     return f"{ver} {mode} 已跑"

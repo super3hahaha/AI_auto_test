@@ -1,9 +1,14 @@
 #!/usr/bin/env python3
 """init_target —— 给包名，自动探测设备/App 信息，生成或更新 config/target.json。
 
-只需要一个包名，其余「跟这个包/这台设备相关」的字段自动查：
-    serial          —— adb devices（只有一台在线自动选，多台需 --serial 指定）
-    app_version     —— dumpsys package 的 versionName
+只需要一个包名，其余「跟这个包/这台设备相关」的字段自动查（serial/app_version 只是探测
+过程中的临时依据，不落盘——见下方说明）：
+    serial          —— adb devices（只有一台在线自动选，多台需 --serial 指定），仅用于本次
+                       探测该连哪台设备，不写回 target.json（多设备并行下没有"默认设备"，
+                       executions.csv 才是逐台真值，见 docs/gotchas.md）
+    app_version     —— dumpsys package 的 versionName，仅嵌进下面的 build 说明文本；不单独
+                       持久化成字段（装的包随时可能换，快照式的静态字段只会越放越过期，
+                       adbkit.py/run_flow.py 已改成每次现查，见 _appctx.probe_installed_version）
     app_name        —— pull apk 后 aapt dump badging 的 application-label
     main_activity   —— 同一次 badging 的 launchable-activity
     build           —— dumpsys package flags 是否含 DEBUGGABLE，拼出黑盒/白盒 oracle 深度说明
@@ -203,9 +208,9 @@ def main():
 
     print("=== 探测结果 ===")
     print(f"  package        = {r['package']}")
-    print(f"  serial         = {r['serial']}")
+    print(f"  serial         = {r['serial']}（仅本次探测用，不写回 target.json）")
     print(f"  app_name       = {r['app_name']}")
-    print(f"  app_version    = {r['app_version']}")
+    print(f"  app_version    = {r['app_version']}（仅嵌进 build 说明，不单独写回 target.json）")
     print(f"  main_activity  = {r['main_activity'] or '(未探到，可手填)'}")
     print(f"  build          = {r['build']}")
     if r["_db_candidates"]:
@@ -222,8 +227,12 @@ def main():
 
     base = CFG_PATH if CFG_PATH.exists() else EXAMPLE_PATH
     cfg = json.loads(base.read_text()) if base.exists() else {}
-    for k in ("package", "serial", "app_name", "app_version", "main_activity", "build", "db_name"):
+    # serial/app_version 不落盘：serial 没有"默认设备"这回事（多设备并行下 executions.csv 才是
+    # 逐台真值），app_version 是运行时随时会变的设备状态、不是注册时刻能定死的配置。
+    for k in ("package", "app_name", "main_activity", "build", "db_name"):
         cfg[k] = r[k]
+    cfg.pop("serial", None)
+    cfg.pop("app_version", None)
     if args.dump_backend:
         if args.dump_backend == "u2" and atx_ok is False:
             print("[init_target] 警告：atx 健康检查没过，仍按你的显式要求写入 dump_backend=u2；"

@@ -174,12 +174,10 @@ def main():
     # 证据链接(current_link) 用 run_id 段（无则退回今天日期，兼容旧机器）；停在 serial 层、不含 attempt，
     # 这样它作为前缀能覆盖本 run 该用例的所有 attempt（doc_report 按此前缀筛"本轮"证据）。
     run_seg = cfg.get('run_id') or end_dt.strftime('%Y%m%d')
-    # 版本段：跟随设备模式（env AITEST_FOLLOW_DEVICE=1）不装机，target.json 里注册时写的
-    # app_version 未必是这台设备真实在跑的版本，现查一次；否则沿用老逻辑直读 config。
+    # 版本段：现查这台设备真实安装的版本——target.json 不再存静态 app_version 字段
+    # （装的包随时可能换，注册时的快照会过期，多设备场景下各台还可能彼此不同）。
     # 与 adbkit.app_version() 共用 _appctx.probe_installed_version，两处不会分岔。
-    app_ver = cfg.get('app_version', '')
-    if os.environ.get("AITEST_FOLLOW_DEVICE") == "1":
-        app_ver = probe_installed_version(cfg.get("package", ""), serial) or app_ver or "unknown"
+    app_ver = probe_installed_version(cfg.get("package", ""), serial) or "unknown"
     evidence = f"evidence/{app_slug}/{app_ver}/{run_seg}/{a.case}/{serial}"
 
     if rc == 0:

@@ -18,6 +18,7 @@
 // onActivated，onMounted 只有首次跑。要拿 DOM 一律用模板 ref，不要 document.querySelector(".stage")
 // —— 被缓存的 DOM 仍挂在文档里，而 Evidence.vue 也有个 .stage，全局选择器会量到它身上。
 import { ref, computed, onMounted, onActivated, watch, nextTick } from "vue";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { api, type DeviceRow, type RecScreen, type RecNode, type RecStep, type RecSel } from "../api";
 import { store } from "../store";
 
@@ -36,6 +37,9 @@ const shot = ref<HTMLImageElement | null>(null);
 const stage = ref<HTMLElement | null>(null);
 const nat = ref<[number, number] | null>(null); // 截图真实像素，框定位的基准
 const line = ref<{ x: number; y: number; len: number; deg: number } | null>(null);
+// 默认开：录制器遇到已知广告 SDK 全屏页（scope 卡死，见 recorder.py AD_RULE_IDS）自动清一遍再
+// 呈现当前屏，不用人眼看到广告手动点「清障」。留开关是防万一——真出现误判，随手关掉退回手动。
+const autoSweep = ref(true);
 
 function defaultCase() {
   const d = new Date();
@@ -189,24 +193,32 @@ async function call<T>(what: string, fn: () => Promise<T>): Promise<T | null> {
 
 async function probe() {
   if (!serial.value) return;
-  const s = await call("探当前屏…", () => api.recProbe(store.activeSlug, serial.value));
-  if (s) screen.value = s;
+  const s = await call("探当前屏…", () => api.recProbe(store.activeSlug, serial.value, autoSweep.value));
+  if (s) {
+    screen.value = s;
+    if (s.auto_swept) msg.value = `已自动清障 ${s.auto_swept} 次（广告全屏页）`;
+  }
 }
 
 async function act(body: Record<string, unknown>) {
   if (!serial.value) return;
   if (!caseId.value.trim()) caseId.value = defaultCase();
+  // 用当前最大 n + 1，不能用 length + 1：中间删过步骤后两者不等，会撞上残留的旧 n
+  // （撞号会让 shots/{n}.png 互相覆盖，且 v-for :key="s.n" 重复）
+  const nextN = steps.value.reduce((m, s) => Math.max(m, s.n), 0) + 1;
   const r = await call(`执行 ${body.kind}…`, () =>
     api.recAct(store.activeSlug, serial.value, {
       ...body,
       case: caseId.value.trim(),
-      n: steps.value.length + 1,
+      n: nextN,
       before_labels: screen.value?.labels,
+      auto_sweep: autoSweep.value,
     })
   );
   if (r) {
     steps.value.push(r.step);
     screen.value = r.screen;
+    if (r.step.auto_swept) msg.value = `已自动清障 ${r.step.auto_swept} 次（广告全屏页）`;
   }
 }
 
@@ -268,6 +280,17 @@ function note() {
 function undo() {
   steps.value.pop();
 }
+function deleteStep(n: number) {
+  steps.value = steps.value.filter((s) => s.n !== n);
+}
+async function clearSteps() {
+  const ok = await confirm(`已录 ${steps.value.length} 步，清空后不可恢复。`, {
+    title: "确认清空全部步骤？",
+    kind: "warning",
+  });
+  if (!ok) return;
+  steps.value = [];
+}
 async function doExport() {
   const c = caseId.value.trim();
   if (!c || !steps.value.length) {
@@ -309,6 +332,9 @@ onMounted(async () => {
       </select>
       <input v-model="caseId" class="mono case" placeholder="用例 ID" />
       <button @click="probe" :disabled="!serial || !!busy">{{ screen ? "重新探屏" : "开始（探当前屏）" }}</button>
+      <label class="small auto-sweep" title="遇到已知广告 SDK 全屏页自动清掉，不用人眼看到广告再手动点「清障」">
+        <input type="checkbox" v-model="autoSweep" /> 自动清障
+      </label>
       <span class="muted small">产物落 <span class="mono">apps/{{ store.activeSlug }}/recordings/&lt;用例ID&gt;/</span></span>
     </div>
 
@@ -393,6 +419,7 @@ onMounted(async () => {
           <b>步骤 {{ steps.length }}</b>
           <span v-if="warnCount" class="pill pill-warning">{{ warnCount }} 步需人工处理</span>
           <span class="sp"></span>
+          <button class="mini" @click="clearSteps" :disabled="!steps.length">清空步骤</button>
           <button class="mini" @click="undo" :disabled="!steps.length">撤销末步</button>
           <button class="mini" @click="doExport" :disabled="!steps.length || !!busy">导出</button>
         </div>
@@ -402,6 +429,7 @@ onMounted(async () => {
         </div>
         <div v-for="s in steps" :key="s.n" class="card step">
           <div class="sn">#{{ s.n }}</div>
+          <button class="mini sdel" title="删除这一步" @click="deleteStep(s.n)">✕</button>
           <div class="sbody">
             <div class="slabel">{{ s.label }}</div>
             <div v-if="s.script?.length" class="mono cmd">
@@ -516,8 +544,11 @@ h2 { margin: 0; font-weight: 500; }
 .a-ok { color: var(--text-success); }
 .a-bad { color: var(--text-danger); font-weight: 500; }
 .hd2 { display: flex; align-items: center; gap: 8px; margin: 12px 0 8px; }
-.step { display: grid; grid-template-columns: 30px 1fr; gap: 8px; padding: 10px 12px; margin-bottom: 6px; }
+.step { position: relative; display: grid; grid-template-columns: 30px 1fr; gap: 8px; padding: 10px 12px; margin-bottom: 6px; }
 .sn { color: var(--text-secondary); font-size: 12px; }
+.sdel { position: absolute; top: 8px; right: 10px; padding: 0 6px; line-height: 20px; height: 20px;
+        color: var(--text-secondary); }
+.sdel:hover { color: var(--text-danger); }
 .sbody { min-width: 0; }
 .slabel { font-weight: 500; font-size: 13px; }
 .cmd { font-size: 12px; background: var(--bg-code, rgba(127,127,127,.12)); padding: 2px 6px;

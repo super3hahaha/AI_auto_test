@@ -24,7 +24,6 @@ pub fn run() {
             commands::read_device_model_cache,
             commands::set_target_scope,
             commands::set_target_dump_backend,
-            commands::set_target_app_version,
             commands::upsert_device_alias,
             commands::delete_device_alias,
             commands::export_device_aliases,

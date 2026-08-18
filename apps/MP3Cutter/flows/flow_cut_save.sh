@@ -66,9 +66,15 @@ $AK focus 2>/dev/null | grep -q "$PKG" || { log "App 不在前台，重新拉起
 # dump_hierarchy 能看到 WebView 覆盖层里的 `关闭` 节点，sweep 规则直接点得到，盲点兜底不再需要；
 # 而那 8 连点里 y=15/40 落在状态栏区、两列自上而下快速点会被系统当成「下拉」手势把通知栏拉出来
 # 盖住页面（还有 AD_W 取物理尺寸 1440 而非 override 1080 导致 x 越界的 bug）。详见 gotchas.md。
-CUT_ENTRY="$(t 音频裁剪 mp3_cutter)"   # resource-id=ll_cut 真机核对确认是 mp3_cutter 这个 key（非 audio_cutter，两者zh-rCN撞车）
+CUT_ENTRY="$(t 音频裁剪 mp3_cutter)"   # 仅作兜底/日志用途，见下方说明
+# 2026-08-17 真机复现（192.168.209.171:5555）：系统 locale 仍是 zh-Hans-CN，但首页六宫格
+# tile 的文案渲染成了英文「Audio Cutter」而非「音频裁剪」（同一批设备早前跑 CONV-CORE-01
+# 时该处还是中文，尚未查清是 App 显示语言跟随逻辑变化还是这批机型的间歇状态）——原来靠
+# t() 查表出的固定中文文案去 waitfor/taptext，在这种情况下必然等 8s 超时，且现象(按钮清晰
+# 可见且已激活) 极易被误判成产品缺陷（见 gotchas.md 2026-08-17 条目）。改成按 resource-id
+# ll_cut 定位/点击，不依赖显示语言，从根上不怕这类语言不同步问题。
 for _ in $(seq 1 15); do
-  $AK waitfor text "$CUT_ENTRY" --timeout 1 >/dev/null 2>&1 && break
+  $AK waitfor id ll_cut --timeout 1 >/dev/null 2>&1 && break
   # App 被广告任务/残留状态弹回桌面时 focus 不含包名——重新拉回前台，别停在桌面空转
   $AK focus 2>/dev/null | grep -q "$PKG" || { log "广告页把 App 弹出，重新拉起"; $AK launch >/dev/null 2>&1; sleep 3; }
   sweep --rounds 5 --interval 1.2 --patience 2
@@ -76,16 +82,23 @@ for _ in $(seq 1 15); do
   $AK tapid close-button --timeout 2 >/dev/null 2>&1 || true
   $AK tapdesc "Interstitial close button" --timeout 2 >/dev/null 2>&1 || true
 done
-# 首页截图挪到这里：清广告循环退出后才截，并挂真实门控——『音频裁剪』必须在屏才记「通过」。
-# 若广告（含关不掉的 WebView 插屏）还盖着首页，音频裁剪就不在 uiautomator 树里 → shot 记「失败」
+# 首页截图挪到这里：清广告循环退出后才截，并挂真实门控——『音频裁剪』tile 必须在屏才记「通过」。
+# 若广告（含关不掉的 WebView 插屏）还盖着首页，ll_cut 就不在 uiautomator 树里 → shot 记「失败」
 # 并非0退出，set -e 让整轮如实判失败，而不是把广告截图当首页判过（修掉历史假阳性）。
+# --assert-text 不能再硬编码 CUT_ENTRY（显示语言可能是中文也可能是英文，见上）——现读 ll_cut
+# 子节点当前真实文案存入 CUT_LABEL 用来断言，断言永远跟当次真实显示的语言一致；读不到（比如
+# 页面结构又变了）才退回 t() 查表值兜底，保证这条断言不会因为读不到就直接跳过。
+HOME_XML=$($AK --case "$CASE" ui 01-home 2>/dev/null)
+CUT_LABEL=$(grep -oE '<node[^>]*resource-id="[^"]*id/ll_cut"[^>]*><node[^>]*text="[^"]*"' <<< "$HOME_XML" \
+  | grep -oE 'text="[^"]*"$' | sed 's/^text="//; s/"$//')
+[ -n "$CUT_LABEL" ] || CUT_LABEL="$CUT_ENTRY"
 # --assert-gone 兜一发原生广告标志（WebView 创意不进树，对其为盲区，仅作 belt-and-suspenders）。
 # --assert-timeout 6 给首页控件慢一拍出现留余量。
-$AK --case "$CASE" shot 01-home "App 首页正常显示（隐私同意弹窗已关、无插屏广告遮挡）" \
-  --assert-text "$CUT_ENTRY" --assert-gone 测试广告 --assert-timeout 6 >/dev/null; log "首页(已门控)"
+$AK --case "$CASE" shot 01-home "App 首页正常显示（隐私同意弹窗已关、无插屏广告遮挡），入口文案「$CUT_LABEL」" \
+  --assert-text "$CUT_LABEL" --assert-gone 测试广告 --assert-timeout 6 >/dev/null; log "首页(已门控，入口=$CUT_LABEL)"
 # 测试广告(--assert-gone)不查表：这是 AdMob 插屏的固定占位文案，不是 app 自身 strings.xml
 # 资源、不随设备语言变化，仅作 belt-and-suspenders，见脚本头注。
-$AK taptext "$CUT_ENTRY" --timeout 8 >/dev/null
+$AK tapid ll_cut --timeout 8 >/dev/null
 # 点「音频裁剪」后依次弹：文件访问(App内btn) → 通知权限(系统) → 音频权限(系统)，
 # 清数据后每次都会重新出现；顺序/是否出现可能随系统版本变化。
 # 文件访问是 App 内自定义按钮(id=btn)，不在通用库里，单独点；命中就点，没有就跳过。

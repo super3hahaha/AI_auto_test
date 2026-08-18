@@ -20,6 +20,8 @@ pub fn run() {
             commands::list_flows,
             commands::list_devices,
             commands::recorder_cmd,
+            commands::recorder_session_start,
+            commands::recorder_session_stop,
             commands::read_device_aliases,
             commands::read_device_model_cache,
             commands::set_target_scope,
@@ -70,6 +72,7 @@ pub fn run() {
             // run 进程组一起收掉，避免 python/auto_repair/claude 变成孤儿进程留在后台。
             if let tauri::RunEvent::Exit = event {
                 commands::kill_all_run_pgids_blocking();
+                commands::kill_all_rec_sessions_blocking(); // 录制 daemon（含其 scrcpy 子进程）也不留孤儿
             }
         });
 }

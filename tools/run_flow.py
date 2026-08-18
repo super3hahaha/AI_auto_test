@@ -49,6 +49,38 @@ def _key_lines(text, limit=600):
     return joined[:limit] + "…" if len(joined) > limit else joined
 
 
+def _prewarm_lang_table(script_path, serial, env):
+    """需要查表的执行（LANG_CODE 已设且跟脚本源语言不同）才提前备好该设备版本的多语言表，
+    路径经 env LANG_TABLE 传给脚本，省掉 lang_helper 在脚本内现场 ensure 的那一次 adb 往返。
+
+    只预热、不判定：ensure 失败这里不阻断，留给 lang_helper 里的 t() 在真正要查表时报错——
+    脚本可能压根没接 t()（那种情况 LANG_CODE 传了也没用），不该因为备表失败就先把用例判死。
+    """
+    lang = (env.get("LANG_CODE") or "").strip()
+    if not lang:
+        return
+    try:
+        body = pathlib.Path(script_path).read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return
+    if "lang_helper.sh" not in body:      # 脚本没接 t()，预热纯属浪费
+        return
+    m = re.search(r"^export SRC_LANG=(\S+)", body, re.M)
+    src = m.group(1) if m else "zh-rCN"   # 与 lang_helper.sh 的默认值保持一致
+    if lang == src:                        # t() 会原样直通，不查表也就不用备表
+        return
+    try:
+        r = subprocess.run([sys.executable, "tools/lang_table.py", "ensure", "--serial", serial],
+                           cwd=str(REPO), capture_output=True, text=True, timeout=300)
+        if r.returncode == 0 and r.stdout.strip():
+            env["LANG_TABLE"] = r.stdout.strip().splitlines()[-1]
+        else:
+            print(f"[run_flow] 多语言表预热失败（不阻断，脚本内会再试一次）："
+                  f"{(r.stderr or r.stdout).strip()[:300]}", flush=True)
+    except Exception as e:
+        print(f"[run_flow] 多语言表预热异常（不阻断）：{e}", flush=True)
+
+
 def _attach_run_log(case, serial, env, chunks, result_word, tail_note):
     """把本次固化脚本的整份流程日志落进本 attempt 的证据目录并登记成证据行。
 
@@ -147,6 +179,11 @@ def main():
         _attach_run_log(a.case, serial, env, chunks, "需复核", "被用户中止")
         os._exit(143)
     signal.signal(signal.SIGTERM, _on_term)
+
+    # 多语言表：跑之前按「这台设备此刻实装的 versionCode」备好（见 decisions #55）。
+    # 放在 signal handler 注册之后、Popen 之前：冷路径要拉 base.apk + 跑 aapt2（约 6s），
+    # 这段时间里用户点「中止」也能被上面的 handler 正常收走。
+    _prewarm_lang_table(script_path, serial, env)
 
     t0 = time.monotonic()
     # 固化脚本的输出要 tee：一路原样逐行写回本进程 stdout（桌面壳 Rust 侧逐行泵、auto_repair 逐行

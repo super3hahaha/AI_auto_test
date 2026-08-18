@@ -21,6 +21,9 @@ import { ref, computed, onMounted, onActivated, watch, nextTick } from "vue";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { api, type DeviceRow, type RecScreen, type RecNode, type RecStep, type RecSel } from "../api";
 import { store } from "../store";
+import { RecorderSession } from "../recorder/session";
+import { VideoPipe } from "../recorder/videoPipe";
+import type { DaemonMsg } from "../recorder/types";
 
 const devices = ref<DeviceRow[]>([]);
 const serial = ref("");
@@ -31,6 +34,15 @@ const mode = ref<"tap" | "swipe" | "longdrag" | "xy">("tap");
 const busy = ref("");
 const err = ref("");
 const msg = ref("");
+// 清障这类"过程噪音"不进 msg：msg 是常驻横幅，会把下面整块内容顶下去。走浮层 toast，
+// 绝对定位不占高度，1s 自动消失（清障本身不需要人确认，只是让人知道刚发生过）
+const toast = ref("");
+let toastTimer: number | undefined;
+function showToast(t: string) {
+  toast.value = t;
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = window.setTimeout(() => { toast.value = ""; }, 1000);
+}
 const ambig = ref<RecNode | null>(null);
 const ambigPick = ref(0);
 const shot = ref<HTMLImageElement | null>(null);
@@ -40,6 +52,204 @@ const line = ref<{ x: number; y: number; len: number; deg: number } | null>(null
 // 默认开：录制器遇到已知广告 SDK 全屏页（scope 卡死，见 recorder.py AD_RULE_IDS）自动清一遍再
 // 呈现当前屏，不用人眼看到广告手动点「清障」。留开关是防万一——真出现误判，随手关掉退回手动。
 const autoSweep = ref(true);
+// 录制结束后人要慢慢看/整理步骤，此时视频流+自动刷屏还在跑纯属打扰（且真机上持续占用 scrcpy/u2）。
+// 「停止录制」只掐这条：断开 daemon 会话、停视频，画面定格在最后一屏；已录步骤原样保留仍可导出。
+// act() 统一在入口挡这一道，覆盖所有触发点（工具栏按钮/点框/滑动/文本），不用逐个按钮加 disabled。
+const stopped = ref(false);
+
+// ── 录制器 V2 会话（常驻 daemon + WS）────────────────────────────────────────
+// wsMode=true：动作/探屏/导出全走 WS（步骤卡 ~0.2s、新框 ~1s）；daemon 起不来（python 缺
+// websockets 等）自动降级 legacy——下面 probe/act/doExport 里各自分流，UI 完全一样只是慢。
+const sess = new RecorderSession();
+const wsMode = ref(false);
+// stale：发出动作后到新控件框到达之间，旧框对应的树已过时——画面压暗+框禁点，防"照着旧框点错"
+// （这是旧架构"截图与 dump 不同时刻"坑在异步架构下的等价物，见 docs/gotchas.md 2026-08-03）
+const stale = ref(false);
+const connState = ref(""); // ""=未连 / "ws"=V2 / "legacy"=降级（界面上要让用户知道现在是哪条链路）
+let lastShotSeq = 0;
+
+// ── 视频流（scrcpy → WebCodecs → canvas）────────────────────────────────────
+// videoActive 只在**第一帧真的画出来**后才置 true（daemon 声称有视频 ≠ 解码成功），在那之前
+// 取屏区继续显示 shot 静态图；解码器连挂 3 次自动退回静态图模式，产品可用性不依赖视频流。
+const videoCanvas = ref<HTMLCanvasElement | null>(null);
+const videoActive = ref(false);
+const deviceWH = ref<[number, number] | null>(null); // 设备逻辑分辨率（画框基准，≠视频尺寸）
+let pipe: VideoPipe | null = null;
+
+// ── 画面变化 ↔ 控件框失效的对齐 ─────────────────────────────────────────────
+// 视频是连续的、树是离散 dump 的：过渡动画期间框对应的还是上一屏（用户看到"虚线位置不对"）。
+// scrcpy 画面不变就不发帧 ⇒ 「有帧到达」==「画面在变」。据此：
+//  · 画面在动 → motionStale 压暗禁点（跟 act 后的 stale 同款视觉），但持续动画（广告 banner
+//    这类永远在动）超过 3s 就不再压——树对 banner 以外的区域仍然有效，一直压反而没法录；
+//  · 画面停稳 400ms → 立刻主动要一份新树（限频 1.2s），不用干等 3s 空闲巡屏。
+const motionStale = ref(false);
+let lastFrameAt = 0;
+let motionStart = 0;
+let quietTimer: ReturnType<typeof setTimeout> | undefined;
+let lastAutoRefresh = 0;
+
+function onVideoMotion() {
+  const t = performance.now();
+  if (t - lastFrameAt > 600) motionStart = t; // 静了一阵又来帧 = 新一波画面变化
+  lastFrameAt = t;
+  if (t - motionStart < 3000) motionStale.value = true;
+  else motionStale.value = false; // 持续动画（banner）：3s 后视为"树基本稳定"，恢复可点
+  clearTimeout(quietTimer);
+  quietTimer = setTimeout(() => {
+    motionStale.value = false;
+    // 画面刚停稳：树多半已变，主动刷一份（act 触发的刷新有自己的流程，stale 时不重复要）
+    if (!wsMode.value || stale.value) return;
+    const now = Date.now();
+    if (now - lastAutoRefresh < 1200) return;
+    lastAutoRefresh = now;
+    sess.send({ t: "refresh", auto_sweep: autoSweep.value });
+  }, 400);
+}
+
+// 首帧看门狗：daemon 报了 videoMeta（= scrcpy 在推流）就开始计时，到点还没画出第一帧就判定
+// "这条链路前端解不出"，主动让 daemon 关流回退 screencap。缺了它就是纯软失败——没有异常、没有
+// 报错、画面永远黑、控件框一个都不画（框的定位基准 base 只认真实画面尺寸），用户只看到"探屏失败"。
+const VIDEO_FIRSTFRAME_MS = 4000;
+let videoWatchdog: number | undefined;
+function armVideoWatchdog() {
+  clearTimeout(videoWatchdog);
+  videoWatchdog = window.setTimeout(() => {
+    if (videoActive.value || !wsMode.value) return;
+    fallbackToStill(`视频流 ${VIDEO_FIRSTFRAME_MS / 1000}s 没出第一帧`);
+  }, VIDEO_FIRSTFRAME_MS);
+}
+function fallbackToStill(why: string) {
+  clearTimeout(videoWatchdog);
+  pipe?.destroy();
+  pipe = null;
+  videoActive.value = false;
+  sess.send({ t: "videoMode", on: false, why });
+  msg.value = `${why}，已切静态截图模式（画面刷新变慢，录制/导出不受影响）。想换回实时视频：重进本页。`;
+}
+
+function ensurePipe(): VideoPipe | null {
+  if (!VideoPipe.supported() || !videoCanvas.value) return null;
+  if (!pipe) {
+    pipe = new VideoPipe(videoCanvas.value);
+    pipe.onFrame = () => {
+      if (!videoActive.value) { videoActive.value = true; clearTimeout(videoWatchdog); }
+      onVideoMotion();
+    };
+    pipe.onNeedKeyframe = () => sess.send({ t: "requestKeyframe" });
+    // 解码连挂：光把前端切静态没用——daemon 那边 scrcpy 还活着就不会 screencap，
+    // 结果是"退回静态"却一张图都收不到。必须同时通知 daemon 关流。
+    pipe.onFatal = () => fallbackToStill("视频解码连续失败");
+  }
+  return pipe;
+}
+sess.onVideoPacket = (flags, pts, payload) => ensurePipe()?.push(flags, pts, payload);
+
+// canvas 元素在首次 hierarchy 到达后才随 .frame 挂载——config packet 若在此之前到达会被丢
+// （pipe 还建不出来），后续 delta 全解不出。canvas 一就绪就主动要一次关键帧（daemon 重启取流
+// ~1s，重发 config+IDR），把这个启动竞态抹平。
+watch(videoCanvas, (el, old) => {
+  if (!el || old || !wsMode.value) return;
+  // canvas 是被 videoMeta 带来的 deviceWH 挂上的：pipe 这时才建得出来，尺寸得补设一次
+  if (deviceWH.value) ensurePipe()?.setDeviceSize(deviceWH.value[0], deviceWH.value[1]);
+  sess.send({ t: "requestKeyframe" });
+});
+
+function teardownVideo() {
+  clearTimeout(videoWatchdog);
+  pipe?.destroy();
+  pipe = null;
+  videoActive.value = false;
+  deviceWH.value = null;
+  clearTimeout(quietTimer);
+  motionStale.value = false;
+}
+
+function onDaemonMsg(m: DaemonMsg) {
+  if (m.t === "videoMeta") {
+    deviceWH.value = [m.device.w, m.device.h];
+    ensurePipe()?.setDeviceSize(m.device.w, m.device.h);
+    if (!videoActive.value) armVideoWatchdog();
+  } else if (m.t === "hierarchy") {
+    // 图先不动（新图由紧随的 shot 消息带来）：bounds 是设备坐标，同一朝向下基准不变，
+    // 新框叠旧图的空窗被 stale 压暗明示，不冒充"已同步"
+    const prev = screen.value;
+    screen.value = { ...m.screen, png: prev?.png ?? "", png_err: prev?.png_err ?? "",
+                     shot_w: prev?.shot_w ?? 0, shot_h: prev?.shot_h ?? 0 };
+    stale.value = false;
+    if (m.screen.auto_swept) showToast(`已自动清障 ${m.screen.auto_swept} 次（广告全屏页）`);
+  } else if (m.t === "shot") {
+    if (m.seq < lastShotSeq) return; // 乱序旧图丢弃（截图异步，可能晚于下一轮 hierarchy）
+    lastShotSeq = m.seq;
+    if (screen.value) {
+      screen.value = { ...screen.value, png: m.png, png_err: m.png_err,
+                       shot_w: m.shot_w, shot_h: m.shot_h };
+    }
+  } else if (m.t === "step") {
+    steps.value.push(m.step);
+    busy.value = "";
+  } else if (m.t === "stepDiff") {
+    const s = steps.value.find((x) => x.n === m.n);
+    if (s) { s.diff = m.diff; s.auto_swept = m.auto_swept; }
+    // 视频模式：这一刻 = 该步稳定树刚到手，canvas 上的帧与 diff 对应同一时刻——正是
+    // shots/NN.png 该定格的画面（still 模式后端自己 screencap，不用前端管）
+    if (videoActive.value && videoCanvas.value && caseId.value.trim()) {
+      const n = m.n, c = caseId.value.trim();
+      videoCanvas.value.toBlob(async (blob) => {
+        if (blob) sess.sendShot(n, c, await blob.arrayBuffer());
+      }, "image/png");
+    }
+  } else if (m.t === "swept") {
+    showToast(`自动清障命中 ${m.rule_id}（${m.by}=${m.value}）`);
+  } else if (m.t === "exported") {
+    busy.value = "";
+    msg.value = `已导出 ${m.steps} 步 / ${m.shots} 张截图 → ${m.rec} · 脚本草稿 ${m.flow}（草稿没有任何判定，要补 output-check/logscan/FAILED 收尾）` +
+      (m.backfilled?.length ? ` ⚠︎ 步骤 ${m.backfilled.join("、")} 的截图是导出时补拍的（时刻≠该步执行时）` : "");
+  } else if (m.t === "error") {
+    busy.value = "";
+    stale.value = false;
+    err.value = m.message;
+  }
+}
+sess.onMessage = onDaemonMsg;
+sess.onDrop = () => {
+  wsMode.value = false;
+  connState.value = "";
+  teardownVideo();
+  err.value = "录制服务连接断开（设备掉线/进程被杀）。点「开始」重连。";
+};
+
+async function startSession(): Promise<boolean> {
+  if (!serial.value) return false;
+  try {
+    const info = await api.recSessionStart(store.activeSlug, serial.value);
+    await sess.connect(info);
+    wsMode.value = true;
+    connState.value = "ws";
+    return true;
+  } catch (e: any) {
+    // daemon 起不来 → 降级 legacy（慢但可用）。不吞原因：让用户知道怎么修回快路径。
+    wsMode.value = false;
+    connState.value = "legacy";
+    msg.value = `录制服务未启动（${e}），已降级为逐次探屏模式（每步 ~5s）。修复后重进本页恢复。`;
+    return false;
+  }
+}
+
+function stopSession() {
+  if (sess.connected) sess.close();
+  if (connState.value === "ws" && serial.value) api.recSessionStop(serial.value).catch(() => {});
+  wsMode.value = false;
+  connState.value = "";
+  stale.value = false;
+  lastShotSeq = 0;
+  teardownVideo();
+}
+
+function stopRecording() {
+  stopSession();
+  stopped.value = true;
+  msg.value = "已停止录制，不再探屏（已录步骤原样保留，仍可导出；要继续请点「重新探屏」）";
+}
 
 function defaultCase() {
   const d = new Date();
@@ -78,10 +288,16 @@ function devLabel(d: DeviceRow) {
 // 前台是对话框时只有 1013x1373，而截图始终是整屏 1080x2280，误用它会把所有框整体放大 1.66 倍、
 // 糊成盖住半屏的一块（真机踩过，桌面壳里复现、浏览器版没事，因为那边直接读的 naturalWidth）。
 const base = computed<[number, number] | null>(() => {
+  // 视频模式：canvas 的像素尺寸恒等于设备逻辑分辨率（videoPipe.setDeviceSize 保证），
+  // bounds 也是设备坐标系——基准天然统一
+  if (videoActive.value && deviceWH.value) return deviceWH.value;
   const sc = screen.value;
   if (sc?.shot_w && sc.shot_h) return [sc.shot_w, sc.shot_h]; // 后端从 PNG IHDR 读的权威值
   return nat.value; // 兜底：img 已加载时的真实像素。两者都没有就不画框，宁可不画也别画错
 });
+
+// 取屏区当前实际显示的元素（坐标换算/手势的量测对象）：视频模式是 canvas，静态模式是 img
+const viewEl = computed<HTMLElement | null>(() => (videoActive.value ? videoCanvas.value : shot.value));
 
 const boxes = computed(() => {
   const sc = screen.value;
@@ -132,9 +348,10 @@ const boxes = computed(() => {
 // 对齐自检（确认对齐无误后可整块删掉）：把第一个框实际渲染的位置反算回设备坐标跟 bounds 比，
 // 自己判定对不对 —— 免得靠肉眼看图猜"是不是还偏一点"。overlay 与 img 的尺寸也一起报出来。
 const align = ref<{ ok: boolean; text: string } | null>(null);
-watch([boxes, () => screen.value?.png], async () => {
+watch([boxes, () => screen.value?.png, videoActive], async () => {
   await nextTick();
-  const im = shot.value;
+  const im = viewEl.value; // 视频模式量 canvas，静态模式量 img——自检逻辑相同
+
   const ov = stage.value?.querySelector(".overlay") as HTMLElement | null;
   const el0 = ov?.querySelector(".box") as HTMLElement | null;
   const f = boxes.value[0], b = base.value;
@@ -193,19 +410,38 @@ async function call<T>(what: string, fn: () => Promise<T>): Promise<T | null> {
 
 async function probe() {
   if (!serial.value) return;
+  stopped.value = false; // 重新探屏 = 恢复录制
+  // 首选 V2：起（或复用）常驻会话，探屏由 daemon 推送（hierarchy + shot 消息）
+  if (wsMode.value || (await startSession())) {
+    err.value = "";
+    stale.value = true;
+    sess.send({ t: "refresh", auto_sweep: autoSweep.value });
+    return;
+  }
   const s = await call("探当前屏…", () => api.recProbe(store.activeSlug, serial.value, autoSweep.value));
   if (s) {
     screen.value = s;
-    if (s.auto_swept) msg.value = `已自动清障 ${s.auto_swept} 次（广告全屏页）`;
+    if (s.auto_swept) showToast(`已自动清障 ${s.auto_swept} 次（广告全屏页）`);
   }
 }
 
 async function act(body: Record<string, unknown>) {
   if (!serial.value) return;
+  if (stopped.value) { err.value = "录制已停止，如需继续请先点「重新探屏」"; return; }
   if (!caseId.value.trim()) caseId.value = defaultCase();
   // 用当前最大 n + 1，不能用 length + 1：中间删过步骤后两者不等，会撞上残留的旧 n
   // （撞号会让 shots/{n}.png 互相覆盖，且 v-for :key="s.n" 重复）
   const nextN = steps.value.reduce((m, s) => Math.max(m, s.n), 0) + 1;
+  if (wsMode.value) {
+    const { kind, ...rest } = body as { kind: string } & Record<string, unknown>;
+    err.value = "";
+    msg.value = "";
+    busy.value = `执行 ${kind}…`; // step 消息到达即清（~0.2s），不上全屏 mask
+    if (kind !== "note") stale.value = true;
+    sess.send({ t: "act", kind, body: rest, case: caseId.value.trim(), n: nextN,
+                auto_sweep: autoSweep.value });
+    return;
+  }
   const r = await call(`执行 ${body.kind}…`, () =>
     api.recAct(store.activeSlug, serial.value, {
       ...body,
@@ -218,7 +454,7 @@ async function act(body: Record<string, unknown>) {
   if (r) {
     steps.value.push(r.step);
     screen.value = r.screen;
-    if (r.step.auto_swept) msg.value = `已自动清障 ${r.step.auto_swept} 次（广告全屏页）`;
+    if (r.step.auto_swept) showToast(`已自动清障 ${r.step.auto_swept} 次（广告全屏页）`);
   }
 }
 
@@ -237,7 +473,7 @@ function confirmAmbig() {
 }
 
 function toDev(e: MouseEvent): [number, number] | null {
-  const el = shot.value;
+  const el = viewEl.value;
   if (!el || !base.value) return null; // 没有可信基准时不换算坐标，宁可不动作也别点错位置
   const r = el.getBoundingClientRect();
   const [W, H] = base.value;
@@ -245,11 +481,11 @@ function toDev(e: MouseEvent): [number, number] | null {
 }
 
 function down(e: MouseEvent) {
-  if (mode.value === "tap" || !shot.value) return;
+  if (mode.value === "tap" || !viewEl.value) return;
   const p = toDev(e);
   if (!p) return;
   if (mode.value === "xy") return act({ kind: "tap", x: p[0], y: p[1] });
-  const r = shot.value.getBoundingClientRect();
+  const r = viewEl.value.getBoundingClientRect();
   const sx = e.clientX - r.left, sy = e.clientY - r.top;
   line.value = { x: sx, y: sy, len: 0, deg: 0 };
   const move = (ev: MouseEvent) => {
@@ -269,12 +505,29 @@ function down(e: MouseEvent) {
   e.preventDefault();
 }
 
-function typeText() {
-  const v = prompt("输入文本（会用 --assert-typed 校验真打进去了，防输入法联想乱码）");
+// window.prompt 在 Tauri 的 webview 里没实现——点了**静默**什么都不弹、直接返回 null（confirm/
+// message 有 plugin-dialog 顶上，文本输入没有对应 API）。所以自己做页内输入弹层。
+const ask = ref<{ title: string; hint: string; value: string } | null>(null);
+const askInput = ref<HTMLInputElement | null>(null);
+let askResolve: ((v: string | null) => void) | null = null;
+function askText(title: string, hint: string): Promise<string | null> {
+  ask.value = { title, hint, value: "" };
+  nextTick(() => askInput.value?.focus());
+  return new Promise((r) => { askResolve = r; });
+}
+function askDone(ok: boolean) {
+  const v = ok ? (ask.value?.value ?? "").trim() : null;
+  ask.value = null;
+  askResolve?.(v || null);
+  askResolve = null;
+}
+
+async function typeText() {
+  const v = await askText("输入文本", "打进当前有焦点的输入框（先点一下目标输入框）。会用 --assert-typed 校验真打进去了，防输入法联想乱码。");
   if (v) act({ kind: "text", value: v });
 }
-function note() {
-  const v = prompt("给这一步记一句备注（不操作设备，只写进录制文件）");
+async function note() {
+  const v = await askText("给这一步记一句备注", "不操作设备，只写进录制文件，导出脚本时作为注释提示。");
   if (v) act({ kind: "note", value: v });
 }
 function undo() {
@@ -297,13 +550,33 @@ async function doExport() {
     err.value = "还没录到步骤，或用例 ID 为空";
     return;
   }
+  // 有 diff 还没回来的步骤（刚点完就导出）先等一拍——rec.json 里 pending diff 是残次品
+  if (wsMode.value) {
+    if (steps.value.some((s: any) => s.diff?.pending)) {
+      err.value = "还有步骤的 diff 在计算中（刚执行完动作），等控件框刷新后再导出";
+      return;
+    }
+    err.value = "";
+    busy.value = "落盘…";
+    sess.send({ t: "export", case: c, steps: steps.value });
+    return;
+  }
   const r = await call("落盘…", () => api.recExport(store.activeSlug, serial.value, c, steps.value));
   if (r) msg.value = `已导出 ${r.steps} 步 / ${r.shots} 张截图 → ${r.rec} · 脚本草稿 ${r.flow}（草稿没有任何判定，要补 output-check/logscan/FAILED 收尾）`;
 }
 
 const warnCount = computed(() => steps.value.filter((s) => s.warn || s.needs_attention).length);
 
-watch(() => store.activeSlug, () => { loadDevices(); screen.value = null; steps.value = []; });
+watch(() => store.activeSlug, () => { stopSession(); loadDevices(); screen.value = null; steps.value = []; });
+// 切设备 = 换会话：旧 daemon 停掉（每设备一进程，留着白占一条 u2 连接），新会话点「开始」再起
+watch(serial, (_n, old) => {
+  if (sess.connected) sess.close();
+  if (old && connState.value === "ws") api.recSessionStop(old).catch(() => {});
+  wsMode.value = false;
+  connState.value = "";
+  stale.value = false;
+  lastShotSeq = 0;
+});
 
 // keep-alive 保活本视图（录到一半切去看设备/证据，回来步骤还在）。控件框的对齐靠 CSS
 // （.overlay 用 inset:0 贴合被 img 撑开的 .frame）保证，切走切回都不用重量，只剩"切回刷设备列表"。
@@ -336,7 +609,15 @@ onMounted(async () => {
         <input type="checkbox" v-model="autoSweep" /> 自动清障
       </label>
       <span class="muted small">产物落 <span class="mono">apps/{{ store.activeSlug }}/recordings/&lt;用例ID&gt;/</span></span>
+      <span class="sp"></span>
+      <button class="mini" @click="stopRecording" :disabled="!screen || stopped" title="断开录制会话/停视频，画面定格；已录步骤保留，仍可导出">
+        {{ stopped ? "已停止" : "停止录制" }}
+      </button>
     </div>
+
+    <transition name="toast">
+      <div v-if="toast" class="toast mono">{{ toast }}</div>
+    </transition>
 
     <div v-if="err" class="err">{{ err }}</div>
     <div v-if="msg" class="ok">{{ msg }}</div>
@@ -371,9 +652,20 @@ onMounted(async () => {
                这么绕一层是因为前两种做法都在 WKWebView 上翻过车：JS 测 img 矩形再算像素会量到
                图片解码前的旧尺寸；aspect-ratio 与 img 的 height:auto 算出的高度也未必逐像素一致。
                inset:0 不依赖任何数值计算，跨引擎都成立。 -->
-          <div v-if="screen.png" class="frame">
-            <img ref="shot" :src="'data:image/png;base64,' + screen.png" @load="onImgLoad" alt="" />
-            <div class="overlay">
+          <!-- deviceWH 也算渲染条件：视频模式下 daemon 不发截图（png 恒空），而 videoActive 要等
+               第一帧解出来、第一帧又要 canvas 先在 DOM 里——只写 `png || videoActive` 时这三者互为
+               前提，一旦首屏正好赶上 scrcpy 已在流（png 就此不再来），canvas 永远挂不上、视频永远
+               解不出，表现成"探屏成功但一片黑、0 个可点框"（黑框只是 .stage 的占位尺寸）。
+               daemon 一报 videoMeta（deviceWH 到手）就把 canvas 挂上，死锁解开。 -->
+          <div v-if="screen.png || videoActive || deviceWH" class="frame">
+            <!-- 视频模式（scrcpy 流）canvas 与静态截图 img 二选一显示；canvas 常驻 DOM
+                 （v-show）是因为 VideoPipe 要先绑上它才解得出第一帧，第一帧到了才切显示 -->
+            <canvas ref="videoCanvas" v-show="videoActive" class="vshot" />
+            <img v-show="!videoActive" ref="shot" :src="'data:image/png;base64,' + screen.png"
+                 @load="onImgLoad" alt="" :class="{ 'img-stale': stale }" />
+            <!-- stale：动作已下发、新树未到；motionStale：视频画面正在变（有帧在到达）、
+                 树还是旧的。两种情况下旧框都不可信——压暗+禁点，防照旧框点错。 -->
+            <div class="overlay" :class="{ 'ov-stale': stale || motionStale }">
               <div
                 v-for="(b, i) in boxes"
                 :key="i"
@@ -384,6 +676,7 @@ onMounted(async () => {
                 @click.stop="pick(b.n)"
               />
             </div>
+            <div v-if="stale || motionStale" class="stale-tip">控件框刷新中…</div>
           </div>
           <div
             v-if="line"
@@ -405,6 +698,8 @@ onMounted(async () => {
             个彻底够不着（不画框，只能走硬坐标）</template>
           </div>
           <div class="muted small mt">
+            <template v-if="connState === 'ws'"><b class="c-ok">实时会话</b>（常驻服务，步骤 ~0.2s / 新框 ~1s）· </template>
+            <template v-else-if="connState === 'legacy'"><b class="warn">降级模式</b>（每步 ~5s，见上方提示）· </template>
             dump 后端
             <b :class="screen.backend === 'u2' ? 'c-ok' : ''">{{ screen.backend || "?" }}</b>
             <template v-if="screen.backend === 'u2'">（常驻 atx，比 shell 快约 7×）</template>
@@ -464,6 +759,19 @@ onMounted(async () => {
       </div>
     </div>
 
+    <div v-if="ask" class="modal" @click.self="askDone(false)">
+      <div class="card dlg">
+        <b>{{ ask.title }}</b>
+        <p class="muted small">{{ ask.hint }}</p>
+        <input ref="askInput" v-model="ask.value" class="mono ask-in"
+               @keydown.enter.prevent="askDone(true)" @keydown.esc.prevent="askDone(false)" />
+        <div class="dlg-actions mt">
+          <button class="mini" @click="askDone(false)">取消</button>
+          <button class="mini on" @click="askDone(true)">确定</button>
+        </div>
+      </div>
+    </div>
+
     <div v-if="ambig" class="modal" @click.self="ambig = null">
       <div class="card dlg">
         <b>这个控件的首选选择器不唯一</b>
@@ -494,6 +802,15 @@ h2 { margin: 0; font-weight: 500; }
 .mt { margin-top: 5px; }
 .sp { flex: 1; }
 .err { color: var(--text-danger); background: var(--bg-danger); padding: 10px 12px; border-radius: var(--radius); margin: 10px 0; }
+/* 浮层，脱离文档流：清障提示出现/消失都不推动下面的布局 */
+.toast {
+  position: fixed; top: 56px; left: 50%; transform: translateX(-50%); z-index: 60;
+  color: var(--text-success); background: var(--bg-success); border: 1px solid var(--border);
+  padding: 7px 14px; border-radius: 999px; font-size: 12px; pointer-events: none;
+  box-shadow: 0 6px 20px rgba(0,0,0,.16); max-width: 80vw;
+}
+.toast-enter-active, .toast-leave-active { transition: opacity .18s ease, transform .18s ease; }
+.toast-enter-from, .toast-leave-to { opacity: 0; transform: translateX(-50%) translateY(-6px); }
 .ok { color: var(--text-success); background: var(--bg-success); padding: 10px 12px; border-radius: var(--radius); margin: 10px 0; font-size: 13px; }
 .empty { padding: 20px; margin-top: 12px; line-height: 1.7; }
 .c-amb { color: var(--text-danger); }
@@ -520,6 +837,9 @@ h2 { margin: 0; font-weight: 500; }
    之前这里没有高度上限，1080x2280 的截图在 400px 宽下要撑到 843px 高，笔记本视口经常放不下，
    只能整页滚动。 */
 .stage img { display: block; max-width: 100%; max-height: calc(100vh - 180px); width: auto; height: auto; }
+/* 视频 canvas 与 img 同一套缩放规则（canvas 的 width/height 属性= 设备像素 = intrinsic 尺寸，
+   现代引擎会按属性比例等比缩放，与 img 行为一致），.frame/.overlay 的对齐机制原样成立 */
+.stage canvas.vshot { display: block; max-width: 100%; max-height: calc(100vh - 180px); width: auto; height: auto; }
 /* 用 outline 而不是 border 画框：outline 不进盒模型、走的渲染路径也不同，能绕开 WKWebView 下
    「半透明 dashed border 的盒子被填上底色 + 冒出圆角」那个怪象（Chromium 里同样代码 computed
    background 是全透明的，只有桌面壳复现）。边框色一律用不透明值，少一个变量。 */
@@ -534,6 +854,14 @@ h2 { margin: 0; font-weight: 500; }
 .box.b-amb { outline-color: #ff5050; }
 .box.b-anc { outline-color: #5aaaff; }
 .line { position: absolute; height: 2px; background: #0f0; transform-origin: 0 50%; pointer-events: none; }
+/* stale（V2 异步刷新的空窗态）：框压淡 + 禁点 + 角标提示。不用全屏 mask——空窗只有 ~1s，
+   遮全屏反而闪。视频模式画面本身是实时的（真相），只弱化"已经过时的框"。 */
+.img-stale { filter: brightness(0.55); }
+.ov-stale { opacity: 0.22; }
+.ov-stale .box { pointer-events: none; }
+.stale-tip { position: absolute; top: 8px; left: 50%; transform: translateX(-50%); font-size: 12px;
+             color: #fff; background: rgba(0, 0, 0, 0.6); padding: 2px 10px; border-radius: 999px;
+             line-height: 1.6; pointer-events: none; }
 .mask { position: absolute; inset: 0; background: rgba(255, 255, 255, 0.72); color: #111;
         display: flex; align-items: center; justify-content: center; font-size: 13px; line-height: 1.5; }
 
@@ -562,5 +890,6 @@ h2 { margin: 0; font-weight: 500; }
 .opt { display: flex; align-items: center; gap: 8px; padding: 7px 9px; border: 0.5px solid var(--border);
        border-radius: 8px; margin: 5px 0; cursor: pointer; font-size: 13px; }
 .dlg-actions { text-align: right; }
+.ask-in { width: 100%; box-sizing: border-box; margin-top: 4px; }
 .mini.on { background: var(--text-primary, #111); color: var(--bg, #fff); }
 </style>

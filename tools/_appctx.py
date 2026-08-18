@@ -45,6 +45,7 @@ TARGET_CFG = APP_ROOT / "target.json"
 LEDGER = APP_ROOT / "ledger"
 CASES = APP_ROOT / "cases"
 FLOWS = APP_ROOT / "flows"
+LANG = APP_ROOT / "lang"      # 多语言文案表：tables/<versionCode>.json + index.json，见 decisions #55
 
 
 def load_cfg():
@@ -83,6 +84,24 @@ def ledger_lock():
             _LOCK_FH = None
 
 
+def probe_installed_build(pkg, serial=""):
+    """adb 现查某台设备上 pkg 已装的 (versionName, versionCode)，查不到的字段为 None。
+
+    比 probe_installed_version 多回 versionCode，给多语言表当缓存 key 用（见 decisions #55）：
+    versionName 可能带手工后缀而重复（`2.3.5J`/`2.3.5b`），versionCode 是 Play 强制单调唯一的。
+    一次 dumpsys 同时取两个字段，别为了 versionCode 再跑一次 adb。"""
+    if not pkg:
+        return (None, None)
+    try:
+        args = ["adb"] + (["-s", serial] if serial else []) + ["shell", "dumpsys", "package", pkg]
+        out = subprocess.run(args, capture_output=True, text=True, timeout=10).stdout or ""
+    except Exception:
+        return (None, None)
+    name = re.search(r"versionName=(\S+)", out)
+    code = re.search(r"versionCode=(\d+)", out)
+    return (name.group(1) if name else None, code.group(1) if code else None)
+
+
 def probe_installed_version(pkg, serial=""):
     """adb 现查某台设备上 pkg 已装的 versionName；查不到/adb 异常返回 None。
 
@@ -91,15 +110,7 @@ def probe_installed_version(pkg, serial=""):
     （尤其多设备场景下，各台可能装的版本还不一样）。adbkit.app_version()（决定证据实际落盘
     目录）与 run_flow.py（决定 executions.csv「证据链接」列的文本）共用这一份实现，避免
     两处各写一遍导致"文件夹在哪"和"账本记的链接指哪"分岔。"""
-    if not pkg:
-        return None
-    try:
-        args = ["adb"] + (["-s", serial] if serial else []) + ["shell", "dumpsys", "package", pkg]
-        out = subprocess.run(args, capture_output=True, text=True, timeout=10).stdout
-    except Exception:
-        return None
-    m = re.search(r"versionName=(\S+)", out or "")
-    return m.group(1) if m else None
+    return probe_installed_build(pkg, serial)[0]
 
 
 TEXT_RESOURCES_FILE = GLOBAL_CONFIG / "text_resources.json"  # 桌面壳「资源库」文本资源登记，跨 App 共享

@@ -448,3 +448,52 @@
   - `doc_report.py` 新增 `version_from_link()`/`versions_label()`：从 `executions.csv` 每行的证据链接 `evidence/<slug>/<version>/<run>/<case>/<serial>` 里解析出 `run_flow.py` 落盘时已经现查过的真实版本，标题区汇总本轮全部设备、失败详情按该问题实际复现的设备汇总；同版本只显示一次，不同版本按设备分别标注（如 `2.3.6（设备A）、2.3.5（设备B）`）。彻底不读 `target.json`，也就不存在"跟随设备"模式下失真的问题。
   - `set_target_app_version` 命令（#49 引入）随字段一起删除；`init_target.py --write` 时用 `cfg.pop("serial", None)`/`cfg.pop("app_version", None)` 顺手清掉老 target.json 里的历史残留。`AppInfo`（`commands.rs`/`api.ts`）同步去掉这两个字段，`Runner.vue` App 库卡片未点选版本时的展示从退回 `a.app_version` 改成直接显示 `"—"`（没有旧值可退，比显示一个可能错的版本更诚实）。
   - **连带修的另一个真实 bug**：`auto_repair.py::newest_attempt_dir()` 原来也读 `cfg.get("app_version", "")` 拼自愈要找的证据目录路径；字段删除后这行如果不改，`_safe("")` 会退到字面量 `"default"`，导致自愈流程永远找错证据目录——已同步改成现查，跟 `run_flow.py` 落盘时用同一份探测逻辑，两边算出来的路径不会再分岔。
+
+## 53. 录制器默认自动清广告全屏页，不再等人眼看到广告手动点「清障」（2026-08-18）
+
+- **问题**（用户使用录制器时提出）：录制时若真机弹出广告全屏页，之前只能人盯着屏幕手动点工具栏的「清障」按钮（`act({kind:'sweep'})`），录制节奏被广告打断，而且容易漏点（人没注意到广告已经出现）。
+- **决定**：`tools/recorder.py::probe()` 拆成 `_probe_once()`（原探屏实现）+ 新 `probe(auto_sweep=True)` 外层：探完一屏后调用 `_auto_sweep_ads()`（`ak("sweep", "--rounds","1","--patience","1","--only", AD_RULE_IDS)`，复用 `adbkit.py` 现成的规则库匹配，不重新实现），命中就重探，最多再核对 2 轮（同一广告位偶尔连着刷两层不同 SDK 插屏）。`AD_RULE_IDS` 只锁 `config/ad_rules.json` 里 id 前缀 `ad-` 的 5 条广告 SDK 规则（scope 卡死在 `AdActivity`/`AppLovinFullscreen` 等具体全屏页组件串），**不含** `consent-agree`/`perm-allow`/`system-immersive-cling`/`dialog-outside-tap-fallback` 这几条 `scope="任意页面"` 的规则——那几条文案匹配范围更宽（"关闭"/"同意"这类可能出现在正常界面的按钮上），录制时人在盯着屏幕，手动点更放心，只自动化"明确知道是广告全屏页"这一类。
+- **接线**：`act_once`/`record`/CLI 的 `probe`/`act` 子命令都新增 `auto_sweep` 参数（默认 `True`），经 `--json {auto_sweep:bool}` 从桌面壳前端 `Recorder.vue` 的「自动清障」勾选框（默认勾选）一路透传下来，关掉退回纯手动。探屏结果新增 `auto_swept: number` 字段（本次顺带清掉几个），前端命中时提示"已自动清障 N 次"。
+- **副作用（有益）**：广告页从 `after` 探屏前就被清掉，`diff.appeared/disappeared` 不会再夹带广告按钮文案（如"跳过"/"关闭广告"），录制出来的 `waitfor` 候选更干净。
+- **风险**：`ad_rules.json` 只认已登记的广告 SDK/scope，新样式广告识别不到仍需人工点「清障」兜底；纯 WebView 渲染、连规则库 `keyevent-back` 兜底都摸不到候选节点的创意，仍要人工处理。
+
+## 54. 多语言表改从 apk 直接建（aapt2 dump），不再用翻译导出包；表跟被测 apk 版本绑定（2026-08-18）
+
+- **背景**：用户问"能不能从 apk 解析出文案资源"。机制（`lang_table.py` + `lang_helper.sh` + 21 个接了 `t()` 的 flow）2026-07-27 就建好了，缺的不是能力而是**数据源选错了**——原来喂的是翻译导出包 zip。
+- **决定**：`tools/lang_table.py` 新增 `build-apk <apk>` 子命令作为首选入口，`apps/MP3Cutter/lang/strings_table.json` 换成从 apk 建（旧表留 `strings_table.zipbased.bak.json`，`lang/` 本就 gitignore）。原 `build`（目录/zip）保留，只降级为备选。
+- **为什么 apk 更对**（实测数字见 gotchas「多语言表用翻译导出包建 ≠ 设备上的真实文案」）：翻译包是"该翻成什么"，apk 是"实际入包的是什么"；翻译漏入包/被覆盖/某语言压根没打进去，只有从 apk 建才看得出来。且 **aapt2 吐的是运行时真值**（`\'` 这层转义 Android 打包时已经解掉），省掉猜转义规则——原 XML 路线正是栽在这里，443 条值跟 apk 对不上。
+- **为什么用 aapt2 不用 apktool**：apktool 要 JRE，这台机器没装 java；aapt2 在 Android SDK build-tools 里，且直接输出运行时值。代价是文本 dump 需要自己处理跨行的多行文案，用 aapt2 自报的 `entryCount` 兜底校验解析完整性（对不上就报错不产表，宁可不产也不产残表）。
+- **建表源用「设备上正在跑的那个包」而不是 `apks/` 里的**：`adb shell pm path` → `adb pull` base.apk。实测 `apks/` 最新才 2.3.5J，设备上装的已经是 2.3.6（差 32 个新 key / 12 个删除 key）。前提是确认没有 `split_config.<lang>.apk`（语言 split），有的话只拉 base 会缺语言。
+- **`resolve` 加回退链**：目标语言缺失时 精确 → 同书写系统近邻（`_SCRIPT_FALLBACK`：`zh-rHK`/`zh-rMO`→`zh-rTW`、`es-rMX`→`es-r419` 等有确定依据的几组）→ 主语言（`fr-rCA`→`fr`）→ `default`，回退时 stderr 打 info 说明走到哪一级。**刻意不做泛化的同语族猜测**——猜错会返回一句屏幕上根本不存在的文案，比老实回退 default 更难排查。
+- **换表的回归防线**：新表 key 从 592 涨到 828，原来单命中的文案可能变成多 key 撞车（`t()` 不带 key 会报错退出）。换表后把 flow 里全部 28 条唯一 `$(t ...)` 调用逐条 `resolve` 复核过：`允许` 由单命中变撞车（新表多了 `notifications_permission_confirm`），补成 `$(t 允许 allow)`——`allow` 正是旧表下唯一命中的 key，**与换表前行为完全等价**。两条 `$(t "IG Audio Downloader")` 新旧表都反查不到（原文是英文、`--from zh-rCN`），补资源 key 后修复。最终 28 条 × 16 种语言 = 448 次解析全通过，且不传 `LANG_CODE` 时输出与换表前逐字一致。
+
+## 55. 多语言表改「执行时按设备实装 versionCode 自动备表」，一版一张、选表零自由度（2026-08-18）
+
+- **问题**（用户提出）："语言表需要自动生成，而不是用户告诉你要生成你再生成。可能会安装不同版本的 apk，那是不是会有多个语言表？怎么选？"
+- **结论：会有多张表，但"选哪张"不该是个问题。** 表由「这台设备此刻实装的 versionCode」唯一确定，不给用户选。用户的真实需求不是"选一张表"，而是"这台设备上跑的这版 App，这句话在目标语言下是什么"——答案唯一。**更关键的是多设备并行时各台装的版本可能不一样，任何"全局单表"的设计在那种场景下必然错一台**（换表前那个固定路径 `lang/strings_table.json` 就是这个毛病）。
+- **布局**：`apps/<slug>/lang/tables/<versionCode>.json`（一版一张）+ `index.json`（`{versionCode: {versionName, built_at, keys, locales[]}}`）+ `.lang.lock`。用 versionCode 不用 versionName：`2.3.5J`/`2.3.5b` 这种手工后缀容易撞，versionCode 是 Play 强制单调唯一的；侧载同 code 不同内容的包留 `ensure --force`。
+- **`lang_table.py ensure --serial <s>`**（新，主入口，幂等）：`dumpsys package` 取 versionCode → 命中 `tables/<code>.json` 直接打印路径（**0.2s**）→ 未命中则 flock 独占（双检，并发首跑只有一个真在建）→ `pm path` 确认没有 `split_config.<lang>.apk` → `adb pull` base.apk → aapt2 建表 → 写 index（**约 6s，每个版本每台机器只付一次**）。
+- **触发点两处，选的是"按需建"而不是"刷新设备时预热"**（用户拍的）：装了新版 App 就静默拉 18MB apk 太激进，开销该出现在真正要用的时候。
+  - `run_flow.py::_prewarm_lang_table()`：仅当 `LANG_CODE` 已设、脚本里 `source` 了 lang_helper、且 `LANG_CODE != 脚本的 SRC_LANG` 时才 ensure，结果经 env `LANG_TABLE` 传下去。**预热失败不阻断**——脚本可能压根没接 `t()`，不该因为备表失败先把用例判死，留给 `t()` 真要查表时报错。
+  - `lang_helper.sh` 兜底：表路径三级取 `$TABLE`（显式，调试用）>`$LANG_TABLE`>现场 `ensure --serial $S`。手工 `bash flows/xxx.sh <serial>` 不经 run_flow 时照样自动备表。
+- **连带**：31 个 flow 脚本里写死的 21 行 `TABLE="apps/MP3Cutter/lang/strings_table.json"` 全删；`available_lang_locales()`（commands.rs）改读 `index.json` 各版本 locale 并集——UI 上选语言时还没选设备、不知道会跑哪一版，只能列并集（locale 集合跨版本几乎不变，真正按版本选表发生在执行时）；读 index 也比扫 `tables/` 下几张 1.4MB 的表快得多。
+- **建表时排掉 Android 伪 locale**（`en-rXB`/`en-rXC` 等）：给开发自查 RTL/加长布局用的假语言，设备不会真跑在上面，收进表只会把语言下拉塞满噪音。
+- **备表失败一律报错阻断，不退化成直通原文**：跟 lang_helper 既有哲学一致——悄悄用原文会在目标语言下稳定失败，且跟"UI 真的变了"没法区分。
+- **追加（同日）：桌面壳语言下拉收窄到三档 `自动 / 简体中文 / 英语`**。表从 apk 建之后覆盖 98 个 locale，全列出来下拉根本没法用，而实际回归只跑这三档；要临时跑别的语言走命令行 `LANG_CODE=ja bash apps/<slug>/flows/flow_xxx.sh <serial>`。档位由 `Runner.vue` 的 `LANG_CHOICES` 常量定（想加档只改这一行，后端 `list_lang_locales` 仍返回全量 locale，前端只是挑要暴露的），且仍受「该 App 表里到底有没有这个语言」约束（`langOptions` 过滤），不给出选了必然查不到的选项。
+  - **顺带去掉原来那档「跟随脚本原文」（空串 = 不注入 `LANG_CODE`）**：绝大多数固化脚本 `SRC_LANG` 就是 `zh-rCN`，选「简体中文」时 `LANG_CODE == SRC_LANG`，`t()` 原样直通不查表，跟不注入完全等价；少数 `export SRC_LANG=en` 的脚本选中文会真去查表把英文原文换成中文，那正是期望行为。
+  - `loadLangLocales()` 的清理逻辑改成「不在 `langOptions` 里就退回 `自动`」——之前按 slug 记住的选择可能是收窄前 98 档里的某个语言，留着会让 `v-model` 显示空白、用户看不出跑的是什么。
+  - ⚠️ **这一档的 UI 改动没法用浏览器预览验证**：桌面壳是 Tauri 应用，`http://localhost:1520` 在普通浏览器里因为拿不到 `window.__TAURI__.invoke` 会直接白屏崩。只能靠 `vue-tsc --noEmit` + 真正的 `tauri dev` 窗口看。
+- **验证**：从零（删掉整个 `lang/`）到自动建表 3.3s；31 个 flow 共 75 条 `t()` 调用 × 14 种语言 = 1050 次解析全通过（按各脚本自己的 `SRC_LANG` 核对，不是统一 zh-rCN——那样会把 `export SRC_LANG=en` 的两个 flow 误判成失败）；不传 `LANG_CODE` 时输出与改动前逐字一致；`cargo check` 通过。
+
+## 56. 录制器 V2：对齐竞品架构重写取屏/交互层（scrcpy 视频流 + 常驻热 dump + 异步刷新）（2026-08-18）
+
+- **问题**：旧录制器每步动作后 ~5s 才刷新。无线 adb 实测拆解：SETTLE 0.5s + adbkit nodes 子进程 1.4s + screencap 1.3s + **sweep 子进程又完整 dump 一次** 1.4s + 每步 2-4 次 python 冷启。竞品（Go 二进制逆向）感知延迟≈0：scrcpy 视频流 + 设备端常驻 atx 热 dump + 前端异步刷新。
+- **架构**：`recorder_daemon.py` 常驻服务（**每设备一进程**——adbkit 的 SERIAL/_U2_DEV/CFG 全模块级全局，per-process 语义零改动继承）。前端 Recorder.vue 直连 `ws://127.0.0.1:<port>?token`（Rust `recorder_session_start` spawn daemon 并读 stdout 首行拿 port/token；`REC_SESSIONS` 进程表独立于 RUN_PGIDS——abort_run 是停回归，不该杀录制会话）。
+- **大脑与设备层解耦**：选择器判定/diff/导出平移到 `recorder_core.py` 纯函数库，daemon 与 legacy CLI 共用，产物必然一致；`adbkit.cmd_nodes` 抽出 `build_nodes()`（1393 份缓存 XML 字节级回归验证）。
+- **快在哪**：① u2 连接热复用（dump 0.35-0.8s，不再每步冷启）；② sweep 离线化——`_sweep_one_round` 直接吃刚 dump 的树（先树预检零开销，命中才查 focus），省掉整次 dump；③ 注入走 u2 jsonrpc（选择器坐标从内存树现算，act 前校验命中数与录制时一致，stale 树拒点）；④ 截图异步不挡刷新（视频模式下每步截图改由前端 canvas capture 0x11 回传，时刻与该步 diff 对齐、零设备开销；export 校验齐全缺图 screencap 补拍）；⑤ 视频=scrcpy H.264 原样转发 + 前端 WebCodecs（路线A：avcC description + AVCC 长度前缀，WKWebView 真机码流 spike 验证过）。**实测：步骤卡 0.2s、新框+diff 0.98s（对比旧 5s）**。
+- **三态降级**：video → still（WebCodecs 不可用/解码连挂 3 次，daemon 异步截图推送）→ legacy（daemon 起不来，旧 recorder_cmd 无状态链路原样保留）。产品可用性不依赖视频流。
+- **随之废弃**：浏览器独立版（recorder.py serve 模式 + recorder_ui.html，与 Recorder.vue 85% 重复且拿不到视频流）；`--from-cache` 录制期优化（内存树现算后该路径不再存在，"缓存泄进导出脚本"的坑根除）。
+- **scrcpy 集成的硬约束**（升级 vendor jar 必须重核，详见 recorder_daemon.py 头注 + tools/vendor/README.md）：v4.1 帧头标志位相比 3.x 整体右移（SESSION=1<<63/CONFIG=1<<62/KEY=1<<61）；session meta 是**裸 12 字节**记录（首字节最高位区分）；scid 必须 <2^31（server 用 Integer.parseInt 16 进制解析）；server 启动后**自删 jar**（每次会话都要重推，跳推优化不成立）；设备逻辑分辨率要用 `dumpsys window displays` 的 `cur=`（`wm size` 不随旋转变化）；websockets 服务端 `max_size` 必须调大（shot 上传整张 PNG 可超默认 1MB，超限 1009 断连整个会话）。
+- **新依赖**：`.venv` 的 `websockets`（缺了自动落 legacy，不致瘫）；`tools/vendor/scrcpy-server-v4.1`（Apache-2.0，SHA256 见 vendor/README.md）。
+- **验证**：真机（Pixel 9 Pro XL / 无线 adb）浏览器桩驱动全链路——视频 canvas 实时出画、act 步骤卡即时、diff 异步补发、杀设备端 scrcpy 进程自愈、横竖屏动态跟随（canvas 1008x2244↔2244x1008）、离线清障在真实插屏广告上自动触发、导出 rec.json/flow 草稿/shots 齐全且格式与 legacy 逐字段一致、legacy CLI probe 回归通过。
+- **追加（同日）：过渡动画期间的"框画面错位"治理（motion-stale）**。视频连续、树离散，画面切换瞬间旧框叠在新画面上（用户看到"虚线位置不对"）。利用 scrcpy「画面不变就不发帧」的特性：有帧到达=画面在变 → overlay 压暗禁点（同 act 后的 stale 视觉）；停稳 400ms → 前端立刻主动 refresh（限频 1.2s），不再干等 3s 空闲巡屏。持续动画（广告 banner 永远在发帧）3s 后不再压框——树对 banner 以外区域仍有效，一直压反而没法录。真机埋点验证：切换开始即压暗，停稳后 ~0.4s 解除、~0.7s 新框到位。

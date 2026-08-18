@@ -213,7 +213,15 @@ export const api = {
   // 供执行台这类「顺带刷新」的高频调用方用；设备页的显式「刷新」按钮传 true。
   listDevices: (slug: string, force = false) =>
     invoke<DeviceRow[]>("list_devices", { appSlug: slug, force }),
-  // ── 录制器：三个无状态子命令，步骤列表由 Recorder.vue 持有（见 Rust 侧 recorder_cmd 注释）──
+  // ── 录制器 V2：常驻 daemon 会话（每设备一进程；前端拿 {port,token} 后直连 WS）──
+  // start 幂等：同 serial 已有活会话直接复用；stop 用于切设备/切 App 时收尾
+  recSessionStart: (slug: string, serial: string) =>
+    invoke<{ port: number; token: string; video: boolean }>("recorder_session_start", {
+      appSlug: slug, serial,
+    }),
+  recSessionStop: (serial: string) => invoke<void>("recorder_session_stop", { serial }),
+
+  // ── 录制器 legacy：三个无状态子命令（daemon 起不来时的降级链路），步骤列表由 Recorder.vue 持有 ──
   // probe ≈ 1-3s，act ≈ 3-5s，调用方必须上 loading
   recProbe: (slug: string, serial: string, autoSweep = true) =>
     invoke<RecScreen>("recorder_cmd", {
@@ -293,7 +301,7 @@ export const api = {
     ch.onmessage = onLine;
     return invoke<number>("run_flow_repair", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, followDevice, onEvent: ch });
   },
-  // 某 App 的多语言文案表覆盖了哪些语言代号（apps/<slug>/lang/strings_table.json）；
+  // 某 App 的多语言文案表覆盖了哪些语言代号（读 apps/<slug>/lang/index.json 各版本的并集）；
   // 该 App 还没建过语言表则返回空数组，场景库据此隐藏语言选择器。
   listLangLocales: (slug: string) => invoke<string[]>("list_lang_locales", { appSlug: slug }),
   // 语言选「自动」时，执行前逐台设备现查一次系统当前语言并换算成表里的代号；raw=adb 读到的

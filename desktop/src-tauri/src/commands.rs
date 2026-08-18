@@ -1488,10 +1488,14 @@ pub async fn run_flow_repair(
     .map_err(|e| e.to_string())?
 }
 
-/// 某 App 的多语言文案表(apps/<slug>/lang/strings_table.json)覆盖了哪些语言代号——供场景库
-/// 「语言」选择器列出可选项；文件不存在（该 App 还没建过语言表）就返回空列表，前端据此隐藏/
-/// 禁用选择器，不报错。"default"(Android 未加 -<locale> 后缀的默认目录，含义因翻译包而异，
-/// 不是一个明确语言代号) 不作为可选项列出。
+/// 某 App 的多语言文案表覆盖了哪些语言代号——供场景库「语言」选择器列出可选项；一张表都还没
+/// 建过就返回空列表，前端据此隐藏/禁用选择器，不报错。"default"(Android 未加 -<locale> 后缀的
+/// 默认目录，不是一个明确语言代号) 不作为可选项列出。
+///
+/// 数据源是 `apps/<slug>/lang/index.json`（各 versionCode 一条，见 docs/decisions.md #55）而不是
+/// 单张表文件：表按被测 apk 的 versionCode 分开存，UI 上要选语言时还没选设备、不知道会跑哪一版，
+/// 所以列的是**所有已建版本的 locale 并集**（locale 集合跨版本几乎不变，真正按版本选表发生在
+/// 执行时的 `lang_table.py ensure`）。读 index 而不是扫 tables/ 里那些 1.4MB 的表，也快得多。
 #[tauri::command]
 pub fn list_lang_locales(app: AppHandle, app_slug: String) -> Result<Vec<String>, String> {
     let root = root_of(&app)?;
@@ -1500,19 +1504,19 @@ pub fn list_lang_locales(app: AppHandle, app_slug: String) -> Result<Vec<String>
 
 /// `list_lang_locales` 与 `resolve_device_lang_code` 共用的实际读表逻辑，抽出来避免重复解析。
 fn available_lang_locales(root: &Path, app_slug: &str) -> Result<Vec<String>, String> {
-    let path = app_root(root, app_slug).join("lang").join("strings_table.json");
+    let path = app_root(root, app_slug).join("lang").join("index.json");
     let txt = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(_) => return Ok(vec![]),
     };
     let v: Value = serde_json::from_str(&txt).map_err(|e| format!("{path:?} 解析失败：{e}"))?;
     let mut set = std::collections::BTreeSet::new();
-    if let Value::Object(entries) = v {
-        for (_key, locales) in entries {
-            if let Value::Object(m) = locales {
-                for loc in m.keys() {
+    if let Value::Object(versions) = v {
+        for (_code, meta) in versions {
+            if let Some(Value::Array(locales)) = meta.get("locales") {
+                for loc in locales.iter().filter_map(|l| l.as_str()) {
                     if loc != "default" {
-                        set.insert(loc.clone());
+                        set.insert(loc.to_string());
                     }
                 }
             }
@@ -1552,7 +1556,7 @@ fn device_locale_raw(serial: &str) -> String {
     }
 }
 
-/// BCP-47 系统语言（如 "ko-KR"/"zh-Hans-CN"/"id-ID"）→ `strings_table.json` 用的 Android 资源
+/// BCP-47 系统语言（如 "ko-KR"/"zh-Hans-CN"/"id-ID"）→ 语言表用的 Android 资源
 /// 目录代号（如 "ko"/"zh-rCN"/"in"）候选列表，按优先级尝试，第一个在表里实际存在的即采用。
 /// 中文按脚本/地区子标签区分简繁；`id`(现代 BCP-47) 是 Android 历史遗留的 `in` 这类别名单独映射；
 /// 其余语言取主语言子标签（region 一律丢弃，表里都是不带地区的裸语言代号）。
@@ -1572,7 +1576,7 @@ fn candidate_table_codes(raw: &str) -> Vec<String> {
     if lang.is_empty() {
         return vec![];
     }
-    // Android 沿用的历史遗留语言代号（偏离现行 ISO 639-1/BCP-47），strings_table.json 是从
+    // Android 沿用的历史遗留语言代号（偏离现行 ISO 639-1/BCP-47），语言表是从
     // Android values-<locale>/ 目录建的表，键用的就是这套旧代号。
     let legacy = match lang.as_str() {
         "id" => Some("in"),   // 印尼语：BCP-47 现行 id，Android 资源目录历史上一直用 in
@@ -1812,6 +1816,189 @@ pub async fn recorder_cmd(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// 录制器 V2：常驻 daemon 会话（tools/recorder_daemon.py，每设备一进程）
+// ---------------------------------------------------------------------------
+/// 活跃录制会话表。**独立于 RUN_PGIDS**：abort_run 的语义是「停止执行回归」，不该顺手杀掉
+/// 正在录制的会话；但应用退出（kill_all_run_pgids_blocking）要把两张表都收干净。
+struct RecSession {
+    pgid: i32,
+    port: u16,
+    token: String,
+}
+static REC_SESSIONS: Mutex<Vec<(String, RecSession)>> = Mutex::new(Vec::new());
+
+#[derive(Serialize, Clone)]
+pub struct RecSessionInfo {
+    pub port: u16,
+    pub token: String,
+    pub video: bool,
+}
+
+/// 起（或复用）一台设备的录制 daemon，返回前端直连 WS 所需的 {port, token, video}。
+/// daemon 启动成功的判据是 stdout 首行的 JSON（{"port":N,"token":"…","video":bool}）；
+/// 之后它的 stdout/stderr 由后台线程泵到本进程日志。已有同 serial 会话时先 TCP 探活，
+/// 活着直接复用（Recorder.vue 切走切回不重启会话），死了清掉重启。
+#[tauri::command]
+pub async fn recorder_session_start(
+    app: AppHandle,
+    app_slug: String,
+    serial: String,
+) -> Result<RecSessionInfo, String> {
+    let root = root_of(&app)?;
+    let cfg = load_app_config(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        // 复用探活：端口还接得通就直接还给前端
+        {
+            let mut sessions = REC_SESSIONS.lock().unwrap();
+            if let Some((_, s)) = sessions.iter().find(|(k, _)| k == &serial) {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], s.port));
+                if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).is_ok() {
+                    return Ok(RecSessionInfo { port: s.port, token: s.token.clone(), video: false });
+                }
+                let dead: Vec<i32> = sessions.iter().filter(|(k, _)| k == &serial).map(|(_, s)| s.pgid).collect();
+                #[cfg(unix)]
+                for p in dead {
+                    term_pgid(p);
+                }
+                sessions.retain(|(k, _)| k != &serial);
+            }
+        }
+        let args = vec![
+            "tools/recorder_daemon.py".to_string(),
+            "--serial".to_string(),
+            serial.clone(),
+            "--parent-pid".to_string(),
+            std::process::id().to_string(),
+        ];
+        let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0); // daemon 及其子进程（scrcpy 等）一组，收尾一网打尽
+        }
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null()) // adb exec-out 会转发 stdin，GUI 进程的 stdin 是无效 fd（见 gotchas）
+            .spawn()
+            .map_err(|e| format!("启动 recorder_daemon 失败：{e}"))?;
+        let pgid = child.id() as i32;
+
+        // 读首行 JSON（15s 上限：python 冷启 + import ~1s，留足慢机余量）。放线程里读、主线程等，
+        // 避免 daemon 起不来时 read_line 永久阻塞。
+        let mut stdout = child.stdout.take().ok_or("拿不到 daemon stdout")?;
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let h = std::thread::spawn(move || {
+            let mut reader = BufReader::new(&mut stdout);
+            let mut line = String::new();
+            use std::io::BufRead;
+            let _ = reader.read_line(&mut line);
+            let _ = tx.send(line);
+            // 首行之后继续把 stdout 泵到日志（不能 drop 读端：daemon 写满管道缓冲会被 SIGPIPE）
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => eprintln!("[rec-daemon] {}", String::from_utf8_lossy(&buf).trim_end()),
+                }
+            }
+        });
+        let stderr = child.stderr.take();
+        std::thread::spawn(move || {
+            if let Some(err) = stderr {
+                let mut reader = BufReader::new(err);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => eprintln!("[rec-daemon!] {}", String::from_utf8_lossy(&buf).trim_end()),
+                    }
+                }
+            }
+        });
+        let line = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| {
+                #[cfg(unix)]
+                term_pgid(pgid);
+                "recorder_daemon 15s 内没有输出启动信息（python 环境缺 websockets？看终端 [rec-daemon!] 日志）".to_string()
+            })?;
+        drop(h); // 泵线程自生自灭，跟随子进程 EOF 退出
+        let v: Value = serde_json::from_str(line.trim())
+            .map_err(|e| {
+                #[cfg(unix)]
+                term_pgid(pgid);
+                format!("daemon 首行不是合法 JSON（{e}）：{}", line.trim())
+            })?;
+        let port = v["port"].as_u64().unwrap_or(0) as u16;
+        let token = v["token"].as_str().unwrap_or("").to_string();
+        let video = v["video"].as_bool().unwrap_or(false);
+        if port == 0 || token.is_empty() {
+            #[cfg(unix)]
+            term_pgid(pgid);
+            return Err(format!("daemon 启动信息缺 port/token：{}", line.trim()));
+        }
+        REC_SESSIONS.lock().unwrap().push((
+            serial,
+            RecSession { pgid, port, token: token.clone() },
+        ));
+        Ok(RecSessionInfo { port, token, video })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 停掉一台设备的录制会话：SIGTERM 进程组（daemon 有 signal handler 做清理），2s 后 SIGKILL 兜底。
+#[tauri::command]
+pub fn recorder_session_stop(serial: String) -> Result<(), String> {
+    let pgids: Vec<i32> = {
+        let mut sessions = REC_SESSIONS.lock().unwrap();
+        let out = sessions.iter().filter(|(k, _)| k == &serial).map(|(_, s)| s.pgid).collect();
+        sessions.retain(|(k, _)| k != &serial);
+        out
+    };
+    #[cfg(unix)]
+    {
+        for p in &pgids {
+            term_pgid(*p);
+        }
+        let pids = pgids.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            for p in &pids {
+                kill_pgid_if_alive(*p);
+            }
+        });
+    }
+    Ok(())
+}
+
+/// 应用退出兜底的录制会话部分（由 kill_all_run_pgids_blocking 调）。
+pub fn kill_all_rec_sessions_blocking() {
+    let entries: Vec<i32> = REC_SESSIONS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, s)| s.pgid)
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        for p in &entries {
+            term_pgid(*p);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        for p in &entries {
+            kill_pgid_if_alive(*p);
+        }
+    }
 }
 
 /// 本地解析 APK（不碰设备）：aapt dump badging 抠 package/versionName/application-label。

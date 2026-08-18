@@ -57,7 +57,12 @@ def app_version():
 
 
 _WIRELESS_SERIAL_RE = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}:\d+$")
-_RECONNECT_TRIED = False  # 整个进程生命周期最多重连一次，避免把普通非零退出误判成掉线反复重连拖慢整轮
+# 重连冷却窗（秒）：距上次重连尝试超过这个间隔才允许再试。CLI 子进程存活通常 <30s，行为等价于
+# 旧的「每进程一次」；常驻进程（recorder_daemon）里则获得「每次掉线都能自愈」——企业 WiFi AP 漫游
+# 是常态（gotchas 2026-08-04），一次额度撑不过一个录制会话。冷却窗仍防「普通非零退出被误判成
+# 掉线后反复重连拖慢整轮」这个旧问题。
+_RECONNECT_COOLDOWN = 30.0
+_LAST_RECONNECT_TS = 0.0  # 上次重连尝试的 time.monotonic()；0 表示还没试过
 
 
 def _is_wireless_serial(s):
@@ -76,13 +81,16 @@ def _looks_offline(text):
 
 
 def _try_reconnect_once():
-    """无线设备疑似掉线时尝试 `adb connect` 重连一次，成功才让调用方重试原命令。
+    """无线设备疑似掉线时尝试 `adb connect` 重连（带冷却窗），成功才让调用方重试原命令。
     根因是企业 WiFi 下的 AP 漫游导致 TCP 长连接瞬断（见 docs/gotchas.md 2026-08-04 条目），
     不是本框架的并发资源争抢，所以这里只治「掉线后不会自愈」，不动执行编排。"""
-    global _RECONNECT_TRIED
-    if _RECONNECT_TRIED or not _is_wireless_serial(SERIAL):
+    global _LAST_RECONNECT_TS
+    now = time.monotonic()
+    if not _is_wireless_serial(SERIAL):
         return False
-    _RECONNECT_TRIED = True
+    if _LAST_RECONNECT_TS and now - _LAST_RECONNECT_TS < _RECONNECT_COOLDOWN:
+        return False
+    _LAST_RECONNECT_TS = now
     print(f"[adb] {SERIAL} 疑似掉线，尝试 adb connect 重连…", file=sys.stderr)
     try:
         subprocess.run(["adb", "connect", SERIAL], capture_output=True, text=True, timeout=15)
@@ -556,10 +564,15 @@ def _dump_xml_shell(cache_screen=None):
 
 
 SYSTEMUI_PKG = "com.android.systemui"
+# u2 出口默认只剥 SystemUI。target.json 可选字段 strip_packages（字符串数组）可**追加**要剥的窗口包名
+# ——典型场景：Pixel 平板/大屏上导航栏 taskbar 属 launcher 包（com.google.android.apps.nexuslauncher），
+# 其 id=back 与 App 自己的 back 形成 n=2 歧义。⚠️ 追加包名会改变全树匹配数 n/idx，等于改判已录脚本里
+# `--index` 的语义——改这个字段后，该 App 的已录 flow 必须整体回归一遍才可信。默认不启用。
+_STRIP_PKGS = frozenset({SYSTEMUI_PKG} | set(CFG.get("strip_packages") or []))
 
 
-def _strip_systemui(xml):
-    """从 u2 的 dump 里剥掉 SystemUI（状态栏/导航栏）窗口，让 u2 后端与 shell 后端看到同一棵树。
+def _strip_systemui(xml, pkgs=_STRIP_PKGS):
+    """从 u2 的 dump 里剥掉 SystemUI（状态栏/导航栏）等窗口，让 u2 后端与 shell 后端看到同一棵树。
 
     u2 的 `dump_hierarchy()` dump **所有窗口**，而 `adb shell uiautomator dump` 只 dump **当前活跃
     窗口**。实测同一屏 u2 134 个节点 / shell 108 个，多出来的 26 个几乎全是状态栏（clock / wifi_combo /
@@ -575,7 +588,7 @@ def _strip_systemui(xml):
         root = ET.fromstring(xml)
     except ET.ParseError:
         return xml  # 解析不了就原样返回，让下游的解析错误处理去报
-    removed = [c for c in list(root) if c.get("package") == SYSTEMUI_PKG]
+    removed = [c for c in list(root) if c.get("package") in pkgs]
     for c in removed:
         root.remove(c)
     return ET.tostring(root, encoding="unicode") if removed else xml
@@ -889,7 +902,14 @@ def cmd_nodes(args):
                                     sels:[{by,v,n,idx}], anc:{by,v,child:"2,0"}|null}]}
     sels 已排序：唯一匹配的排前，同等唯一性下 id > text > desc（与固化脚本的选择器偏好一致）。
     """
-    root = _dump_root(cache_screen=args.cache_screen)
+    print(json.dumps(build_nodes(_dump_root(cache_screen=args.cache_screen),
+                                 set(args.skip_pkg or [])), ensure_ascii=False))
+
+
+def build_nodes(root, skip_pkgs=()):
+    """cmd_nodes 的核心：XML 根 Element → 节点表 dict（不打印、不 dump、不碰设备）。
+    抽出来是给常驻录制服务（recorder_daemon）内存里直接调用的——它自己持有热 dump 的树，
+    不该为了拿节点表再起一个 adbkit 子进程。CLI 的 cmd_nodes 只是它的打印壳。"""
     # 展平但**保留层级路径**：path 是从根数下来的子节点索引序列，与 cmd_bounds 的 --child 同一套
     # 语义（都只数 tag=="node" 的子节点），所以这里给出的 anc.child 能被 --child 原样吃下。
     flat = []
@@ -918,7 +938,7 @@ def cmd_nodes(args):
     # 窗口**（shell 只 dump 当前活跃窗口），同一屏实测 u2 134 个节点 / shell 108 个，多出来的
     # 几乎全是状态栏（clock/wifi/battery/通知图标）——录制器根本不需要，留着还会污染匹配数。
     # 排除后两后端对 App 控件的视图基本对齐，换后端不改变 --index 语义（见 decisions #30）。
-    skip = set(args.skip_pkg or [])
+    skip = set(skip_pkgs)
     keep_node = lambda n: bool(n["b"]) and n["pkg"] not in skip
     # 匹配数只统计有 bounds 的节点：_match_nodes 要求 center 可解析，无 bounds 的节点
     # tapid/taptext 本来就够不着，算进去会让 n/idx 与真实点击行为对不上。
@@ -959,11 +979,11 @@ def cmd_nodes(args):
         l, t, r, bo = n["b"]
         out.append({**{k: v for k, v in n.items() if k != "path"},
                     "i": i, "c": [(l + r) // 2, (t + bo) // 2], "anc": anc})
-    print(json.dumps({
+    return {
         "w": max((n["b"][2] for n in raw if keep_node(n)), default=0),
         "h": max((n["b"][3] for n in raw if keep_node(n)), default=0),
         "count": len(out), "nodes": out,
-    }, ensure_ascii=False))
+    }
 
 
 def _tap_selector(by, args):

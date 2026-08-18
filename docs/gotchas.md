@@ -178,6 +178,7 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 ## Tauri webview 里 `window.confirm()`/`alert()` 不可靠，删除类操作要用 `@tauri-apps/plugin-dialog`（2026-07-22）
 
 - 原生 `window.confirm()` 在 Tauri v2 的 webview 里不会真的阻塞弹出系统对话框，很多情况下静默直接返回——用户没看到确认框，点删除就直接执行了；**更隐蔽的反向坑（2026-08-04 实测）：静默返回值也可能是假，导致 `if (!confirm(...)) return` 直接短路，点删除看起来毫无反应，接口压根没被调用**，表现成"这一条设备死活删不掉，别的都正常"（偏随机，不是这一行设备本身有什么特殊）。必须换成 `@tauri-apps/plugin-dialog` 的 `confirm()`/`message()`（项目已装该插件，`api.ts` 里 open/save 已在用），见 `desktop/src/views/Runner.vue` 的 `removeApp`。**`Devices.vue` 的 `removeDevice` 已在 2026-08-04 同步改用 `plugin-dialog`，这条坑不再复现**——以后新增任何"删除/确认"交互，起手直接用 `plugin-dialog`，别再用原生 `confirm`/`alert`。
+- **`window.prompt()` 更彻底：根本没有替代品（2026-08-18 实测）**。录制器的「输入文本」「备注」按钮原来用 `prompt()`，在 Tauri 窗口里点了**什么都不弹**、静默返回 `null`，表现成"这按钮是坏的"。`plugin-dialog` 只有 `confirm`/`ask`/`message`/`open`/`save`，**没有任何文本输入对话框**——要收一行文本只能自己做页内弹层（见 `desktop/src/views/Recorder.vue` 的 `askText()`：`ask` 状态 + Promise + `nextTick` 聚焦 + 回车确认/Esc 取消）。
 - 「删除 App」不做硬删除：`apps/<slug>/` 整个 rename 进 `apps/.trash/<slug>__<时间戳>/`，防手滑误删用例/固化脚本/账本却没法找回；`.trash` 前缀 `.` 让 `list_apps` 天然跳过，不会冒出来当成一个 App，也加进了 `.gitignore`。
 
 ## UI dump 两后端可切；shell/u2 的树可能不同 + 千万别在同进程内交错 dump（2026-07-20）
@@ -502,6 +503,67 @@ App 的 `strings.xml` 本地化文案——固化脚本写死了固化当时设�
 查表小工具，`LANG_CODE` 未设置时原样直通、零风险）。用法见 flow-freeze skill「多语言」
 一节。**残留限制**：只解决"文案对不对"，不解决"目标语言下控件是否因为文案变长/变短
 导致布局挪位、或触发额外的语言相关引导页"——这类仍要真机验证，查表验证不能替代。
+
+## 多语言表用「翻译导出包」建 ≠ 设备上的真实文案（2026-08-18）
+
+`strings_table.json` 原来是拿翻译导出包 zip 建的。翻译包是"该翻成什么"，apk 是"实际装到
+设备上是什么"，两者实测差得很大——用 2.3.5J 的 apk 跟当时在用的翻译包表对比：
+
+| 项 | 翻译包表 | apk 实际 |
+|---|---|---|
+| string key | 592 | 808（266 个表里没有） |
+| locale | 24 | 98 |
+| 表里有、apk 没有的 key | 50（查出来的译文设备上根本不存在） | — |
+| 同 key 同 locale 值不一致 | **443 条** | — |
+| 表里有 `en`、apk 无 `values-en`（英文实际走默认 `values/`） | 775 条 | — |
+
+那 443 条值不一致里，主因是 `_parse_strings()` 没做 Android XML 反转义和 trim：表里存的是
+`A\'dan Z\'ye`（字面反斜杠）、`'من فيديو إلى صوت '`（尾随空格），设备上显示的是 `A'dan Z'ye`。
+法语/意大利语/土耳其语这类带撇号的语言几乎条条中招。**当时没暴露，是因为只在 `zh-rCN` 下跑**
+（`t()` 在 `LANG_CODE` 等于 `SRC_LANG` 时原样直通、根本不查表），一旦 `LANG_CODE=fr` 就是稳定
+失败，且失败长得跟"UI 真变了"一模一样。
+
+**修法**：`tools/lang_table.py` 新增 `build-apk`，走 `aapt2 dump resources` 直接读 apk。
+aapt2 吐的是**运行时真值**（转义已解），所以 apk 路线不需要也不能再反转义一次；XML/zip 路线
+补了 `_unescape_android()`（`\'` `\"` `\n` `\uXXXX` + 外层引号 + 空白折叠）。
+
+坑内坑，都是实际踩到的：
+- **aapt2 文本 dump 里含换行的文案是跨行输出的**（权限引导那种 `1.打开设置\n2.点击权限`），
+  按行正则解析会把这些 key 整条丢掉（实测丢了 5 个）。`_parse_aapt2_dump()` 对未闭合的值累积
+  到收尾引号那一行，并用 aapt2 自报的 `entryCount` 校验解析条数，对不上直接报错不产表。
+- **不需要 apktool/JRE**：这台机器压根没装 java，`aapt2` 在 Android SDK build-tools 里，
+  `_find_aapt2()` 按 `$AAPT2` → PATH → SDK 最新 build-tools 顺序找。
+- **换 apk 必须重建表**。实测 2.3.5J → 2.3.6：新增 32 key、删除 12 key。当时 `apks/` 里
+  最新才 2.3.5J，设备上跑的已经是 2.3.6。
+- **设备上装的包可以直接拉下来建表**，比翻本地包更准：`adb shell pm path <pkg>` → `adb pull`
+  base.apk。先看有没有 `split_config.<lang>.apk`——有的话语言资源在 split 里，只拉 base 会缺语言
+  （MP3Cutter 2.3.6 只有 abi/dpi split，语言全在 base）。
+- **换表可能引入新的文案撞车**。新表 key 多了，原来单命中的文案可能变成多 key，`t()` 不带
+  第二个参数就会报错退出。**换表后必须把 `flow_*.sh` 里所有 `$(t ...)` 调用逐条跑一遍
+  `resolve` 复核**，撞车的补 `--key`（选旧表下命中的那个 = 与换表前行为等价）。
+
+## App 内语言 ≠ 设备系统语言（2026-08-18）
+
+排查上面那条时发现：真机 `persist.sys.locale=zh-Hans-CN`，但 MP3Cutter 首页显示的全是英文
+（`Audio Cutter`/`IG Audio Downloader`/`My Ringtone`）——这个 App 有独立的应用内语言设置，
+跟系统语言无关。后果：
+
+- **`SRC_LANG=zh-rCN` 这个前提取决于 App 内语言，不是系统语言。** 同一批 flow 里
+  `flow_dl_ig.sh` 用 `$(t IG音频下载)`、`flow_dl_ig_output.sh` 用 `$(t "IG Audio Downloader")`，
+  就是因为两条固化时 App 内语言不同。
+- `resolve_device_lang_code`（decisions #38 的「自动」档）读的是 `persist.sys.locale`，
+  **在这种 App 上会自动注入一个错的语言**。选「自动」前先确认该 App 没有独立语言设置。
+- 固化脚本里原文是英文、`--from zh-rCN` 反查必然落空时，**给 `t()` 补第二个参数（资源 key）**
+  即可：带 key 时跳过按原文反查，不传 `LANG_CODE` 时仍原样返回英文原文（零行为变化）。
+
+## 系统权限弹窗的文案不在 App 的 strings.xml 里（2026-08-18）
+
+`flow_mix_core.sh`/`flow_mix_shortest.sh`/`flow_ring_set.sh` 里点「允许」用的是
+`$(t 允许 allow)`，但那三处点的是 **Android 系统权限弹窗**（`permissioncontroller` 包），
+文案来自系统而不是被测 App。App 表里 `allow`（ja=`許可する`）和
+`notifications_permission_confirm`（ja=`許可`）两个 key 的中文都是「允许」，**哪个都不保证等于
+系统弹窗上的那一句**。目前三处都是 `|| true` best-effort 所以不阻断，但切语言时等于没点上。
+真要跨语言稳，应该改用 `pm grant` 直接授权绕开 UI（项目里目前没有任何 `pm grant` 用法）。
 
 ## 无线设备 chip/分组标题显示成端口号 `5555`（2026-07-29）
 
@@ -1718,3 +1780,95 @@ RTT 313ms 时每条命令都要等三分之一秒，`push` 的窗口确认直接
 - **negative 断言处要额外小心**：`flow_merge_count.sh` 有一处是"1 个已选中时点「下一个」应无反应"的
   负向断言。那里**必须真的定位到按钮**（两个 id 都找不到就让 `set -e` 停），不能把定位失败吞成"点了没反应"
   ——否则脚本会把"控件改名找不到"误判成"断言通过"，比直接失败更危险。
+
+## `t()` 里的 shell 变量缓存不生效——它总在 `$(...)` 子 shell 里跑（2026-08-18）
+
+`lang_helper.sh` 的 `t()` 用法一律是 `$AK taptext "$(t 音频裁剪 mp3_cutter)"`，也就是**每次调用都发生在
+命令替换的子 shell 里**。函数内 `_LANG_TABLE_CACHE="$p"` 这种赋值回不到父 shell，下一次 `t()` 又是
+一个新子 shell，缓存永远是空的——实测等于每个 `t()` 都重跑一遍 `lang_table.py ensure`（一条 flow
+几十处调用 = 几十次 `adb dumpsys`）。
+
+**修法**：缓存落文件，`"${TMPDIR:-/tmp}/aitest_lang_$$_<serial>"`。`$$` 在子 shell 里仍是**父** shell
+的 PID（bash 特性），正好拿它给缓存文件划「本次执行」的作用域；source 时先 `rm -f` 一次清掉 PID 复用
+撞上的历史残留。同类坑适用于任何想在 `$()` 里记状态的 shell 函数。
+
+## 核对 flow 的 `t()` 调用不能统一按 `zh-rCN` 反查（2026-08-18）
+
+`flow_dl_ig_output.sh`/`flow_dl_tt_output.sh` 里有 `export SRC_LANG=en`（这两条固化时 App 内语言
+是英文，见上面「App 内语言 ≠ 设备系统语言」）。写核对脚本时统一传 `--from zh-rCN` 会把它们判成
+"找不到 key"的假失败——**必须逐文件 grep `^export SRC_LANG=` 取各自的源语言**，没有才默认 `zh-rCN`。
+
+顺带一条通用建议：涉及断言/点击判定的 `t()` 调用都**顺手带上第二个参数（资源 key）**。带 key 时
+`resolve` 跳过"按原文反查"，于是既不怕换表后原文撞车成多个 key，也不怕 `SRC_LANG` 没设对。
+
+## 桌面壳的 UI 改动没法用浏览器预览验证（2026-08-18）
+
+`npm run dev --prefix desktop` 起的 Vite server（`http://localhost:1520`）在**普通浏览器**里打开是
+白屏，console 里 `Cannot read properties of undefined (reading 'invoke')`——桌面壳所有数据都走
+`@tauri-apps/api` 的 `invoke`，那个对象只有 Tauri 的 WebView 里才注入。所以改了 `desktop/src/**`
+的界面，别指望用浏览器截图去验证，也别据此判断"页面崩了"。
+
+**能做的验证**：`cd desktop && npx vue-tsc --noEmit`（类型 + 模板检查），加上真正的
+`npm run tauri dev` 窗口里看（Vite HMR 会把改动推进已开着的窗口，不用重启）。
+
+## 录制器 V2「探屏成功却一片黑、0 个可点框」＝ 视频与截图互相让路的死锁（2026-08-18）
+
+现象：点「开始探屏」后右侧统计正常（如"228 个节点"），取屏区却是个纯黑方块（那只是 `.stage`
+没图时的 260×520 占位），**画出 0 个可点框**，而且没有任何报错（`png_err` 是空的）。时好时坏。
+
+成因是三方互为前提：
+
+| 环节 | 条件 |
+|---|---|
+| daemon `need_shot` | `... and not (scrcpy.alive)` —— 流一活就**不再 screencap**（画面交给视频） |
+| 前端 `.frame` 渲染 | `screen.png \|\| videoActive` —— 没图又没解出帧就不挂 DOM |
+| `videoActive` | 要第一帧解出来；解码要 `canvas`；`canvas` 在 `.frame` 里 |
+
+所以只有"首屏那次 dump 抢在 scrcpy alive 之前（那次带 png）"才能打破循环 —— 实测这两件事只差
+0.4s（hierarchy ~0.8s vs videoMeta ~1.2s），dump 稍慢（无线抖动、u2 重连、自动清障多点一轮）
+就翻转成死锁。同一台设备复现脚本见下：连上等 4s 再发 `refresh`，之后每条 hierarchy 都 `png=0B`。
+
+另外 `videoPipe.onFatal` 那句"已退回静态截图模式"原本是**假的**：前端把自己切了 still，daemon
+那边 `scrcpy.alive` 还是 true，照样不拍图 → 一样是黑屏。
+
+**修法（三处一起，缺一不可）**：
+1. `.frame` 的 v-if 加 `|| deviceWH` —— `videoMeta` 一到就把 canvas 挂上，解开死锁；canvas 挂载的
+   watch 里补 `setDeviceSize` + `requestKeyframe`。
+2. 前端首帧看门狗：`videoMeta` 后 4s 还没画出帧 → 判定"这条链路解不出"，发 `{t:"videoMode",on:false}`。
+   `onFatal` 走同一条路径。
+3. daemon 认这条命令：`video_on=False` → 停 scrcpy + 立刻补一张 shot；`need_shot` 改成
+   `not (scrcpy.alive and video_on)`；重连时 `video_on=False` 就不再起流。
+
+通用教训：**两条链路互为兜底时，"另一条在工作"的判断必须来自消费端的确认，不能拿生产端的
+"我在推"当证据**（scrcpy 在推流 ≠ 前端画得出来）。
+
+## flow 脚本里 grep 抠"父标签紧跟子标签"的正则，换 dump 后端就静默失效（2026-08-18）
+
+现象：`VOICE-CORE-01` 固化并真机跑通后，隔了一段时间同一条脚本首页断言突然报
+`[shot] ✗ 必须出现的控件未在屏：'变声器'`——但截图明明看着首页干净、「Voice Changer」清晰
+可见，只是显示的是英文不是中文。
+
+根因：脚本里读入口 tile 真实文案（不硬编码语言，见下方"多语言"章节）用的是这种写法：
+
+```bash
+CUT_LABEL=$(grep -oE '<node[^>]*resource-id="[^"]*id/ll_cut"[^>]*><node[^>]*text="[^"]*"' <<< "$HOME_XML" \
+  | grep -oE 'text="[^"]*"$' | sed 's/^text="//; s/"$//')
+```
+
+这条正则假设"父节点的 `>` 后面立刻是子节点的 `<node`"——只在 `dump_backend=shell`（整份
+dump 挤成一行，标签间没有空白）时成立。`dump_backend=u2` 是缩进多行，父子标签间隔着换行+
+空格，同一条正则匹配不到，静默退回 `t()` 查表的兜底值（中文），而真机当时显示的是英文，
+`--assert-text` 拿兜底值一比对不上直接判失败——**现象跟"App UI 真的坏了"完全一样**，很容易
+误判成产品缺陷去报 bug。更麻烦的是 `target.json` 的 `dump_backend` 不是 flow 脚本自己定的，
+会被同时跑着的别的进程（这次是桌面壳的录制器守护进程 `recorder_daemon.py`）实时改写，脚本
+写的时候用哪个后端验证过、回归跑的时候实际是哪个后端，两者可能对不上，且脚本自己毫无感知。
+
+审计发现 `flow_cut_save.sh`/`flow_cut_core02.sh` 也是同一段代码抄过去的，同样中招（姊妹脚本
+共享代码同步排查的纪律见 skill flow-freeze 纪律#12）。三个脚本都已修复：读到 dump 先
+`tr -d '\n'` 拍平成单行，正则里父子标签之间也从 `><` 改成 `>[[:space:]]*<`，两种后端都能
+匹配上。已写进 skill flow-freeze 写脚本纪律#13，`grep -rn '><node' apps/*/flows/*.sh`
+可以一键排查有没有别的脚本也这么写。
+
+通用教训：**跨标签的文本相邻关系去做 grep，只在生成方式固定不变时安全；生成方式（这里是
+dump 后端的排版）可能被外部进程实时改写时，这类"隐含格式假设"必须先归一化再匹配，不能假设
+自己观察到的那种格式永远成立**。

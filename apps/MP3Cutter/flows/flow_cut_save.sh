@@ -22,9 +22,9 @@ S="$1"
 AK="python3 tools/adbkit.py --serial $S"
 CASE="CUT-CORE-01"   # 纯用例ID；证据路径里的设备段由 adbkit 按 --serial 自动加，别把 serial 掺进 --case
 # 多语言查表：LANG_CODE=ko bash apps/MP3Cutter/flows/flow_cut_save.sh <serial> 即可换语言跑；
-# 不传 LANG_CODE 时 t() 原样返回原文，行为与接入前完全一致。见 tools/lang_helper.sh。
+# 不传 LANG_CODE 时 t() 原样返回原文，行为与接入前完全一致；表路径不用写死，lang_helper 按
+# 设备实装 versionCode 自动备表（见 tools/lang_helper.sh、docs/decisions.md #55）。
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/lang_helper.sh"
-TABLE="apps/MP3Cutter/lang/strings_table.json"
 PKG="ringtone.maker.mp3.cutter.audio"   # 前台归属判断用：被全屏插屏广告/误触 BACK 弹回桌面时，据此把 App 重新拉回前台
 SRC="assets/mp3-sample-track.mp3"
 DEV_DST="/sdcard/Music/mp3-sample-track.mp3"
@@ -88,8 +88,12 @@ done
 # --assert-text 不能再硬编码 CUT_ENTRY（显示语言可能是中文也可能是英文，见上）——现读 ll_cut
 # 子节点当前真实文案存入 CUT_LABEL 用来断言，断言永远跟当次真实显示的语言一致；读不到（比如
 # 页面结构又变了）才退回 t() 查表值兜底，保证这条断言不会因为读不到就直接跳过。
-HOME_XML=$($AK --case "$CASE" ui 01-home 2>/dev/null)
-CUT_LABEL=$(grep -oE '<node[^>]*resource-id="[^"]*id/ll_cut"[^>]*><node[^>]*text="[^"]*"' <<< "$HOME_XML" \
+# 2026-08-18 真机踩过（VOICE-CORE-01 固化时发现，见 skill flow-freeze「两个 dump 后端排版不同」）：
+# shell 后端 dump 整份单行、u2 后端缩进多行，父子标签间隔着换行+空格，下面这条"父标签 `>` 紧跟
+# 子标签 `<node`"的正则只吃 shell 那种单行格式，u2 时匹配不到——静默退回 t() 兜底值，语言不对
+# 时直接把 --assert-text 判失败。先拍平成单行再 grep 消掉两种后端的排版差异。
+HOME_XML=$($AK --case "$CASE" ui 01-home 2>/dev/null | tr -d '\n')
+CUT_LABEL=$(grep -oE '<node[^>]*resource-id="[^"]*id/ll_cut"[^>]*>[[:space:]]*<node[^>]*text="[^"]*"' <<< "$HOME_XML" \
   | grep -oE 'text="[^"]*"$' | sed 's/^text="//; s/"$//')
 [ -n "$CUT_LABEL" ] || CUT_LABEL="$CUT_ENTRY"
 # --assert-gone 兜一发原生广告标志（WebView 创意不进树，对其为盲区，仅作 belt-and-suspenders）。

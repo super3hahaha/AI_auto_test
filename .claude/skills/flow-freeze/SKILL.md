@@ -74,31 +74,38 @@ $AK tapid take_save --timeout 8 --from-cache editor       # 直接读缓存算�
 这些选择器/判定点直接找不到，报"没找到...界面可能已变"（其实是语言变了，不是 UI 结构变了，
 但表现上跟 UI 变更报错一样，容易误判）。
 
-**如果有该 App 的多语言 `strings.xml` 翻译包**（人工导出的翻译 zip，或用 `lang-string-compare`
-skill 的 `extract_apk_strings.py` 直接从 apk 反编译出的同构产物）——`tools/lang_table.py` 能
-建一张「资源 key → 各语言译文」映射表，固化脚本运行时按目标语言把写死文案换算一遍，不用重新
-探路/重新写死每种语言的文案：
+**表不用你建，也不用问用户要翻译包**：`tools/lang_table.py ensure` 会按「该设备此刻实装的
+versionCode」从设备上的 apk 现拉现建（`pm path` → `adb pull base.apk` → `aapt2 dump`），
+缓存在 `apps/<slug>/lang/tables/<versionCode>.json`，命中约 0.2s、冷路径约 6s，每个版本每台
+机器只付一次。`run_flow.py` 起脚本前会自动预热，`lang_helper.sh` 里还有一层现场兜底——
+**固化脚本只要 source 一下、把文案包成 `t()` 就行，不写表路径**：
 
 ```bash
-# 1) 建表（App 出新版翻译包时重建一次即可）
-python3 tools/lang_table.py build "<翻译包目录或zip>" \
-    --out apps/<slug>/lang/strings_table.json --default-alias en
-
-# 2) 固化脚本里 source 小工具，把写死文案包一层 t()
+# 固化脚本里 source 小工具，把写死文案包一层 t()（不用写 TABLE=，表自动解析）
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/lang_helper.sh"
-TABLE="apps/<slug>/lang/strings_table.json"
-$AK taptext "$(t 音频裁剪)" --timeout 8
-$AK waitfor text "$(t 选择音频)" --timeout 8 --cache picker
+$AK taptext "$(t 音频裁剪 mp3_cutter)" --timeout 8
+$AK waitfor text "$(t 选择音频 select_audio)" --timeout 8 --cache picker
 
-# 3) 回归时按需切语言（不传 LANG_CODE 完全等价于原来的行为，零风险）
+# 回归时按需切语言（不传 LANG_CODE 完全等价于原来的行为，零风险、零开销）
 LANG_CODE=ja bash apps/<slug>/flows/flow_cut_save.sh <serial>
 ```
 
+- **第二个参数（资源 key）建议每次都带上**。带 key 时跳过"按原文反查"，于是既不怕 App 出新版后
+  原文撞车成多个 key（换表时真撞过，见 decisions #54），也不怕 `SRC_LANG` 没设对。查 key 的办法：
+  `python3 tools/lang_table.py resolve <表> "<原文>" --from <源语言> --to en`，撞车时报错会列出全部候选，
+  再对照真机 dump 的控件 `resource-id` 定哪个才是。
+- **源语言以脚本实际固化时 App 显示的语言为准，不是设备系统语言**。有些 App（如 MP3Cutter）有独立的
+  应用内语言设置，系统是中文而 UI 是英文——这种脚本要 `export SRC_LANG=en`（放在 `source` 之前）。
 - `t()` 找不到 `--from`（`SRC_LANG`，默认 `zh-rCN`）语言下这段文案对应的 key，会非0退出报错——
-  说明这段文案根本不是 `strings.xml` 里的（比如广告 SDK 的 `content-desc`），或者
-  `SRC_LANG`/固化时用的语言选错了，需要人工核实，**不做静默兜底**。
-- `--to` 语言译文缺失（翻译包本身没补全那条）→ 回退用原文 + stderr 警告，不中断整条脚本——
-  这种情况多半那一步在目标语言下还是会失败，跟"脚本断了→回主循环重探"走同一套处理路径。
+  说明这段文案根本不是 `strings.xml` 里的（比如广告 SDK 的 `content-desc`、或**系统权限弹窗的按钮**，
+  那是 `permissioncontroller` 包的资源，不在被测 App 表里），或者 `SRC_LANG` 选错了，需要人工核实，
+  **不做静默兜底**。
+- `--to` 语言译文缺失 → 先按回退链找（精确 → 同书写系统近邻 `zh-rHK`→`zh-rTW` → 主语言 `fr-rCA`→`fr`
+  → `default`），整条链都落空才回退用原文 + stderr 警告，不中断整条脚本。
+- **备表失败**（设备离线 / App 没装 / 找不到 aapt2 / 包按语言拆了 split）→ 报错退出，不退化成用原文。
+- 也可以手动指定包建表（比如要核对某个还没装到设备上的版本）：
+  `python3 tools/lang_table.py build-apk <apk> --out <表路径> --default-alias en`；
+  `python3 tools/lang_table.py index` 看已建了哪些版本。
 - **`tapid`/`waitfor id` 这些本来就不受语言影响的步骤不用包 `t()`**，只包那些非用文案/描述定位
   或判定不可的步骤——能用 id 就优先用 id，这是从源头减少语言依赖面，比查表更稳。
 - 新语言第一次接入必须真机验证过（切换设备语言 → `run_flow.py` 跑一遍确认 exit=0），不能只
@@ -296,6 +303,29 @@ CUT-CORE-01/MIX-CORE-01/SPLIT-CORE-01 都有重命名收尾这一步，新模块
     结果几小时后同一个坑在另一台设备上又把 `MIX-CORE-02` 打挂了一次（见 `docs/gotchas.md`
     同日条目）。判断标准：改动的代码段是不是"选择器/等待/清障"这类跟被测功能强相关、姊妹
     脚本大概率原样复制的部分（跟 UI 强绑定的截图文案、`CASE` 变量名这类天然不同的部分除外）。
+13. **禁止用 `grep` 匹配"父标签 `>` 紧跟子标签 `<node`"这种跨两个标签的相邻关系去抠某个
+    resource-id 的子节点文案**（典型写法：`grep -oE '<node[^>]*resource-id="...id/xxx"[^>]*><node[^>]*text="[^"]*"'`，
+    用于"入口容器自己没有 text，要读它子 TextView 当次真实渲染的文案"这种场景，跟纪律#1
+    禁止的"grep 抠 bounds"是姊妹坑，但触发条件不同、之前没写进来）。**原因**：`shell` 后端吐
+    的 `ui` dump 是整份挤在一行、标签间没有空白，`>` 后面立刻是下一个 `<node`；`u2` 后端是
+    缩进多行，父子标签间隔着换行+空格——同一条正则在 `shell` 后端下能匹配到，换到 `u2` 后端
+    (或反过来) 就静默匹配不到。而 `target.json` 的 `dump_backend` 不是脚本自己决定的、可能
+    被别的进程（如桌面壳录制器）实时改写，脚本运行时到底是哪个后端不受自己控制，所以**任何
+    读这两个后端切换后仍要正确工作**。2026-08-18 真机踩过（`VOICE-CORE-01` 固化时发现）：
+    `flow_cut_save.sh`/`flow_cut_core02.sh` 里读入口 tile 真实文案（`CUT_LABEL`）的这段正则
+    只在 `shell` 后端验证过，`target.json` 被改成 `u2` 后端后静默读不到值、退回 `t()` 查表的
+    中文兜底，而当时真机显示的是英文，`--assert-text` 直接判失败——现象跟"App UI 真的坏了"
+    完全一样，排查成本高。**改法**：在拿到 dump 文本后先 `tr -d '\n'` 拍平成单行再 grep，把
+    两种后端的排版差异消掉，两边都能匹配：
+    ```bash
+    HOME_XML=$($AK --case "$CASE" ui 01-home 2>/dev/null | tr -d '\n')
+    CUT_LABEL=$(grep -oE '<node[^>]*resource-id="[^"]*id/ll_cut"[^>]*>[[:space:]]*<node[^>]*text="[^"]*"' <<< "$HOME_XML" \
+      | grep -oE 'text="[^"]*"$' | sed 's/^text="//; s/"$//')
+    ```
+    注意正则里父子标签之间也要从 `><` 改成 `>[[:space:]]*<`，光拍平不改这一处仍然匹配不到。
+    **排查现有脚本是否中招**：`grep -rn '><node' apps/*/flows/*.sh`，命中的都要照此改法补
+    `tr -d '\n'` + `>[[:space:]]*<`；`grep -o '<node[^>]*resource-id="..."[^>]*>'` 这种只
+    匹配"单个标签自身属性"（不跨标签）的写法不受影响，不用改。
 
 ## 失败判定标准（硬规则，2026-07-22 起）
 

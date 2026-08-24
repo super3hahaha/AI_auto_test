@@ -113,6 +113,26 @@ def probe_installed_version(pkg, serial=""):
     return probe_installed_build(pkg, serial)[0]
 
 
+def slug_for_package(pkg):
+    """反查：给一个包名，找 apps/ 下哪个已注册 App 的 target.json.package 是它。
+    查不到（未注册的 App / pkg 为空）返回 None。供录制器"探屏"时核对设备当前前台
+    跟左栏选中的 App 是不是同一个，不是就提醒/自动切目标目录用（见 decisions.md）。"""
+    if not pkg or not APPS.exists():
+        return None
+    for d in APPS.iterdir():
+        if not d.is_dir() or d.name.startswith("."):
+            continue
+        cfg_path = d / "target.json"
+        if not cfg_path.exists():
+            continue
+        try:
+            if json.loads(cfg_path.read_text()).get("package") == pkg:
+                return d.name
+        except Exception:
+            continue
+    return None
+
+
 TEXT_RESOURCES_FILE = GLOBAL_CONFIG / "text_resources.json"  # 桌面壳「资源库」文本资源登记，跨 App 共享
 
 

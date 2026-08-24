@@ -15,6 +15,8 @@
 - **真机跑一段时间会自动熄屏/锁屏**：熄屏后 `am start` 能把 Activity 拉起但界面不可见/不可点，后续 `ui`/`tap` 全部落空，看起来像"App 无响应"。`adbkit.py launch`（`cmd_launch`）已在开头调 `_ensure_awake()` 自愈：读 `dumpsys power` 的 `mWakefulness=`，非 `Awake` 就 `KEYCODE_WAKEUP` + 滑动解锁，无密码锁屏够用；**有密码锁屏这一下解不开**，仍会导致后续步骤失败，遇到了记 `BLOCK-`。
 - **小米/红米(MIUI)设备 ADB 模拟点击可能被系统整体拒绝**：`adb shell input tap/text/swipe` 发出去无报错、`ui dump` 也能正常拿到 bounds，但 App 完全收不到事件——UI 卡在原页面不动，看起来像"App 不响应/脚本失效"。真实原因是 MIUI 的安全限制：`logcat` 里会看到 `InputDispatcher: Permission denied: injecting event from pid X uid 2000 to window ... owned by uid <app_uid>`（2000=shell）。修复：手机上开启 设置→更多设置→开发者选项→**"USB调试(安全设置)"**（USB debugging (Security settings)，部分 ROM 需先登录小米账号联网验证）。这是设备侧手动开关，无法用 ADB 命令绕开（也正是它存在的意义），跑之前先确认这台 MIUI 设备该开关已开。判断优先级：先看 `adb -s <serial> logcat -d | grep "Permission denied: injecting"`，命中就是这个坑，别去怀疑脚本逻辑或 App bug。
 
+- **dmg 装的桌面壳双击打开报「adb 不可用：No such file or directory」，但 `start.command` 打开没事**：Finder/Launchpad 拉起的 GUI app 走 launchd，PATH 是系统最小 PATH，不会加载 `~/.zshrc`/`~/.bash_profile`；`start.command` 是终端里跑的 login shell，PATH 里带用户自己装的 Android SDK 路径，所以没触发。已在 [`lib.rs::run()`](../desktop/src-tauri/src/lib.rs) 开头调 [`fix_gui_app_path()`](../desktop/src-tauri/src/commands.rs) 兜底：把 `~/Library/Android/sdk/platform-tools`、`/opt/homebrew/bin`、`/usr/local/bin` 等常见位置补进本进程 PATH（子进程含起的 python 都继承，一并解决 `adbkit.py` 里裸 `"adb"` 的问题）。如果用户的 SDK 装在非常见路径（既不在 `ANDROID_HOME`/`ANDROID_SDK_ROOT` 也不在上述默认位置），这个兜底覆盖不到，需要用户自己把 adb 所在目录加进系统级 PATH（如 `/etc/paths.d/`）。
+
 ## 三招确认包是否 debuggable（换包必查，决定 oracle 深度）
 
 debuggable 是构建时烧进 manifest 的，安装不会改变（除非 rooted/userdebug 系统 `ro.debuggable=1` 全局生效）。任一确认即可，方法2/3 最权威：
@@ -1872,3 +1874,232 @@ dump 挤成一行，标签间没有空白）时成立。`dump_backend=u2` 是缩
 通用教训：**跨标签的文本相邻关系去做 grep，只在生成方式固定不变时安全；生成方式（这里是
 dump 后端的排版）可能被外部进程实时改写时，这类"隐含格式假设"必须先归一化再匹配，不能假设
 自己观察到的那种格式永远成立**。
+
+## UNLOCK-* 真机接入多语言：系统弹窗/服务端目录名查不到表，且暴露一个跟语言无关的既有超时坑（2026-08-19）
+
+给 `apps/MP3Cutter/flows/flow_unlock_*.sh`（10 个广告解锁类用例）补接 `t()` 时，在真机上
+（当时连接设备系统语言实测是俄语 ru-RU）做端到端验证，发现两类问题：
+
+**1）三类文案天生查不到表，不是漏改**：（a）在线铃声目录名如「Top Ringtones 2026」
+「Most Downloaded」是服务端下发的目录内容，不在 apk 的 `strings.xml` 里；（b）系统相册
+选图器（Photos/Just once/Pixel 4/CROP）来自 Android 系统的图库 App，不是被测 apk；
+（c）Android 系统运行时权限弹窗（如请求 `READ_MEDIA_AUDIO` 时弹出的确认框）来自
+`com.android.permissioncontroller` 系统包。这三类都跟随**设备真实系统语言**而不是
+`LANG_CODE`——真机实测：把 `grant_first_run_permissions()` 里第二个 `taptext "Allow"`
+（英文硬编码）放到系统语言是俄语的真机上运行，实际弹出的系统按钮文案是「ПОЗВОЛЯТЬ」，
+跟脚本的英文硬编码对不上，taptext 落空。这不是 bug，是这套语言表机制的能力边界（只覆盖
+被测 apk 自己的资源），三个脚本文件里都留了对应注释。
+
+**2）跟语言无关的既有缺陷**：`grant_first_run_permissions()` 的重试预算（5 轮、每轮
+`sleep`≈1.5s，共约 7.5s）在这次测试设备（联网 ADB 设备 `192.168.209.171:5555`，非直连
+USB）上不够用——刚 `force-stop` + 冷启动后，App 从"仍在检查权限/渲染首页占位卡片"到
+"选图页 RecyclerView 完全渲染出可勾选的 checkbox"这段时间超过了 7.5s 的重试窗口，导致
+`flow_unlock_convcount.sh` 连续 3 次真机跑都卡在"0/2 勾选"——但同一时刻手动追加等待几秒
+后现查，页面其实已经正常渲染完成（真实 `READ_MEDIA_AUDIO` 权限确认是 `granted=true`）。
+这个超时预算写死在 `_lib_ad_unlock.sh` 里，10 个 `UNLOCK-*` 脚本共用，不挑语言、不挑
+`LANG_CODE`，在慢设备/网络型设备上大概率都会复现，**目前尚未修**（不在本次语言接入范围
+内，需要单独把 `grant_first_run_permissions` 的重试轮数/间隔做成可调，或改成轮询直到
+`checkbox`/目标 id 真正出现，而不是固定轮数硬等）。
+
+验证覆盖：`mp3_cutter`/`audio_format`/`select_audio`/`allow` 等多个 key 在 `--to ru` 下
+经真机 dump 逐一核对，`t()` 产出跟屏幕真实文案逐字一致（如 `audio_format`→「Конвертер
+аудио」、`allow`→「Позволять」）；33 个新增 `$(t ...)` 调用对表内全部 98 个 locale 跑
+`resolve` 零报错（含 key 缺失/撞车）。**但受限于上述第 2 点，没有拿到任何一条 `UNLOCK-*`
+在非英语真机上的完整 exit=0 通过**，按项目「不做已知缺陷豁免」的纪律，这条不算完整
+验证完成，如实记在这里，不算进已验证清单。
+
+通用教训：**多语言接入的验证边界是"文案换算对不对"，不是"整条用例端到端过不过"——后者
+可能被完全不相关的既有超时/时序缺陷挡住，两件事要分开验收，不能因为卡在后者就误判前者
+有问题，也不能因为前者验证过就假装后者也顺带测过了**。
+
+## UNLOCK-ALBUM-01 入口文案漂移 + Exit 按钮大小写踩坑（2026-08-19）
+
+`apps/MP3Cutter/flows/flow_unlock_album.sh` 在 2.3.6 上判失败（queue.csv 记的是"首页找不到
+「MP3 Cutter」入口"），用 `tools/recorder.py` 重新录制真机路径（REC-0819-1133）+ adbkit 逐步
+复核，定位到三处：
+
+1. **首页入口文案已从「MP3 Cutter」改成「Audio Cutter」**——真机 dump 直接确认，taptext 改
+   文案即可，无需别的兼容逻辑。
+2. **「Use」「Watch Ad」现在有稳定 resource-id**（`tv_use` / `fl_watch_ad`），已改用 `tapid`
+   替代原来的文案匹配——好处不止"更稳"，还顺带去掉了对 `t()` 语言表这两个 key 的依赖。
+3. **录制过程中人工多点了一次列表行的 `play_btn`**（预览播放）——真机复核证实这一步
+   不是下载/解锁链路必需操作，且点击后有概率触发一次全屏插屏广告（复核时命中过一次真实
+   AdMob 插屏），是不必要的 flaky 源，**没有采纳进固化脚本**。判断"这一步是不是录制时的
+   人工探索噪声"的方法：对比该行为对下游状态的影响是否可预测——`play_btn` 点击前后
+   `iv_download`/`tv_use` 计数没有任何变化（真机验证：8 个 `play_btn` + 8 个 `iv_download`，
+   点了以后仍是 8+8，只是多弹了一次插屏广告），说明它跟"文件是否已下载"这条状态完全无关。
+
+**额外挖出一个跟本次录制无关的既有脚本缺陷**：真机跑固化脚本本身发现"退出编辑器验证解锁
+持久化"这段必然失败——脚本原来按文案 `taptext "Exit"`（大小写敏感精确匹配）找退出确认弹窗
+的按钮，但真机 dump 显示按钮文案实际是全大写「EXIT」（`android:id/button2`），文案大小写
+不匹配导致点击一直落空，弹窗从未关闭，后续"回到选图页"的断言必然超时判失败——**现象是
+"这一步很慢/很卡"，根因其实是点击根本没生效，跟等待时长无关**。脚本原有注释里写的
+`resource-id=btn_undo` 也是错的（可能是更早版本的遗留信息，或者记录时看错了别的弹窗）。
+改用 `tapid android:id/button2`（标准 AlertDialog 按钮 id，不挑语言/大小写）后真机复跑通过。
+
+**通用教训**：`taptext` 默认精确匹配区分大小写，Android 按钮的 `textAllCaps` 渲染属性会让
+屏幕视觉显示和无障碍树里的实际 `text` 属性都变成全大写——写固化脚本时看着截图里的按钮文案
+抄进 `taptext` 参数容易大小写抄错（人工看惯了看不出"Exit"和"EXIT"有区别，但 `taptext` 会）；
+能用系统级 `android:id/buttonN`（AlertDialog 正负按钮的标准 id）或 App 自己的 resource-id
+时优先用 id，从源头绕开这个坑，不用记着到处传 `--nocase`。
+
+## `watch_reward_ad()` 固定跑满 15 轮，不代表广告真播了那么久（2026-08-19）
+
+`_lib_ad_unlock.sh` 的 `watch_reward_ad()`（10 个 `UNLOCK-*` 脚本共用）**内部完全不判断广告
+是否已经播完/关闭**（函数自己的注释也写明"不做任何解锁成功的判定"），设计上就是无条件把
+"初始 sleep 6 + 最多 15 轮（每轮：清醒检测 + 前3轮额外测问卷特征 + `sweep --rounds 3
+--interval 1 --patience 2` + `sleep 2`）"这套预算跑满，再返回给调用方去判定是否解锁成功。
+真机实测过一次 UNLOCK-ALBUM-01 全流程：从"看广告-加载中"截图到"看广告-结束后"截图之间
+量到 **227 秒（约 3 分 47 秒）**，占整条用例总耗时（约 425~476 秒）的一半以上。
+
+实测拆解耗时来源（网络 ADB 设备 `192.168.209.171:5555`，非 USB 直连，adb 往返本身有延迟）：
+- 单次界面干净时的 `sweep --rounds 3 --interval 1 --patience 2`：约 **8.3 秒**（`patience=2`
+  意味着连续 2 轮无命中就提前收工，但每轮都要重新 `dump`，网络 ADB 下单次 `dump` 实测
+  普遍要 3~4 秒，不是文档里泛泛估的"~2秒"那么快）。
+- 单次 `find text "Next"`（没找到）：约 **3.8 秒**（`find` 命令本身没有 `--timeout`/轮询
+  能力，单次查找已经要这么久，纯粹是 dump 开销）。
+- `dumpsys power` 清醒检测：约 0.7~0.9 秒（不经过 adbkit.py，直接 `adb shell`，最快的一步）。
+
+按这个单价推算：前 3 轮每轮≈0.9+3.8+8.3+2(收尾sleep)≈15s，后 12 轮每轮≈0.9+8.3+2≈11.2s，
+15 轮总计 3×15+12×11.2≈179s，加初始 `sleep 6`≈185s——跟真机实测的 227s 量级吻合（差异
+来自网络延迟波动）。**结论：真实广告播放/加载本身可能只需要几十秒，但函数不管广告是不是
+早就播完了，也会无条件耗光全部 15 轮预算**，这是当前实现的固有特征，不是本轮改动引入的
+新问题、也不是这次修复的范围（判定逻辑仍然依赖调用方后续 `waitfor id take_save`），但**是
+全部 10 个 `UNLOCK-*` 固化脚本回归耗时的最大单一瓶颈**，值得单独立项优化（比如让调用方
+传入一个"成功标志"参数，命中就提前 break，而不是死等满 15 轮）——评估/实施时另起任务，
+不要把这条跟某个具体 `UNLOCK-*` 用例的选择器修复混在一起改。
+
+## `watch_reward_ad()` 提前退出机制落地：10/10 真机验证 exit=0 + 早退出（2026-08-19）
+
+针对上面那条"固定跑满15轮"的瓶颈，`_lib_ad_unlock.sh::watch_reward_ad()` 加了第三个可选参数
+`success_fn`（调用方定义的 0 参数判定函数，命中就 break，不传则完全等同旧行为），10 个
+`flow_unlock_*.sh` 全部接了各自的判定函数。设计取舍见 `decisions.md` #59（callback式判定
+函数 vs 参数化OR逻辑、判定信号必须绑定真实控件而非"没看到广告UI"）、#60（adbkit logcat
+编码修复）。
+
+**最终结果：10/10 真机 exit=0**，其中 9 条日志明确显示第 2/15 轮命中早退出信号提前结束
+等待（`ALBUM-01`237s/`ALBUM-02`272s/`ALBUM-03`118s/`CONVCOUNT-01`105s/`COVER-01`171s/
+`MERGECOUNT-01`107s/`MIXCOUNT-01`90s/`RESET-01`194s/`SPEED-01`124s，其中 `SPEED-01` 连
+`output-check` 的真实2倍速时长交叉核对也通过：预期8500ms，实测8594ms）；`COVER-02` 有
+一次运行（407s）赶上一段异常长的广告联播，跑满全部15轮才关闭，但 exit=0 判定依然正确——
+早退出是"有信号就提前走，没信号就照旧兜底跑满"，不影响正确性，只是那一轮没吃到加速
+红利，属于广告内容本身的正常波动。跟之前的基线对比（`UNLOCK-ALBUM-01` 优化前单次看
+广告 227s，占用例总耗时一半以上）——早退出后，成功判定命中在第2轮（初始 sleep 6s + 1轮
+sweep ≈ 15s 左右），看广告这一段耗时数量级从"三分多钟"降到"十几秒"。
+
+验证过程中挖出并顺手修了好几个挡路的既有缺陷（都不是早退出机制本身的一部分，但不修就
+测不到早退出这一步），逐条记录，方便以后遇到类似"选择器/判定莫名其妙不对"时对照排查：
+
+**1. `tools/adbkit.py`：`adb()` 加 `errors="replace"`** —— `logcat` 输出遇非法字节直接
+`UnicodeDecodeError` 崩进程，`UNLOCK-MIXCOUNT-01` 因此在功能完全正常的情况下报"脚本异常
+退出"。详见 decisions.md #60。
+
+**2. 入口文案漂移**：`flow_unlock_cover.sh`/`flow_unlock_speed.sh` 首页入口仍写死
+`t("MP3 Cutter", mp3_cutter)`，真机早就漂移成「Audio Cutter」（`flow_unlock_album.sh`
+2026-08-19 那次修复漏了同步这两个姊妹脚本）——改用 `t("Audio Cutter", audio_cutter)`。
+
+**3. `flow_unlock_reset.sh` 大小写不匹配**：`t(SYSTEM system)` 传的原文字面量"SYSTEM"
+（全大写）不等于真机渲染的「System」（首字母大写），`t()` 不传 `LANG_CODE` 时原样返回
+原文、taptext 默认精确匹配大小写，导致这个 tab 点空——同 `flow_unlock_album.sh` 那次
+Exit/EXIT 大小写坑一个模子刻出来的，改成 `t(System system)`。
+
+**4. `flow_unlock_reset.sh` 真正的硬伤——`--index 0` 选择器在"最近使用置顶"排序下会
+选中原值本身，压根不触发锁定态（2026-08-19 用户真机指出，是本轮排查最容易误判方向的
+一个坑，记录下来引以为戒）**：`set_system_tone()` 里选系统铃声固定点
+`iv_select_status --index 0`（列表第一项）。表面上看起来稳（不用抠文件名文案），但这个
+系统铃声列表是按"最近使用"排序的——上一次成功设置成功的那首铃声会自动排到第 0 位。
+于是"固定选第0位"这个逻辑只有**从来没设过系统铃声的全新状态**下才是一次真正的改变；
+只要脚本成功跑过一次，下一次再点 `--index 0` 选中的就是"刚设置过的那首"本身，等于
+原值到原值的空操作，App 内部判定"没有变化"、自然不会重新触发锁定/弹出 Reset 按钮。
+真机连续几次运行"设置系统铃声后未见任何 Reset 按钮"，一开始误判成"看一次广告解锁 Reset
+这个权益被永久消耗、且这个权益比本地 SharedPreferences 更底层、pm clear 都清不掉"——
+这个诊断方向是**错的**：压根不是权益被消耗，就是选择器每次都在选"跟当前值一样的那个"。
+**改法**：固定改选 `--index 1`（列表第二位）——只要"最近使用"排序把上次选中的挤到第0位，
+第1位就必然是别的铃声，天然保证每次都选到一首不同于当前值的铃声，不需要读取"当前选中
+是哪个"这种没有可靠 `checked`/`selected` 属性暴露出来的状态。改完真机验证：三处
+（Ringtone/Notification/Alarm）都能正常制造出锁定态、Reset 按钮正常出现、看完广告后
+Reset 计数正确减少、exit=0、早退出第2/15轮命中，全部真实链路走通。
+**教训**：遇到"这个动作按脚本设计应该每次都触发，但真机上不触发了"，先怀疑选择器本身
+选没选出"跟当前不一样的值"，而不是先怀疑"权益被消耗"这种没法在脚本层面验证/修复的
+外部因素——后者听起来合理但没有真的去看"选中前后这个值到底变没变"，属于跳过了最基本
+的对照检查就下结论，回头看这条弯路完全可以避免。
+
+**5. `flow_unlock_cover.sh`：另一个真实存在的时序竞争——`dialog-outside-tap-fallback`
+规则会在解锁弹窗渲染较慢时把它当好评弹窗误清掉（2026-08-19，真机连续复现两次）**：
+2026-08-03 已经加过一层防御（"先探测目标解锁弹窗在不在，不在才当普通插屏去 sweep"），
+但探测只做一次（3秒），后面紧跟的是完整 3 轮 sweep（约3~6秒）——如果解锁弹窗恰好在
+3秒探测之后、sweep这几轮期间才渲染出来，照样会被点掉。sweep 本身没法区分"这是我们
+要等的弹窗"还是"随便一个可点外部关闭的弹窗"，没法从根上消除这个竞争，只能缩短每轮
+sweep 的暴露窗口——改成"探测→轻量清一轮→立刻再探测"的短促循环（每轮 sweep 只给1轮
+机会，清完立刻回来看解锁弹窗是不是已经出现了），比"先等3秒不管、再一次性扫3轮"更快
+发现目标弹窗、被误清掉的概率更低。改完连续验证通过。
+
+**6. `UNLOCK-COVER-01`/`UNLOCK-COVER-02`（Change Cover 换封面流程，两个脚本共享同一段
+选图器交互）其余几处**：
+   - 「Change Cover」按钮本身会**随机出现/不出现**（同样路径反复跑，有的截图有这枚带
+     PRO角标的tile，有的完全没有），怀疑受服务端远程配置/灰度开关控制，不是稳定的UI
+     结构变化，脚本不需要跟着改；回归再踩到"未见 Change Cover"先怀疑这个开关这次没开。
+   - 原脚本硬坐标 `tap 178 1160` 赌"相册网格第一格永远是张普通照片"，这台测试机媒体库
+     被大量测试/录屏活动污染后经常点到视频缩略图/推广卡片。改用系统相册选图器给每张
+     真实照片项都带的 `content-desc="Photo taken on ..."`（`tapdesc "Photo taken on"
+     --partial`）定位。
+   - 选图器还可能落地到两种结构完全不同的页面：(a) 老式 Google Photos 的"Pixel 4"设备
+     相册文件夹页，进去就是照片网格；(b) Android 系统 Photo Picker 的"Device folders"
+     文件夹列表页（`ExternalPickerActivity`），文件夹名称是"Camera"/"Screenshots"等
+     系统分类而非"Pixel 4"，要先点进某个文件夹才有照片网格。两条脚本都改成：先假设
+     已经在网格直接用 `tapdesc` 选，选不中再退化依次尝试点开"Camera"/"Pictures"/
+     "Screenshots"这几个常见系统相册文件夹名后重选一次。
+   - `flow_unlock_cover_playback.sh` 另外两处硬坐标（暂停按钮/更多菜单）已经点不中当前
+     播放页布局了（真机 dump 确认真实位置在 `[431,1800][578,1947]`/
+     `[851,1531][910,1590]`）——这条脚本本来就是这批里唯一违反 flow-freeze 纪律#1
+     "禁止硬坐标"的，改用真实 resource-id（`iv_play`/`iv_menu`）彻底解决，顺带把这条
+     脚本原来"看完广告后毫无判定，无条件截图打通过"的缺口也补上了真判定。
+   - 系统 MediaProvider 的写入确认框（"Allow MP3 Cutter & Ringtone Maker to modify this
+     audio file?"）原脚本完全没处理，补了 best-effort `taptext "Allow"`。
+   - 排查过程中还踩到一条 `logscan` 误报：`uiautomator dump` 自己的崩溃日志
+     （`UiAutomationService ... already registered`）被当成了 App 崩溃命中——根因是
+     `cmd_logscan` 按 PID 过滤时用的是 `logcat -d`（转储整个历史缓冲区，不限时间窗口），
+     如果这个 PID 数字在缓冲区保留期内被系统重新分配给过一个完全不相关的进程（这台
+     设备跑了大量真机测试后 PID 复用概率变高），那个不相关进程的崩溃日志也会被一起
+     翻出来。判定为跟这次改动无关的环境噪声（没有再复现），未修复 `cmd_logscan` 本身，
+     仅记录方向供以后再遇到"logscan 命中但堆栈跟被测 App 完全不相关"时排查参考。
+
+**7. `UNLOCK-SPEED-01`**：Speed 面板真机确认已经从"拖动滑块选速度"改版成"点选预设档位
+胶囊按钮"（0.5/0.75/1.0/1.25/1.5/2.0/Custom），`speed_seek_bar` 这个滑块控件已经不存在，
+原来"算 bounds 拖到最右端"整套逻辑连控件本身都找不到。改成直接 `taptext "2.0"` 点预设
+按钮（虽然这个文案节点自身 `clickable=false`，点击由父容器 GridView cell 处理，但
+taptext 只是拿节点 bounds 算坐标去点，坐标落在父容器范围内一样能触发，不需要额外找
+父容器的选择器）。解锁弹窗文案和资源 key 也一并变了：`unlock_custom_speed`（"Free to
+unlock premium function"）→ `unlock_add_speed`（"Use double-speed feature for free"）。
+
+## 录制器常驻 daemon 挂着不放会让回归脚本假失败"找不到入口"（2026-08-20）
+
+真机复现：`UNLOCK-ALBUM-01` 报"首页找不到「Audio Cutter」入口"判失败，但 `00-home.png`
+证据截图上这个按钮清清楚楚渲染在正中间。排查发现不是选择器/文案问题——`flow_unlock_album.sh`
+走的 adbkit 默认 `shell` 后端，那次 `adb shell uiautomator dump` 被系统直接 SIGKILL
+（exit=137），taptext 拿到空树，自然判"找不到"任何东西。
+
+根因：桌面壳「录制器」tab（`tools/recorder_daemon.py`）为了提速常驻占着 u2
+（uiautomator2/atx）会话，且当时前端 Recorder 页面还开着连着这台设备——`idle_poll()`
+每 3 秒巡一次屏，持续对这台设备发 dump 请求。回归脚本的 `shell` dump 和它同时抢
+UiAutomation（Android 系统同一时间只放行一个），两边打架，谁被系统判定"晚到"就被杀。
+现象是"界面明明有这个控件却怎么都点不到/找不到"，根因跟 App UI、跟文案漂移毫无关系，
+排查这类"选择器莫名其妙失效"时，先看是不是录制器还开着连着同一台设备，比先怀疑
+UI 改版更快。
+
+修复（两条互补，见 docs/decisions.md）：
+1. `recorder_daemon.py`：最后一个前端断开、5 秒宽限期内没人接上，自动
+   `dev.stop_uiautomator()` 释放 u2 会话（`_release_idle`/`_schedule_release`）——只覆盖
+   "开着但没人看"这种情况，覆盖不了"前端还连着正在看"这种（idle_poll 只在
+   `self.clients` 非空时才跳过巡屏，本身不会主动断线）。
+2. 桌面壳 Rust 侧（`commands.rs`）：`stream_child`（`run_flow`/`run_flow_repair`/
+   `judge_result` 等所有按 track_key=serial 登记的执行）起跑前无条件抢占式断开该 serial
+   正在跑的录制会话（`stop_recorder_session_internal`）；反过来 `recorder_session_start`
+   也会查 `RUN_PGIDS`，这台设备正在跑回归就直接拒绝。前端 `runStore.runningSerials()` +
+   Recorder.vue 据此把正在跑回归的设备在下拉里置灰、「开始」按钮也禁用——这条覆盖的正是
+   本次真正触发 bug 的场景（录制器开着连着，回归在同一台设备上起跑）。
+
+排查同类问题的信号：`adb shell uiautomator dump` 反复返回 Killed（exit=137，非
+"UI 树解析失败"那种正常报错）、或 logcat 里能看到 UIAutomatorStub 正在服务
+dumpWindowHierarchy 请求，说明有别的进程正占着这台设备的 UiAutomation——先查
+`ps aux | grep recorder_daemon` 是不是有别的实例挂在同一个 serial 上。

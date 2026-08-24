@@ -221,6 +221,13 @@ export const api = {
     }),
   recSessionStop: (serial: string) => invoke<void>("recorder_session_stop", { serial }),
 
+  // 查设备当前前台包名 → 反查是不是仓库里另一个已注册的 App；录制器点「开始/重新探屏」时调一次，
+  // 核对左栏选中的 App 目录跟手机上真实在跑的 App 是不是同一个，不是就由前端自动切（见 decisions.md）
+  recDetectApp: (slug: string, serial: string) =>
+    invoke<{ pkg: string | null; slug: string | null }>("recorder_cmd", {
+      appSlug: slug, sub: "detect_app", serial,
+    }),
+
   // ── 录制器 legacy：三个无状态子命令（daemon 起不来时的降级链路），步骤列表由 Recorder.vue 持有 ──
   // probe ≈ 1-3s，act ≈ 3-5s，调用方必须上 loading
   recProbe: (slug: string, serial: string, autoSweep = true) =>

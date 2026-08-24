@@ -51,6 +51,7 @@ except ImportError:
     sys.exit("[daemon] 缺 websockets 库：pip install websockets（桌面壳 Setup 页有一键安装）")
 
 IDLE_POLL_S = 3.0      # 无动作时的低频巡屏间隔（hash 不变不推送；兜设备自己弹广告/弹窗）
+IDLE_RELEASE_GRACE_S = 5.0   # 最后一个前端断开后等这么久仍无人接上，才真正释放 u2 会话（见 _delayed_release）
 DEBOUNCE_S = 0.3       # 动作注入后到首次 dump 的等待（给动画一点启动时间，同 legacy SETTLE 的角色）
 STABLE_RETRY_S = 0.4   # 动作后 dump 出来 hash 没变（动画慢）时的重试间隔
 STABLE_RETRIES = 3     # 最多重 dump 次数
@@ -62,6 +63,12 @@ SCRCPY_JAR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor", 
 SCRCPY_DEV_PATH = "/data/local/tmp/aitest-scrcpy-server.jar"  # 改名部署，防与用户自装 scrcpy 互踩
 SCRCPY_MAX_FPS = 30
 SCRCPY_BIT_RATE = 8_000_000
+# 收帧循环单次 readexactly 的超时：TCP 连接本身没断（没收到 FIN/RST）但取流卡死（无线漫游瞬断/
+# 编码器卡住）时，裸 readexactly 会永久阻塞——没有异常、没有广播，_supervise 的重启逻辑根本
+# 不会被触发，画面定住不动而控件树（走独立的 dump 通道）还在正常刷新，两条通道的健康状态就此
+# 脱钩（真机踩过：无线设备画面冻住，框照常更新）。给宽一点——画面完全静止时 scrcpy 本来就可能
+# 好几秒不发新包（没有变化就不编码，不是异常）。
+SCRCPY_FRAME_TIMEOUT_S = 8.0
 # v4.1 帧头标志位（真机 hexdump + Streamer.java 双重核对过；与 3.x 相比整体右移了一位，
 # 因为 bit63 让位给了 SESSION——升级 jar 版本必须重新核对这三个值）：
 #   流布局 = [4B codec_id] + 若干记录；每条记录先读 12B：
@@ -218,7 +225,11 @@ class ScrcpySupervisor:
             while True:
                 if self.restart_req.is_set():
                     return   # 外部要求重启（新客户端要 IDR / 前端解码出错）
-                head = await reader.readexactly(12)
+                try:
+                    head = await asyncio.wait_for(reader.readexactly(12), timeout=SCRCPY_FRAME_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    # 转成异常抛给 _supervise：走它已有的重启+backoff，而不是原地卡死
+                    raise RuntimeError(f"{SCRCPY_FRAME_TIMEOUT_S:.0f}s 没收到新的视频包，判定取流已卡死，重启 scrcpy")
                 if head[0] & 0x80:
                     # session meta：[4B flags][4B 视频宽][4B 视频高]。启动必发一条；旋转/尺寸
                     # 变化再发。视频宽高有编码器对齐（≠设备逻辑分辨率），画框基准必须用后者
@@ -231,7 +242,10 @@ class ScrcpySupervisor:
                     continue
                 pf = int.from_bytes(head[:8], "big")
                 size = int.from_bytes(head[8:12], "big")
-                payload = await reader.readexactly(size)
+                try:
+                    payload = await asyncio.wait_for(reader.readexactly(size), timeout=SCRCPY_FRAME_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(f"包头已到、payload 卡在半路 {SCRCPY_FRAME_TIMEOUT_S:.0f}s 没读完，重启 scrcpy")
                 flags = (1 if pf & PKT_FLAG_CONFIG else 0) | (2 if pf & PKT_FLAG_KEYFRAME else 0)
                 pts = pf & (PKT_FLAG_KEYFRAME - 1)   # 剥掉高位标志，前端拿到的就是纯 pts（微秒）
                 frame = bytes([0x01, flags]) + pts.to_bytes(8, "big") + payload
@@ -255,6 +269,7 @@ class Daemon:
         self.last_activity = now()
         self.ad_rules = None          # 惰性加载 config/ad_rules.json
         self.scrcpy = ScrcpySupervisor(self)
+        self.release_task = None      # 最后一个前端断开后延迟释放 u2 会话的任务，见 _schedule_release
         # 前端**解得出画面**才算视频模式成立：scrcpy 在推流 ≠ 前端画得出来（WebCodecs 不支持、
         # config packet 丢了、解码器连挂）。前端解不出会发 {t:"videoMode",on:false} 把这位清掉，
         # daemon 立刻恢复 screencap 供图——否则就是"daemon 不拍图 + 前端没画面"的双黑洞（真踩过：
@@ -509,8 +524,54 @@ class Daemon:
                                              step_ctx={"n": n, "case": case,
                                                        "before_labels": before_labels}))
 
+    async def _release_idle(self):
+        """最后一个前端断开、宽限期内没有新客户端接上时释放设备资源：停 scrcpy + 停掉 u2
+        instrumentation（`stop_uiautomator`），让设备上的 UiAutomation 位置空出来。
+
+        动机：本 daemon 为提速常驻占着一个 u2 会话（见文件头注），但 Android 系统同一时间只
+        允许一个 UiAutomation 连接——如果只是"没人看录制器了"就一直占着不放，这台设备上任何
+        其他走 `adb shell uiautomator dump`（默认 shell 后端）的东西（最典型是回归固化脚本）
+        会被系统直接 SIGKILL（真机复现：exit=137，界面明明正常渲染，脚本却拿到空树判"找不到
+        入口"）。原则是"只在真正录制时才占着"——没前端连着看，就不该继续攥着设备。
+        真正在录制（有客户端）时绝不会走到这里：调用方只在 self.clients 为空时才 schedule。"""
+        await self.scrcpy.stop()
+        dev = adbkit._U2_DEV
+        if dev is not None:
+            try:
+                await asyncio.to_thread(dev.stop_uiautomator)
+            except Exception as e:
+                print(f"[daemon] 释放 u2 会话失败（忽略，下次连接会重新 start_uiautomator）："
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            adbkit._U2_DEV = None
+        self.root = None
+        self.screen = None
+        self.backend = None
+        self.tree_hash = ""
+
+    async def _delayed_release(self):
+        """空闲宽限期：切 tab/短暂重连不该每次都付一次 stop+start_uiautomator 的往返代价，
+        真正断开几秒后仍然没人接上才释放。期间来了新客户端（见 handle 里的 cancel）直接作废。"""
+        try:
+            await asyncio.sleep(IDLE_RELEASE_GRACE_S)
+        except asyncio.CancelledError:
+            return
+        if self.clients:   # 宽限期内又有客户端连上了，不释放
+            return
+        await self._release_idle()
+
+    def _schedule_release(self):
+        if self.release_task and not self.release_task.done():
+            self.release_task.cancel()
+        self.release_task = asyncio.create_task(self._delayed_release())
+
+    def _cancel_release(self):
+        if self.release_task and not self.release_task.done():
+            self.release_task.cancel()
+        self.release_task = None
+
     async def handle(self, ws):
         """单个 WS 连接的收发循环（已鉴权）。"""
+        self._cancel_release()   # 新客户端接上：作废可能还在宽限期里的释放任务
         self.clients.add(ws)
         try:
             hello = {"t": "hello", "serial": self.serial, "app": recorder_core.APP,
@@ -587,6 +648,8 @@ class Daemon:
                                                  ensure_ascii=False))
         finally:
             self.clients.discard(ws)
+            if not self.clients:
+                self._schedule_release()
 
     async def _backfill_shots(self, case, steps):
         """export 前的截图齐全性校验：每个非 note 步骤都该有 shots/{n:02d}.png（前端 capture

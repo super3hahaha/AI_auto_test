@@ -1239,6 +1239,13 @@ fn stream_child(mut cmd: Command, on_event: Channel<String>, track_key: Option<S
         use std::os::unix::process::CommandExt;
         cmd.process_group(0); // 新建进程组、以本进程为组长 → 子孙共享该 pgid，中止时一网打尽
     }
+    // track_key 恒为 serial（见上方函数注释）：回归要抢这台设备的 UiAutomation，先把可能挂着的
+    // 录制会话断掉——不然两边同时 dump 会互相 kill 掉对方的 uiautomator 进程，制造假失败
+    // （真机复现过：录制器常驻 daemon 没退，回归脚本 `adb shell uiautomator dump` 被系统直接
+    // SIGKILL，明明首页控件都在，脚本却报"找不到入口"）。
+    if let Some(key) = &track_key {
+        stop_recorder_session_internal(key);
+    }
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1850,6 +1857,12 @@ pub async fn recorder_session_start(
     let root = root_of(&app)?;
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        // 这台设备正跑着回归（RUN_PGIDS 有登记）就拒绝起录制——前端按钮已经按这个置灰，这里是
+        // 兜底防线（比如别的入口没走按钮判断，或状态没同步过来）。回归那边启动时会反过来抢占
+        // 断开录制会话（见 stream_child），两条防线互补，不会出现"同时占用"的中间态。
+        if RUN_PGIDS.lock().unwrap().iter().any(|(k, _)| k == &serial) {
+            return Err("该设备正在跑回归，暂不能录制".to_string());
+        }
         // 复用探活：端口还接得通就直接还给前端
         {
             let mut sessions = REC_SESSIONS.lock().unwrap();
@@ -1953,13 +1966,13 @@ pub async fn recorder_session_start(
     .map_err(|e| e.to_string())?
 }
 
-/// 停掉一台设备的录制会话：SIGTERM 进程组（daemon 有 signal handler 做清理），2s 后 SIGKILL 兜底。
-#[tauri::command]
-pub fn recorder_session_stop(serial: String) -> Result<(), String> {
+/// 停一台设备的录制会话（内部共用）：从 REC_SESSIONS 摘除 + SIGTERM 进程组（daemon 有 signal
+/// handler 做清理），2s 后 SIGKILL 兜底。给 #[tauri::command] 版本和 stream_child 的抢占逻辑共用。
+fn stop_recorder_session_internal(serial: &str) {
     let pgids: Vec<i32> = {
         let mut sessions = REC_SESSIONS.lock().unwrap();
-        let out = sessions.iter().filter(|(k, _)| k == &serial).map(|(_, s)| s.pgid).collect();
-        sessions.retain(|(k, _)| k != &serial);
+        let out = sessions.iter().filter(|(k, _)| k == serial).map(|(_, s)| s.pgid).collect();
+        sessions.retain(|(k, _)| k != serial);
         out
     };
     #[cfg(unix)]
@@ -1975,6 +1988,12 @@ pub fn recorder_session_stop(serial: String) -> Result<(), String> {
             }
         });
     }
+}
+
+/// 停掉一台设备的录制会话（前端「停止录制」按钮调）。
+#[tauri::command]
+pub fn recorder_session_stop(serial: String) -> Result<(), String> {
+    stop_recorder_session_internal(&serial);
     Ok(())
 }
 
@@ -2128,6 +2147,36 @@ pub struct ClaudeCliStatus {
     pub display_name: String,
     pub org_name: String,
     pub subscription: String, // 徽章文案（大写）：TEAM / MAX / PRO / ""
+}
+
+/// 从 Finder/Launchpad 双击启动的 GUI app（launchd 拉起），PATH 是系统最小 PATH，不会
+/// 加载 ~/.zshrc 等 shell rc 文件——所以 dmg 装的 app 里 `adb`/`aapt` 全部找不到，只有从
+/// 终端跑 start.command（走 login shell）才带得上用户自己配的 PATH。这里在进程启动时把
+/// 常见安装位置一次性补进 PATH：Command::new("adb") 直接继承，起的 python 子进程再调
+/// adb/aapt 也一并受益（子进程默认继承父进程环境，见 lib.rs::run 调用点）。
+pub fn fix_gui_app_path() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut extra: Vec<String> = vec![
+        format!("{home}/Library/Android/sdk/platform-tools"),
+        format!("{home}/Library/Android/sdk/tools"),
+        format!("{home}/.local/bin"),
+        "/opt/homebrew/bin".to_string(),
+        "/opt/homebrew/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+    ];
+    for var in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Ok(sdk) = std::env::var(var) {
+            extra.push(format!("{sdk}/platform-tools"));
+        }
+    }
+    let existing = std::env::var("PATH").unwrap_or_default();
+    let mut dirs: Vec<String> = existing.split(':').map(|s| s.to_string()).collect();
+    for dir in extra {
+        if !dir.is_empty() && Path::new(&dir).is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::set_var("PATH", dirs.join(":"));
 }
 
 /// 找 claude 可执行文件：GUI app 的 PATH 常不含用户 shell 里的目录，先显式查常见安装位置，

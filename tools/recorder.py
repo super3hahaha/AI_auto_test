@@ -21,7 +21,7 @@ recorder_ui.html）已随 V2 废弃。
 """
 import argparse, base64, json, os, pathlib, re, subprocess, sys, time
 
-from _appctx import REPO, load_cfg
+from _appctx import REPO, load_cfg, slug_for_package
 # 大脑逻辑（选择器判定/diff/导出）已平移到 recorder_core，本文件只剩设备层（probe/screencap/ak）
 # 和无状态 CLI 壳。recorder_daemon（录制器 V2）共用同一份 core，两边产物必然一致。
 import recorder_core
@@ -234,6 +234,23 @@ def public(screen):
     return {k: v for k, v in (screen or {}).items() if k != "raw_png"}
 
 
+_FOCUS_PKG_RE = re.compile(r"([a-zA-Z][\w.]*)/\.?[A-Za-z][\w.$]*")  # 兼容 pkg/.RelactiveActivity 简写
+
+
+def detect_app():
+    """查设备当前前台是哪个包名（读全局 SERIAL，同 probe/act），反查是不是仓库里另一个已注册
+    的 App——供录制器点「开始/重新探屏」时核对"选的 App 目录"和"手机上真实在跑的 App"是不是
+    同一个（见 docs/decisions.md）。复用 adbkit 的 `focus` 子命令（已有 mCurrentFocus/
+    mFocusedApp/ResumedActivity 三级退化），不在这里重新实现一遍 dumpsys 解析。只报数据，
+    切不切由前端按当前 activeSlug 决定——这里读不到 CFG 之外的活跃 App 语境，也不该猜。
+    查不到/未注册的包，slug 为 None。"""
+    r = ak("focus")
+    out = (r.stdout or "") + (r.stderr or "")
+    m = _FOCUS_PKG_RE.search(out)
+    pkg = m.group(1) if m else None
+    return {"pkg": pkg, "slug": slug_for_package(pkg)}
+
+
 def main():
     """无状态 CLI：probe / act / export —— 一次一调，stdout 吐纯 JSON。
 
@@ -249,6 +266,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("probe", help="探一屏 → {png,nodes,labels,w,h}")
     s.add_argument("--json", dest="payload", default=None, help="可选 {auto_sweep:bool}，默认自动清障开")
+    sub.add_parser("detect_app", help="查设备前台包名 → {pkg,slug}，slug 是反查到的已注册 App（查不到为 None）")
     for name, helptext in (("act", "录一步 → {step,screen}"), ("export", "落 rec.json + flow 草稿")):
         s = sub.add_parser(name, help=helptext)
         s.add_argument("--json", dest="payload", required=True, help="入参 JSON（act: {kind,case,n,...}；export: {case,steps}）")
@@ -259,6 +277,8 @@ def main():
     if a.cmd == "probe":
         payload = json.loads(a.payload) if a.payload else {}
         return print(json.dumps(public(probe(payload.get("auto_sweep", True))), ensure_ascii=False))
+    if a.cmd == "detect_app":
+        return print(json.dumps(detect_app(), ensure_ascii=False))
 
     body = json.loads(a.payload)
     if a.cmd == "act":

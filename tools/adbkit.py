@@ -33,6 +33,14 @@ APP = CFG.get("app_slug") or CFG.get("app_name") or PKG.split(".")[-1]  # 证据
 DUMP_BACKEND = CFG.get("dump_backend", "shell")  # UI dump 后端：shell(默认,纯adb) / u2(uiautomator2,需装atx,整轮约快2倍)；--dump-backend 可覆盖
 _VER = None
 
+# 等待轮询期间「清障续期」的宽限：_find/cmd_shot 的等待循环里，每轮 sweep 真的点掉了广告/弹窗
+# （不是没找到东西的空转，是规则库确认命中并点击过一次），就说明"目标控件还没出现"极可能是被这个
+# 障碍挡住而不是路径本身错了——把等待预算续 SWEEP_WAIT_GRACE_S 秒，而不是让这几秒白白算进原来
+# 那个固定 timeout 里。SWEEP_WAIT_MAX_EXTENDS 封顶续期次数，防止广告连续弹出时死等不退出——
+# 封顶后仍未出现就如实报超时，不伪装成"一直在正常等待"。见 docs/decisions.md #57。
+SWEEP_WAIT_GRACE_S = 6.0
+SWEEP_WAIT_MAX_EXTENDS = 3
+
 
 def today():
     return CFG.get("date") or datetime.date.today().strftime("%Y%m%d")
@@ -116,7 +124,14 @@ def adb(*args, capture=False, stdout_file=None):
         if stdout_file:
             with open(stdout_file, "wb") as f:
                 return subprocess.run(cmd, stdout=f, stderr=subprocess.PIPE)
-        return subprocess.run(cmd, capture_output=True, text=True)
+        # errors="replace"：`adb logcat` 的原始输出不保证是合法 UTF-8（原生崩溃/第三方 SDK
+        # 偶尔写入非法字节），text=True 默认严格解码，遇到这种字节会直接抛
+        # UnicodeDecodeError 把调用方（如 cmd_logscan）整个进程炸掉——2026-08-19 真机复现：
+        # UNLOCK-MIXCOUNT-01 看完广告后 App 状态其实正常，`logscan final` 却因为 logcat
+        # 缓冲区里一段非法字节直接崩溃退出，脚本在 `LS=$(...)` 那行被 `set -e` 杀掉，
+        # 连"本轮判定"都没打印就没了，看起来像脚本本身挂了。非法字节替换成 U+FFFD 即可，
+        # logscan 只做关键字匹配，个别字符变问号不影响判定。
+        return subprocess.run(cmd, capture_output=True, text=True, errors="replace")
 
     r = _run()
     err = r.stderr
@@ -355,16 +370,22 @@ def cmd_shot(args):
     if want or gone:
         timeout = getattr(args, "assert_timeout", 0.0) or 0.0
         start = time.monotonic()
+        deadline = start + timeout
+        extends = 0
         nodes, missing = [], list(want)
         while True:
             nodes = list(_dump_tree())
             missing = [v for v in want if not _present_any(nodes, v)]
-            if not missing or timeout <= 0 or time.monotonic() - start >= timeout:
+            if not missing or timeout <= 0 or time.monotonic() >= deadline:
                 break
             # 该出现的控件还没在屏，多半是被广告/权限/隐私同意弹窗挡住（2026-07-22 真机撞过
             # CMP 同意弹窗晚出现，固定短窗 sweep 一过就不再清障，死等到 assert-timeout 才判失败，
             # 见 gotchas.md DL-TT-01）——先插一轮轻量 sweep 试着点掉，清不掉就当正常慢加载继续等。
-            _sweep_loop(2, 0.4, 1, verbose=False)
+            # 2026-08-18 起：真点掉了东西就把倒计时续 SWEEP_WAIT_GRACE_S 秒（封顶
+            # SWEEP_WAIT_MAX_EXTENDS 次），跟 _find 同一套逻辑，见 docs/decisions.md #57。
+            if _sweep_loop(2, 0.4, 1, verbose=False) and extends < SWEEP_WAIT_MAX_EXTENDS:
+                deadline += SWEEP_WAIT_GRACE_S
+                extends += 1
             time.sleep(0.5)
         fails += [f"必须出现的控件未在屏：{v!r}" for v in missing]
         fails += [f"不该出现的标志仍在屏：{v!r}" for v in gone if _present_any(nodes, v)]
@@ -763,7 +784,12 @@ def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cac
       撞过 CMP 隐私同意弹窗渲染时机不固定，早前固定短窗 sweep 一过就不再清障，弹窗晚到时
       死等到超时才判失败（DL-TT-01，见 docs/gotchas.md）。等不到目标多半就是被这类广告/权限/
       同意弹窗挡住，先试着点掉比死等更快；sweep 本身幂等、没有可点的东西时是安全 no-op，
-      不会误伤本来就该慢慢加载的正常界面。传 False 关闭（比如故意要断言"弹窗一直在"的场景）。"""
+      不会误伤本来就该慢慢加载的正常界面。传 False 关闭（比如故意要断言"弹窗一直在"的场景）。
+      2026-08-18 起：这轮 sweep 真的点掉了什么（规则库确认命中，不是空转），就把倒计时续
+      SWEEP_WAIT_GRACE_S 秒（封顶 SWEEP_WAIT_MAX_EXTENDS 次）——清障本身要花时间，原来这几秒
+      白白算在调用方传的固定 timeout 里，等于变相缩短了清障之后留给目标控件真正渲染出来的
+      时间，VOICE-CORE-01 真机踩过（见 docs/decisions.md #57）。没点掉任何东西（真的只是在
+      正常加载）不续期，不会让"路径真的错了"这类情况被掩盖成长时间空等。"""
     attr = {"id": "resource-id", "text": "text", "desc": "content-desc"}[by]
     if from_cache and not from_xml:
         cp = _cache_path(from_cache)
@@ -772,6 +798,8 @@ def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cac
         else:
             cache = cache or from_cache
     start = time.monotonic()
+    deadline = start + timeout
+    extends = 0
     while True:
         nodes = _nodes_from(from_xml) if from_xml else _dump_tree(cache_screen=cache)
         hits = _match_nodes(nodes, attr, value, partial, nocase=nocase)
@@ -779,11 +807,14 @@ def _find(by, value, index=0, partial=False, from_xml=None, from_cache=None, cac
             break
         if from_xml or timeout <= 0:
             sys.exit(f"[find] 没找到 {by}={value!r}（partial={partial}）。界面可能已变，先跑 `ui` 重新观察。")
-        if time.monotonic() - start >= timeout:
-            sys.exit(f"[find] 等待 {timeout}s 仍未出现 {by}={value!r}（超时，已尝试清障仍未出现）。"
+        if time.monotonic() >= deadline:
+            extra = f"（含清障续期{extends}次，共多等{extends * SWEEP_WAIT_GRACE_S:.0f}s）" if extends else ""
+            sys.exit(f"[find] 等待 {timeout}s{extra} 仍未出现 {by}={value!r}（超时，已尝试清障仍未出现）。"
                      "界面可能已变，需重新观察或记失败。")
         if sweep_on_wait:
-            _sweep_loop(2, 0.4, 1, verbose=False)
+            if _sweep_loop(2, 0.4, 1, verbose=False) and extends < SWEEP_WAIT_MAX_EXTENDS:
+                deadline += SWEEP_WAIT_GRACE_S
+                extends += 1
         time.sleep(interval)
     if index >= len(hits):
         sys.exit(f"[find] {by}={value!r} 只有 {len(hits)} 个匹配，index={index} 越界。")

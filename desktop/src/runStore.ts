@@ -153,6 +153,11 @@ export const runStore = reactive({
   serials(): string[] {
     return [...new Set(this.cells.map((c) => c.serial))];
   },
+  // 正在跑回归的设备（status="running" 的格子去重取 serial）——录制器开工前拿它判断
+  // 「这台设备现在能不能录制」：回归和录制会抢同一份 UI dump/uiautomator 会话，不能并存。
+  runningSerials(): string[] {
+    return [...new Set(this.cells.filter((c) => c.status === "running").map((c) => c.serial))];
+  },
   caseIds(): string[] {
     return this.caseOrder;
   },

@@ -21,12 +21,15 @@ import { ref, computed, onMounted, onActivated, watch, nextTick } from "vue";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { api, type DeviceRow, type RecScreen, type RecNode, type RecStep, type RecSel } from "../api";
 import { store } from "../store";
+import { runStore } from "../runStore";
 import { RecorderSession } from "../recorder/session";
 import { VideoPipe } from "../recorder/videoPipe";
 import type { DaemonMsg } from "../recorder/types";
 
 const devices = ref<DeviceRow[]>([]);
 const serial = ref("");
+// 正在跑回归的设备：录制和回归抢同一份 uiautomator 会话，不能并存（见 docs/gotchas.md）。
+const busySerials = computed(() => new Set(runStore.runningSerials()));
 const caseId = ref("");
 const screen = ref<RecScreen | null>(null);
 const steps = ref<RecStep[]>([]);
@@ -120,6 +123,7 @@ function armVideoWatchdog() {
 }
 function fallbackToStill(why: string) {
   clearTimeout(videoWatchdog);
+  disarmVideoFreezeWatch();
   pipe?.destroy();
   pipe = null;
   videoActive.value = false;
@@ -127,12 +131,38 @@ function fallbackToStill(why: string) {
   msg.value = `${why}，已切静态截图模式（画面刷新变慢，录制/导出不受影响）。想换回实时视频：重进本页。`;
 }
 
+// 持续性看门狗：首帧看门狗只管"从没出过画面"，videoActive 一旦变 true 就再没人盯着——流后续
+// 静默卡死时（daemon 那边 readexactly 卡死不报错的老问题已经在 recorder_daemon.py 加了超时自愈，
+// 但前端解码器自己丢同步、包在收却画不出新帧这类纯前端故障，daemon 那头压根不知道）前端会一直
+// 显示最后一帧、框却照常刷新，用户分不清"卡住"和"画面本来没变"。用定期检查代替：超过阈值没收
+// 到新帧先请求关键帧（成本低，daemon 流本身没断的话重启很快恢复）；连续两轮还没有才判定彻底
+// 断流退回静态图。阈值给宽（6s）——纯静止画面本来就可能好几秒没有新帧，不是异常。
+const VIDEO_FREEZE_MS = 6000;
+let videoFreezeTimer: ReturnType<typeof setInterval> | undefined;
+let freezeStrikes = 0;
+function armVideoFreezeWatch() {
+  clearInterval(videoFreezeTimer);
+  freezeStrikes = 0;
+  videoFreezeTimer = window.setInterval(() => {
+    if (!videoActive.value || !wsMode.value) return;
+    const idleMs = performance.now() - lastFrameAt;
+    if (idleMs < VIDEO_FREEZE_MS) { freezeStrikes = 0; return; }
+    freezeStrikes++;
+    if (freezeStrikes === 1) sess.send({ t: "requestKeyframe" });
+    else fallbackToStill(`视频流 ${Math.round(idleMs / 1000)}s 无新帧`);
+  }, VIDEO_FREEZE_MS);
+}
+function disarmVideoFreezeWatch() {
+  clearInterval(videoFreezeTimer);
+  freezeStrikes = 0;
+}
+
 function ensurePipe(): VideoPipe | null {
   if (!VideoPipe.supported() || !videoCanvas.value) return null;
   if (!pipe) {
     pipe = new VideoPipe(videoCanvas.value);
     pipe.onFrame = () => {
-      if (!videoActive.value) { videoActive.value = true; clearTimeout(videoWatchdog); }
+      if (!videoActive.value) { videoActive.value = true; clearTimeout(videoWatchdog); armVideoFreezeWatch(); }
       onVideoMotion();
     };
     pipe.onNeedKeyframe = () => sess.send({ t: "requestKeyframe" });
@@ -156,6 +186,7 @@ watch(videoCanvas, (el, old) => {
 
 function teardownVideo() {
   clearTimeout(videoWatchdog);
+  disarmVideoFreezeWatch();
   pipe?.destroy();
   pipe = null;
   videoActive.value = false;
@@ -248,7 +279,6 @@ function stopSession() {
 function stopRecording() {
   stopSession();
   stopped.value = true;
-  msg.value = "已停止录制，不再探屏（已录步骤原样保留，仍可导出；要继续请点「重新探屏」）";
 }
 
 function defaultCase() {
@@ -408,8 +438,29 @@ async function call<T>(what: string, fn: () => Promise<T>): Promise<T | null> {
   }
 }
 
+// 点「开始/重新探屏」先核对一下：手机当前前台是不是左栏选中的这个 App。查到是仓库里
+// 另一个已注册的 App 就自动切目标目录（复用切 App 的既有 watcher 收尾旧会话/重置步骤），
+// 别的情况（查不到、就是当前这个、或前台是个没注册的 App）一律不动——宁可不切也不能猜错。
+async function maybeSwitchByForegroundApp() {
+  try {
+    const r = await api.recDetectApp(store.activeSlug, serial.value);
+    if (r?.slug && r.slug !== store.activeSlug) {
+      const from = store.activeSlug || "（未选）";
+      await store.setActive(r.slug);
+      showToast(`检测到手机前台是「${r.slug}」，已自动切换目标目录（原「${from}」）`);
+    }
+  } catch {
+    /* 探前台失败不阻断录制，按原目录继续 */
+  }
+}
+
 async function probe() {
   if (!serial.value) return;
+  if (runStore.runningSerials().includes(serial.value)) {
+    err.value = "该设备正在跑回归，暂不能录制——等回归跑完再来";
+    return;
+  }
+  await maybeSwitchByForegroundApp();
   stopped.value = false; // 重新探屏 = 恢复录制
   // 首选 V2：起（或复用）常驻会话，探屏由 daemon 推送（hierarchy + shot 消息）
   if (wsMode.value || (await startSession())) {
@@ -456,6 +507,26 @@ async function act(body: Record<string, unknown>) {
     screen.value = r.screen;
     if (r.step.auto_swept) showToast(`已自动清障 ${r.step.auto_swept} 次（广告全屏页）`);
   }
+}
+
+// 悬浮面板：position:fixed 用视口坐标，不受 .stage 的 overflow:hidden 裁切。离开框后延迟
+// 200ms 才清空，给鼠标留时间移进面板里去框选文字；移进面板本身要取消这个延迟，否则选不完就被收走
+const hoverBox = ref<{ tip: string; x: number; y: number } | null>(null);
+let hoverHideTimer: number | undefined;
+function clearHoverHide() {
+  if (hoverHideTimer !== undefined) { clearTimeout(hoverHideTimer); hoverHideTimer = undefined; }
+}
+function onBoxEnter(b: { tip: string }, e: MouseEvent) {
+  clearHoverHide();
+  hoverBox.value = {
+    tip: b.tip,
+    x: Math.min(e.clientX + 14, window.innerWidth - 320),
+    y: Math.min(e.clientY + 14, window.innerHeight - 40),
+  };
+}
+function onBoxLeave() {
+  clearHoverHide();
+  hoverHideTimer = window.setTimeout(() => { hoverBox.value = null; }, 200);
 }
 
 function pick(n: RecNode) {
@@ -599,12 +670,16 @@ onMounted(async () => {
       <h2>录制器</h2>
       <select v-model="serial" @change="screen = null">
         <option value="" disabled>选设备</option>
-        <option v-for="d in devices" :key="d.serial" :value="d.serial" :disabled="d.state !== 'device'">
-          {{ devLabel(d) }}
+        <option v-for="d in devices" :key="d.serial" :value="d.serial"
+                :disabled="d.state !== 'device' || busySerials.has(d.serial)">
+          {{ devLabel(d) }}{{ busySerials.has(d.serial) ? "（回归执行中）" : "" }}
         </option>
       </select>
       <input v-model="caseId" class="mono case" placeholder="用例 ID" />
-      <button @click="probe" :disabled="!serial || !!busy">{{ screen ? "重新探屏" : "开始（探当前屏）" }}</button>
+      <button @click="probe" :disabled="!serial || !!busy || busySerials.has(serial)"
+              :title="busySerials.has(serial) ? '该设备正在跑回归，暂不能录制' : ''">
+        {{ screen ? "重新探屏" : "开始（探当前屏）" }}
+      </button>
       <label class="small auto-sweep" title="遇到已知广告 SDK 全屏页自动清掉，不用人眼看到广告再手动点「清障」">
         <input type="checkbox" v-model="autoSweep" /> 自动清障
       </label>
@@ -620,7 +695,6 @@ onMounted(async () => {
     </transition>
 
     <div v-if="err" class="err">{{ err }}</div>
-    <div v-if="msg" class="ok">{{ msg }}</div>
 
     <div v-if="!screen" class="card empty muted">
       选一台在线设备 → 点「开始」。录制器会截当前屏并叠出可点的控件框：<b>黄框</b>=有唯一选择器、<b class="c-amb">红框</b>=选择器有歧义（点前强制消歧）、<b class="c-anc">蓝框</b>=自身
@@ -672,7 +746,8 @@ onMounted(async () => {
                 class="box"
                 :class="b.cls"
                 :style="b.style"
-                :title="b.tip"
+                @mouseenter="onBoxEnter(b, $event)"
+                @mouseleave="onBoxLeave"
                 @click.stop="pick(b.n)"
               />
             </div>
@@ -686,6 +761,15 @@ onMounted(async () => {
           <div v-if="busy" class="mask">{{ busy }}</div>
         </div>
       </div>
+      <!-- 原生 title 提示鼠标选不中文字、复制不了（OS 渲染，跟 DOM 无关）——换成真实 DOM 悬浮层，
+           鼠标移进面板本身也不会消失，可以正常框选/Ctrl+C 复制里面的选择器信息 -->
+      <div
+        v-if="hoverBox"
+        class="hover-tip mono"
+        :style="{ left: hoverBox.x + 'px', top: hoverBox.y + 'px' }"
+        @mouseenter="clearHoverHide"
+        @mouseleave="hoverBox = null"
+      >{{ hoverBox.tip }}</div>
 
       <div class="right">
         <div class="card hint">
@@ -709,6 +793,8 @@ onMounted(async () => {
           </div>
           <div v-if="align" class="mono align" :class="align.ok ? 'a-ok' : 'a-bad'">{{ align.text }}</div>
         </div>
+
+        <div v-if="msg" class="ok">{{ msg }}</div>
 
         <div class="hd2">
           <b>步骤 {{ steps.length }}</b>
@@ -853,6 +939,9 @@ h2 { margin: 0; font-weight: 500; }
 .box:hover { background: rgba(37, 99, 235, 0.28); outline: 1px solid #fff; }
 .box.b-amb { outline-color: #ff5050; }
 .box.b-anc { outline-color: #5aaaff; }
+.hover-tip { position: fixed; z-index: 70; max-width: 320px; padding: 8px 10px; font-size: 12px;
+  line-height: 1.5; white-space: pre-line; background: #f0f0f0; color: #111; border: 1px solid #ccc;
+  border-radius: 6px; box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); user-select: text; cursor: text; }
 .line { position: absolute; height: 2px; background: #0f0; transform-origin: 0 50%; pointer-events: none; }
 /* stale（V2 异步刷新的空窗态）：框压淡 + 禁点 + 角标提示。不用全屏 mask——空窗只有 ~1s，
    遮全屏反而闪。视频模式画面本身是实时的（真相），只弱化"已经过时的框"。 */

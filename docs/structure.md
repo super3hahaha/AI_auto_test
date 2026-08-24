@@ -35,6 +35,8 @@ AI_auto_test/
 │       │   │                  #   下拉读它的 locale 并集（选语言时还没选设备，不知道会跑哪版）
 │       │   └── .lang.lock     # 并发建表的 flock（多设备首跑同一版本时只让一个真在建）
 │       ├── cases/            # 该 App 用例定义（YAML）；_TEMPLATE.yaml 字段模板
+│       │   └── archived/     # 归档用例：compile_cases.py 只 glob cases/*.yaml（不递归），挪进这层
+│       │                     #   即从 queue.csv/board.csv/桌面端执行台消失，但文件保留可随时挪回
 │       ├── apks/             # 留存的多版本 APK 本体（<version>.apk，gitignore）；上传时复制，执行前选版本强制重装
 │       ├── recordings/       # 录制器产物（tools/recorder.py，gitignore）：<case>/{rec.json, shots/NN.png, flow_*.draft.sh}
 │       │                     #   rec.json 是**中间物**：人点出来的选择器序列 + 每步前后屏 diff，供 AI 翻成 cases/*.yaml + flows/flow_*.sh
@@ -77,6 +79,10 @@ AI_auto_test/
 │   │                    #   帧协议/坑（scid 31位、jar 自删、session meta 裸12B、wm size 不随旋转）见文件头注。
 │   │                    #   video_on：前端解不出视频时发 {t:"videoMode",on:false} 关流回退 screencap 供图
 │   │                    #   （scrcpy 在推流 ≠ 前端画得出来，见 gotchas「探屏成功却一片黑」）
+│   │                    #   与回归执行互斥（见 decisions #61）：最后一个前端断开 5s 后自动
+│   │                    #   stop_uiautomator() 释放 u2 会话；回归起跑时 Rust 侧会抢占式断开
+│   │                    #   本 daemon（否则两边抢 UiAutomation，回归的 shell dump 会被系统
+│   │                    #   SIGKILL，见 gotchas「录制器常驻 daemon 挂着不放…」）
 │   ├── recorder.py      # 录制器 legacy CLI（V2 降级链路）：无状态 probe/act/export，daemon 起不来（缺 websockets
 │   │                    #   等）时桌面壳经 recorder_cmd 桥退回逐次调用（每步 ~5s）。浏览器版 serve 模式已随 V2 废弃
 │   ├── vendor/          # 第三方二进制 pin 版本存放（scrcpy-server-v4.1 + SHA256/升级步骤见 vendor/README.md）

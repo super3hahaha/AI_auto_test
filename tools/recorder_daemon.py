@@ -299,7 +299,7 @@ class Daemon:
         return legacy_recorder.screencap()
 
     def _inject_sync(self, kind, body, cmd, screen):
-        """执行一个动作。tap/swipe/longdrag 走快路径（坐标已在内存树上现算好）；
+        """执行一个动作。tap/longpress/swipe/longdrag 走快路径（坐标已在内存树上现算好）；
         launch/key/text/sweep 走 adbkit 既有实现 in-process（频次低，正确性优先）。
         返回给 step["out"] 的文本（可空）。"""
         if kind == "tap":
@@ -310,6 +310,15 @@ class Daemon:
             else:
                 adbkit.shell(f"input tap {x} {y}")
             return f"[tap] @ ({x},{y})"
+        if kind == "longpress":
+            x, y = self._tap_point(body, screen)
+            hold_ms = int(body.get("hold_ms") or 800)
+            d = adbkit._u2_device_soft()
+            if d is not None:
+                d.long_click(x, y, hold_ms / 1000.0)
+            else:
+                adbkit.shell(f"input swipe {x} {y} {x} {y} {hold_ms}")  # 起止同点=原地按住，见 cmd_longpress
+            return f"[longpress] @ ({x},{y}) 按住 {hold_ms}ms"
         if kind == "swipe":
             x1, y1, x2, y2 = (int(body[k]) for k in ("x1", "y1", "x2", "y2"))
             ms = int(body.get("ms") or 300)
@@ -490,7 +499,7 @@ class Daemon:
         # 选择器点击前先校验：当前树里该选择器的命中数与录制时（前端拿到的 sels.n）一致才动手。
         # 不一致 = 前端的框是 stale 的（树已变），点下去会点错——拒绝并立刻推新树。
         sel = body.get("sel")
-        if kind == "tap" and sel:
+        if kind in ("tap", "longpress") and sel:
             cur = sum(1 for nd in screen["nodes"] if nd.get(sel["by"]) == sel["v"])
             if cur != sel.get("n"):
                 await ws.send(json.dumps({"t": "error", "scope": "act",
@@ -500,12 +509,22 @@ class Daemon:
                 asyncio.create_task(self.refresh(cause="refresh", auto_sweep=auto_sweep))
                 return
         before_labels = list((self.screen or {}).get("labels") or [])
-        cmd, label, extra = do_action(kind, body, screen)
-        step = {"n": n, "kind": kind, "label": label,
-                "cmd": [str(c) for c in cmd] if cmd else None,
-                "diff": {"appeared": [], "disappeared": [], "pending": True},
-                "out": "", "auto_swept": 0, **extra}
-        step["script"] = action_lines(step)
+        try:
+            # do_action/action_lines 不碰设备，但吃前端传来的 body——形状不对（比如某个动作类型
+            # 漏了字段）会抛 KeyError/ValueError。这里必须兜住：不然异常会从 handle_act 一路
+            # 摔出 `async for raw in ws:` 循环，websockets 库判定这个协程炸了就直接把**这条连接**
+            # 关掉（daemon 进程本身没死，只是这条 WS 断了），前端表现成一句语焉不详的
+            # 「录制服务连接断开（设备掉线/进程被杀）」——实际跟设备/进程都没关系。
+            cmd, label, extra = do_action(kind, body, screen)
+            step = {"n": n, "kind": kind, "label": label,
+                    "cmd": [str(c) for c in cmd] if cmd else None,
+                    "diff": {"appeared": [], "disappeared": [], "pending": True},
+                    "out": "", "auto_swept": 0, **extra}
+            step["script"] = action_lines(step)
+        except Exception as e:
+            await ws.send(json.dumps({"t": "error", "scope": "act",
+                                      "message": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
+            return
         if cmd:   # note 不碰设备
             try:
                 step["out"] = (await asyncio.to_thread(self._inject_sync, kind, body, cmd, screen)) or ""

@@ -646,3 +646,48 @@
   这个桌面壳实例、`RUN_PGIDS` 里查不到）执行回归，抢占逻辑够不着——`recorder_daemon.py`
   自己在最后一个前端断开 5 秒后主动 `stop_uiautomator()` 补上这个盲区，两条机制覆盖的是
   互不重叠的两种场景（"回归从桌面壳发起"vs"录制器长期空占"），都留着。
+
+## 62. 录制器新增「长按」动作，复用 `input swipe`（起止同点）而不是照搬 `longdrag` 的 motionevent/u2 双通道（2026-08-25）
+
+- **需求**：录制器工具栏原有 点击/滑动/长拖(longdrag)/硬坐标 四种模式，缺一个「原地长按不移动」
+  （长按弹出菜单/长按删除确认这类场景），补了「长按」按钮 + `longpress`/`longpressid`/
+  `longpresstext`/`longpressdesc` 这套 adbkit 子命令。
+- **决定**：长按的注入直接用 `input swipe x y x y hold_ms`（起止点写成同一坐标），不用
+  `cmd_longdrag` 那套「先探测 shell `input motionevent` 是否支持，不支持则回退 uiautomator2
+  `touch.down/move/up`」的双通道兜底。
+- **为什么够用**：`longdrag` 那套复杂度是为了解决「按住途中要真的移动」——`input swipe`/
+  `draganddrop` 一次性插值的事件流下移动几乎立刻发生，够不着"先长按进入拖拽态、再开始移动"
+  的门槛，所以才需要拆成离散 DOWN→sleep→MOVE→UP 自己控制节奏。纯长按（起止同点）压根没有
+  "移动"这一步，`input swipe` 内部依然会发 DOWN→（几个坐标不变的）MOVE→UP，只要设备支持
+  `input swipe`（这条命令比 `motionevent` 子命令覆盖的 Android 版本早得多、老设备也有）
+  就天然构成一次合规的长按手势，不需要 longdrag 为兼容老设备踩的那条退路。
+- **daemon 内存态注入路径**（`recorder_daemon.py::_inject_sync`）：优先用 uiautomator2 的
+  `d.long_click(x, y, duration)`（`duration` 是秒），拿不到 u2 才退回同样的
+  `input swipe` 起止同点技巧——跟 legacy CLI（`tools/recorder.py`）、导出脚本回放
+  （`adbkit.py` 的 `longpress*` 子命令）三条路径最终注入手势一致，只是快路径省了一次
+  子进程/dump。
+- **recorder_core.do_action 的 kind 分组**：`tap`/`longpress` 合并处理（sel/anc/坐标锚三档
+  定位逻辑与 `tap` 完全一致，只是命令名换成 `longpress`/`longpressid` 等、动词换成"长按"），
+  没有像 `swipe`/`longdrag` 那样为长按单独抽一套逻辑——因为长按的定位诉求跟点击一模一样
+  （单点，不是起止两点），复制一遍 tap 的三档判断没有意义。
+
+## 63. 所有固化脚本的 `$AK text` 调用统一加 `--assert-typed`（2026-09-02）
+
+- **问题**：#50 的 `_ensure_ascii_ime()` 只挂在 `cmd_reset`（`pm clear`）里，靠"各 flow 脚本清一色以
+  `$AK reset` 开头"这个假设来覆盖全部固化脚本——但后来大量"回归脚本"按 flow-freeze 纪律 #6 改用
+  `force-stop` 重进（不清数据，省首次授权链路），不再走 `reset`，这批脚本的 `$AK text` 调用就失去了
+  自动切键盘这一层保护，只能"赌"设备上一次 `reset` 时切的键盘还生效。自检发现全仓库只有
+  `flow_voice_core.sh` 自己手动 `ime set ...AdbKeyboard || true` 兜底，`flow_merge_adv.sh`/
+  `flow_merge_crossfade.sh` 只挂了 `--assert-typed`，其余十几个 `force-stop` 类脚本（`flow_cut_edge01/02`、
+  `flow_cut_edge_wav40000`、`flow_cut_param`、`flow_cut_param_delete`、`flow_split_ui01` 等）的
+  `$AK text` 调用两种保护都没有——一旦设备重启/IME 被手工测试改过，会静默产出乱码而不报错。
+- **决定**：不逐个脚本判断"这次是不是需要兜底"，直接统一给全仓库所有 `$AK text` 调用加
+  `--assert-typed`（`tools/adbkit.py:cmd_text`，打完字校验原文本是否原样出现在当前 UI 树上，
+  不一致就 `sys.exit` 报出根因，见该函数 docstring）。没有反向修改 `_ensure_ascii_ime()` 的挂载点
+  （不做成"`text` 命令自己顺手切键盘"）——保留 `docs/decisions.md#50` 记录的原因：切键盘涉及
+  `uiautomator2` 连接/推包，不适合放进每次打字调用的热路径，`reset` 里"顺手做一次"仍是切键盘本身
+  最便宜的时机，`--assert-typed` 只负责兜底探测、不负责修复。
+- **代价**：`--assert-typed` 不能防止乱码发生，只能让乱码从"下游断言莫名其妙失败/产物名对不上"
+  变成"当场在打字这一步精确报错"，定位成本从可能几十行日志之外收窄到出错那一行。仍然建议新写
+  `force-stop` 类固化脚本时参考 `flow_voice_core.sh:103` 顺手加一行 `ime set` 主动兜底，`--assert-typed`
+  是保底，不是替代。

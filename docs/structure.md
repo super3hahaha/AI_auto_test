@@ -97,6 +97,7 @@ AI_auto_test/
 │   │                    #   表路径三级取：$TABLE（显式）> $LANG_TABLE（run_flow.py 预热塞的）> 现场 ensure。
 │   │                    #   解析结果缓存落**文件**不能用 shell 变量——t() 总在 $() 子 shell 里跑，见 gotchas
 │   ├── flow_media.sh    # 固化脚本 source 用的产物交叉核对：ms_query_data(按名查 MediaStore _data) + ffprobe_check(pull 回宿主机用 ffprobe 读真实时长，跟 duration 字段对，绕开字段失真)。原来在 flow_split_core01/02 各抄一份、两份同一个 --where 转义 bug，2026-07-29 抽出统一维护
+│   ├── audio_envelope.py # 按时间窗口算产物 RMS 能量(dB)，补 output-check 测不出的"边界处是否真的发生了淡出/淡入渐变"这层（duration-only 断言分不清硬切vs渐变）；整曲一次性解码成PCM(避免反复`-ss`现场seek的解码器瞬态噪声)，打印`FIELD:<name>=<dB>`供flow脚本复用`field_of()`解析，只算数不下判定，见 flow_merge_crossfade.sh 用法与 MERGE-CROSSFADE-01 头注
 │   ├── init_target.py   # 探测包名/版本/主Activity/db_name/debuggable → 写 target.json；--atx-init 装/验 u2 后端
 │   ├── preflight.py     # 开跑前只读自检：设备在线/App装没装/素材是否推到设备/当前看板（零副作用，见上一轮问答）
 │   ├── compile_cases.py # cases/*.yaml → ledger/queue.csv（幂等，保留运行时状态）

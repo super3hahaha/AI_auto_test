@@ -142,7 +142,7 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 
 把原来"在长列表里 `taptext` 精确点选"改成"点搜索图标 → 输入文件名 → 点结果"后，真机探路踩了三个坑：
 
-- **系统默认输入法必须是不带联想的英文键盘**：`adbkit text` 命令本身没问题（`shlex.quote` 正确转义），但如果设备当前 IME 是拼音等联想输入法，`adb shell input text "mp3-sample-track.mp3"` 送进去的原始按键会被 IME 拦截联想改写，实测变成"门票－3sample－track。门票3"这种乱码，搜索自然找不到结果。表现上像是"文本被截断/损坏"，实际是 IME 层面的问题，不是 adbkit 或 shell 转义的 bug。**排查时先确认 `adb shell settings get secure default_input_method` 和当前 IME 语言（`dumpsys input_method | grep imeSubtypeListItem`）是不是英文。** **2026-08-04 已根治**：`cmd_reset` 现在每次都会顺手把默认 IME 切到 `com.github.uiautomator/.AdbKeyboard`（uiautomator2 自带的哑键盘，没有联想引擎，缺包自动推装），走 flow 脚本（都以 `$AK reset` 开头）不会再撞上这个坑；见 `tools/adbkit.py` 的 `_ensure_ascii_ime()`。手工探路/裸调 `adbkit text` 时没经过 `reset` 仍可能撞上，遇到乱码先 `adb shell ime set com.github.uiautomator/.AdbKeyboard` 再试。
+- **系统默认输入法必须是不带联想的英文键盘**：`adbkit text` 命令本身没问题（`shlex.quote` 正确转义），但如果设备当前 IME 是拼音等联想输入法，`adb shell input text "mp3-sample-track.mp3"` 送进去的原始按键会被 IME 拦截联想改写，实测变成"门票－3sample－track。门票3"这种乱码，搜索自然找不到结果。表现上像是"文本被截断/损坏"，实际是 IME 层面的问题，不是 adbkit 或 shell 转义的 bug。**排查时先确认 `adb shell settings get secure default_input_method` 和当前 IME 语言（`dumpsys input_method | grep imeSubtypeListItem`）是不是英文。** **2026-08-04 已根治**：`cmd_reset` 现在每次都会顺手把默认 IME 切到 `com.github.uiautomator/.AdbKeyboard`（uiautomator2 自带的哑键盘，没有联想引擎，缺包自动推装），走 flow 脚本（都以 `$AK reset` 开头）不会再撞上这个坑；见 `tools/adbkit.py` 的 `_ensure_ascii_ime()`。手工探路/裸调 `adbkit text` 时没经过 `reset` 仍可能撞上，遇到乱码先 `adb shell ime set com.github.uiautomator/.AdbKeyboard` 再试。**2026-09-02 补漏**：`force-stop` 类回归脚本（flow-freeze 纪律 #6，不清数据、不走 `reset`）原来完全没这层保护，自检发现十几个脚本裸调 `$AK text` 既不切键盘也不校验；已统一给全仓库所有 `$AK text` 调用加 `--assert-typed`（见 `docs/decisions.md#63`）——打完字发现原文本没原样出现在 UI 树上就当场报错，不会再静默乱码，但不会主动修复，新脚本仍建议参考 `flow_voice_core.sh:103` 顺手加一行 `ime set` 主动切键盘。
 - **搜索结果列表里 `taptext` 精确匹配文件名会命中 2 个节点**：第 0 个是搜索框自身（EditText 回显了刚输入的文本，`text` 属性跟输入内容完全相等），第 1 个才是真正的列表项。~~必须显式传 `--index 1`~~。**⚠️ 2026-07-20 已弃用「文本+--index 1」这套定位，改按列表项 id `tapid tv_name`**——见下方补记：结果行异步渲染 + u2 dump 偶发半份树时匹配数会从 2 掉到 1，`--index 1` 越界挂脚本。搜索框 id=`search_edit_text`、结果行标题 id=`tv_name`，按后者点与搜索框回显彻底解耦。
 - **素材必须在进入「选择音频」页面之前就推送并触发媒体扫描完成**：这个页面进入时把音频列表一次性加载到内存，之后才 `adb push` + 广播扫描的文件，即使 `content query` 已经能查到 MediaStore 记录，页面内搜索仍然"没有结果"——因为它搜的是打开时的快照，不是实时查 MediaStore。退出页面（连按两次返回，第一次退搜索框、第二次退整个 App 到桌面）重新进，让它重新加载列表，新文件才会出现。两个固化脚本都是先 push+扫描、再 launch，顺序本来就对；只是探路/调试时如果先进了页面再补推文件，会被这个坑绊一下，别误判成"文件没推成功"。
 
@@ -181,6 +181,7 @@ Wear / Widget / Partner 双端 / 跨端云同步 / 厂商保活（小米华为�
 
 - 原生 `window.confirm()` 在 Tauri v2 的 webview 里不会真的阻塞弹出系统对话框，很多情况下静默直接返回——用户没看到确认框，点删除就直接执行了；**更隐蔽的反向坑（2026-08-04 实测）：静默返回值也可能是假，导致 `if (!confirm(...)) return` 直接短路，点删除看起来毫无反应，接口压根没被调用**，表现成"这一条设备死活删不掉，别的都正常"（偏随机，不是这一行设备本身有什么特殊）。必须换成 `@tauri-apps/plugin-dialog` 的 `confirm()`/`message()`（项目已装该插件，`api.ts` 里 open/save 已在用），见 `desktop/src/views/Runner.vue` 的 `removeApp`。**`Devices.vue` 的 `removeDevice` 已在 2026-08-04 同步改用 `plugin-dialog`，这条坑不再复现**——以后新增任何"删除/确认"交互，起手直接用 `plugin-dialog`，别再用原生 `confirm`/`alert`。
 - **`window.prompt()` 更彻底：根本没有替代品（2026-08-18 实测）**。录制器的「输入文本」「备注」按钮原来用 `prompt()`，在 Tauri 窗口里点了**什么都不弹**、静默返回 `null`，表现成"这按钮是坏的"。`plugin-dialog` 只有 `confirm`/`ask`/`message`/`open`/`save`，**没有任何文本输入对话框**——要收一行文本只能自己做页内弹层（见 `desktop/src/views/Recorder.vue` 的 `askText()`：`ask` 状态 + Promise + `nextTick` 聚焦 + 回车确认/Esc 取消）。
+- **录制器里有两种"备注"，语义不同，别混（2026-08-25）**：`hd2` 区那个「备注」按钮（`note()`）是**另起一条独立伪步骤**（`kind:"note"`，单独占一张卡片，不挂在任何动作上）；每张步骤卡片右上角的「备注」按钮（`noteStep()`）是**给这个已有步骤本身加 `note` 字段**（`RecStep.note`），导出时在该步动作代码**前**插一行 `# 备注：...`（`recorder_core.py gen_flow()`）。`export()` 落 `rec.json` 时是 `{k:v for k,v in s.items() if k!="out"}` 全字段直通，所以前端新加字段不用改 Python 落盘逻辑，只有 `gen_flow`/`action_lines` 这类要把字段渲染成脚本文本的地方才需要跟着加。
 - 「删除 App」不做硬删除：`apps/<slug>/` 整个 rename 进 `apps/.trash/<slug>__<时间戳>/`，防手滑误删用例/固化脚本/账本却没法找回；`.trash` 前缀 `.` 让 `list_apps` 天然跳过，不会冒出来当成一个 App，也加进了 `.gitignore`。
 
 ## UI dump 两后端可切；shell/u2 的树可能不同 + 千万别在同进程内交错 dump（2026-07-20）
@@ -2103,3 +2104,211 @@ UI 改版更快。
 "UI 树解析失败"那种正常报错）、或 logcat 里能看到 UIAutomatorStub 正在服务
 dumpWindowHierarchy 请求，说明有别的进程正占着这台设备的 UiAutomation——先查
 `ps aux | grep recorder_daemon` 是不是有别的实例挂在同一个 serial 上。
+
+## 设备 46281FDAS008AV 上 App 内显示语言在某次录制前后从中文变成了英文（2026-08-25）
+
+固化 `MERGE-ADV-01`（源自录制 REC-0825-1623）时发现：合并模块已固化的
+`flow_merge_core.sh`/`flow_merge_fmt.sh` 都是按"App 内显示中文"固化的（成功文案
+`t(音频已保存)` 默认 `SRC_LANG=zh-rCN`），但这次在同一台设备（46281FDAS008AV）上真机
+复核 `MERGE-ADV-01` 时，整个 App（首页入口文案、选择音频列表、合并编辑页、设置弹窗、
+结果页）全部显示英文（"Audio Merger"/"Select Audio"/"Audio Saved" 等），跟录制
+REC-0825-1623 里看到的完全一致——说明不是这次复核操作失误，是设备当前真实状态就是英文。
+
+推测是这台设备的 App 内语言设置（区别于系统语言，见 flow-freeze 技能"多语言"章节）在
+2026-08-25 当天被切换过（可能是某次探路/录制会话手动改的），且这类设置是持久化的
+（SharedPreferences），不会随 App 重启/`force-stop` 重进恢复，只有再手动切回中文才会变回去。
+
+**影响**：如果在切回中文之前，在这台设备上跑 `flow_merge_core.sh`/`flow_merge_fmt.sh`
+等假设中文的已固化脚本，`t()` 在没传 `LANG_CODE` 时会原样返回中文原文（如"音频合并"），
+但设备实际显示英文，选择器/`waitfor` 文案断言会全部落空，表现跟"UI 真的挂了"一模一样，
+容易误判成 App 缺陷或脚本本身坏了。
+
+**排查信号**：一条已固化脚本长期稳定通过，突然在同一台设备上从入口页开始就全部
+"等不到预期文案"（不是某个中间步骤，而是第一步 `--assert-text` 就落空），且截图看
+UI 渲染正常、只是文案变成了别的语言——先怀疑设备的 App 内语言设置是不是被换了，去
+App 自己的语言设置页确认，而不是先怀疑选择器或 App 版本改了 UI。
+
+**MERGE-ADV-01 的应对**：按当下真机实际显示的英文原文固化（未接入 `t()`/`SRC_LANG=en`），
+见 `apps/MP3Cutter/flows/flow_merge_adv.sh` 头注。后续若要在这台设备上继续跑中文相关的
+已固化脚本，需先手动把 App 内语言切回中文；长期看，多个已固化脚本混用中/英文两种假设、
+靠"设备当前状态"隐式决定谁能跑通，是脆弱的，值得后续统一改成显式的 `SRC_LANG=en`+`t()`
+包装（同 `UNLOCK-*` 那批的做法），不依赖设备当前语言状态"恰好"和脚本假设一致。
+
+## 合并「Crossfade」和「Overlap」是互斥单选项，行为本质不同；duration-only 断言测不出渐变（2026-08-25）
+
+固化 `MERGE-ADV-01`（Overlap）和 `MERGE-CROSSFADE-01`（Crossfade）时发现：iv_setting 打开的
+设置弹窗里 `cb_crossfade`/`cb_overlap` 真机 dump 确认是**同一个单选组里的两个互斥
+`RadioButton`**（不是"Overlap 是 Crossfade 的一种实现"），共用同一条 `progress_bar` 滑块。
+两者行为本质不同，容易被表面相似的 UI（都在同一个弹窗、都用同一条滑块）误导成"是同一个
+东西的两种叫法"：
+
+- **Overlap**：会把交叠时长从总时长里扣掉（如 5s Overlap，两段各自时长之和减 5s）——
+  真机复核：`00:38.4裁剪片段 + 60s原始mp3` 之和 98.4s，设 50%(=5s)Overlap 后产物实测
+  93440ms（≈98400-5000-仅差小数点后取整误差），见 `flow_merge_adv.sh`。
+- **Crossfade**：不压缩总时长，产物≈两段时长直接相加——同样两个 60s+38.4s 的文件，设
+  50%(=5s)Crossfade 后产物实测 98456ms（≈98440，没有减 5s），见 `flow_merge_crossfade.sh`。
+  5s 参数的语义是"结尾 2.5s 淡出 + 开头 2.5s 淡入"（各占一半），发生在两段的**各自时间轴
+  内部**（不像 Overlap 那样把两段音频真的在时间上叠到一起播放）。
+
+**duration-only 的 output-check 测不出"是否真的发生了音频层面的渐变混合"**——时长对，
+完全可能是纯粹的硬切（甚至完全不生效的空转设置项），产物时长跟真做了渐变时一模一样，人工
+听感/看波形图才能分辨,这也是黑盒（无 debug/DB 访问）测试的天然盲区。排查/验证这类"设置项
+到底有没有真的生效"的思路（已落地为 `tools/audio_envelope.py` + `MERGE-CROSSFADE-01`）：
+
+1. 别直接假设边界位置——**先按功能语义推导真实边界位置**（Overlap 边界=file1时长-交叠时长；
+   Crossfade 边界=file1时长，因为不压缩时长），位置猜错了在错误区间怎么分析都测不出信号。
+   本次踩过这个坑：一开始套用 Overlap 的算法惯性去猜 Crossfade 的边界位置（以为也会压缩
+   时长，边界算在 t≈38s），结果扫到的是完全无关的"素材自身安静段"，浪费了几轮分析。
+2. **别用 `ffmpeg -ss <t> -t <dur>` 反复现场 seek 去测短窗口**——压缩格式（mp3/aac）在任意
+   `-ss` 位置起播都有解码器启动瞬态（decoder priming），窗口越短、抖动干扰占比越大，测出的
+   数字会比真实值更抖。改成**整曲一次性解码成 PCM**（`ffmpeg -ac 1 -ar 8000 -acodec
+   pcm_s16le`），再用 Python `wave`+`audioop` 在同一份解码结果上切窗口算 RMS，同一份数据
+   只解码一次，窗口之间互不干扰。
+3. **别直接跟源素材的绝对能量比**——App 合并时可能做音量归一化（这次真机测出跟源文件直接
+   比能量有 ~9.5dB 出入，怀疑是归一化导致，不是渐变的证据），改成**在产物内部自己比**：
+   稳态参考窗口 vs 疑似渐变窗口，以及渐变窗口内部前半 vs 后半（看趋势方向），只用产物自己
+   的数据，不受"App是否做了归一化"这个变量干扰。
+4. **窗口用平均能量、别只看瞬时峰值**——用小子块（如 0.1s）算线性功率再整体平均转 dB，比
+   直接对一大段做单次 RMS 更能抗住真实音乐内容本身的动态起伏（鼓点/静音段）。
+5. 拿到真实数据前先想清楚会不会被素材自身特征污染——本次在验证 Overlap 时，边界附近测到的
+   一段深度静音，一开始怀疑是缺陷，回查源文件 `mp3-sample-track.mp3` 自己开头几秒本来就是
+   忽大忽小、多处接近静音（人声/音乐类素材常见），才确认是素材天然特征，不是合并/交叠导致——
+   排查"这段安静/异常是不是素材自己就这样"应该先于"是不是 App 处理坏了"。
+
+`MERGE-CROSSFADE-01` 用真实素材验证过这套方法可行（四项方向性关系全部命中，见 case
+notes），但**目前只在这一份固定素材、这一个 Crossfade 强度上验证过一次，没有做过"完全不设
+渐变"的负对照组**——如果以后大面积误判，先怀疑阈值/素材特征，别先怀疑 Crossfade 功能坏了。
+
+## 2026-08-26：`mapfile`/`readarray` 在这台 Mac 上 "command not found"——macOS 系统 `/bin/bash` 是 3.2，没有这两个内置命令
+
+固化 `flow_ring_set_system.sh`（把「选择」列表 System tab 里一串 `tv_name` 文案读成数组）时
+随手写了 `mapfile -t NAME_LIST < <(...)`，真机跑 `run_flow.py` 直接报
+`line N: mapfile: command not found`——**不是 dump 抓空了，是这条内置命令本身在这台机器的
+bash 里根本不存在**：`mapfile`/`readarray` 是 bash 4.0（2009）才加入的内置命令，而 macOS
+自带的 `/bin/bash` 因为 Apple 不愿意跟随 GPLv3 停在了 3.2.57（2007）（同一版本号也是
+`docs/gotchas.md` 另一条"UTF-8 locale 多字节坑"的根因），`run_flow.py` 起 flow 脚本用的
+就是这个系统 `bash`，不会自动切到 Homebrew 装的新版 bash（除非 flow 脚本自己在 shebang 里
+显式写死新 bash 的绝对路径，目前没有脚本这么做）。**报错不是"崩溃"级别的信号**——命令
+未找到本身不会触发 `set -e` 退出（只是那一行返回非0，若不在 `if`/`&&` 里且脚本恰好没在这
+一行退出，会静默把目标数组留空），后续凡是遍历这个数组的判定逻辑全部空转过去，容易被误判
+成"这一步真的没读到候选"而不是"脚本语法在这台机器上就没跑起来"。
+
+**改法**：数组从命令输出构建一律用 `while IFS= read -r line; do arr+=("$line"); done < <(...)`
+这种 bash 3 就支持的写法，不用 `mapfile`/`readarray`。**排查现有脚本是否中招**：
+`grep -rn 'mapfile\|readarray' apps/*/flows/*.sh`，命中的都要改成 while-read 写法。
+
+## 2026-08-31：报告"测试版本"字段被拼成几十个设备重复堆砌——聚合函数吃了逐条执行明细却没按设备去重
+
+`doc_report.py` 的 `versions_label()` 生成报告头部"测试版本："这一行，调用方（`build_report`）
+传给它的 `pairs` 是 `exec_rows`（executions.csv 逐条执行明细，**一条用例 × 一台设备 = 一行**），
+不是去重后的设备列表。函数内部按版本号分组时把 `serial` 直接 `.append()` 进列表，本轮跑了
+十几条用例、3台真机，于是同一台设备的 serial 在同一个版本分组里被塞了十几次——最终
+`devices_label()` 拼接时把同一台设备的标签原样重复十几遍，报告里"测试版本"这一行就变成一大坨
+"三星note9…moto g5…SM_A057F…"循环堆砌的乱码文本（截图见对话记录）。**这不是显示层截断/换行
+问题，是聚合逻辑本身没去重**——凡是从 `exec_rows`（逐条执行明细，粒度是"用例×设备"）往上聚合
+"这轮跑了哪些设备/版本"这类只该出现一次的清单时，都要显式按 serial 去重，不能假设调用方会传
+已经去重过的列表。
+
+**改法**：`versions_label()` 内部 `by_version.setdefault(v, [])` 拿到列表后，`append` 前先判断
+`serial not in sers` 再加。同类聚合函数（`run_devices` 已经这么处理了）新增/改动时也要检查一下
+去重条件在不在。另外报告里偶尔出现的 `unknown` 版本不是这个 bug——是 `run_flow.py` 探测某次
+执行时 `probe_installed_version` 真的探测失败后的 fallback 值，是另一个信号（设备探测不稳定），
+别跟这条拼接 bug 混着排查。
+
+## `outside-panel` 兜底规则算不出安全落点时的低估根因：dump 只拿到弹窗自己那个悬浮窗（2026-08-31，`adbkit.py _match_outside_panel`）
+
+**现象**：`RING-SET-01`/`VOICE-CORE-01` 在个别真机上（moto g5、三星系列都复现过）卡在首页断言，
+`evidence.csv`/`run-log` 里看不到任何"清障"记录——不是规则没识别到弹窗（弹窗截图清清楚楚在屏，
+如变声器首页被"评星"好评弹窗全屏挡住），是 `config/ad_rules.json` 的 `dialog-outside-tap-fallback`
+（scope=任意页面，专门给好评弹窗这类 `setCanceledOnTouchOutside` 对话框写的通用规则）**确认了
+弹窗存在、却主动选择不点**。
+
+**根因**：`_match_outside_panel()` 靠 `parentPanel`/`customPanel` 的包围盒 + 遍历整棵树里所有节点的
+最大 bounds 来估算"屏幕多高"（`H`），再要求面板上方或下方留够 ≥150px 安全间距才敢点，凑不够就
+主动放弃、不乱点——这个安全阀本身没问题（历史上救过好几次误点弹窗内部按钮）。但当次 `uiautomator
+dump` 只返回了对话框自己这个悬浮窗的节点（bounds 到 `[x,1642]` 就没了，没有底下 App 主窗口的
+背景节点），`H` 只能按这个悬浮窗自身的包围盒估算，必然偏小——面板几乎顶到了估算出来的"屏幕
+底部"，上下都不够 150px，被误判成"弹窗占满全屏，找不到安全空白处"，实际设备真实屏幕（1080×1920
+量级）在面板下方明明还有大把空间。
+
+**修**：`_match_outside_panel()` 改成返回 `(point_or_None, panel_present)` 两个值——`panel_present`
+单独告诉调用方"面板本身有没有在树里"，跟"算不算得出安全点"解耦。`_sweep_one_round()` 在
+`outside-panel` 分支里：算出安全点就照常点；算不出但 `panel_present=True`（面板确认在场，只是
+坐标算法保守放弃）就退化成按返回键（`input keyevent 4`）——面板已经确认存在，对一个可取消对话框
+按返回是良定义动作，不算盲按；面板压根不在场（`panel_present=False`）才维持原来的"什么都不做"。
+**为什么不干脆把 `keyevent-back` 直接挂到 `scope=任意页面`**：现有 `keyevent-back` 规则类型是
+不看树、无条件按返回，靠 `scope` 限定在确认安全的场景（如 `AdActivity`）才允许开火——sweep 在
+一条 flow 里几乎每步之间都会被调用，若把无条件返回挂到"任意页面"，命中的不只是弹窗场景，会在
+正常页面上把流程带偏，风险比"弹窗关不掉"更大。这次改法只在"确认面板节点存在"这个前提下才按
+返回，安全边界跟原规则的初衷一致，没有放宽到无条件。
+**教训**：任何靠"遍历当前 dump 到的节点算屏幕尺寸"的启发式，都要考虑 dump 可能只返回了某个
+悬浮窗/子树而非全屏背景这种情况——算出来的尺寸只是"当前树可见范围"的下界，不是真实屏幕尺寸，
+偏小时不能直接当成"没有空间"，需要有更保守动作之外的兜底路径（这里是退化成返回键），不能让
+真正存在的弹窗因为一次几何计算偏差就永远清不掉。
+
+## 剪辑器选区手柄刚进页面时可能读到瞬时默认值，还没收敛到最终默认选区（2026-09-01，`CUT-PARAM-02` 探路）
+
+**现象**：`flac-sample-track.flac`（60s 无损源）固化 `CUT-PARAM-02` 时，进编辑器（含
+`guide_mask_view`/`play_btn` 兜底之后）立刻读 `start_time_text`/`end_time_text`/
+`progress_time_text`，读到 `00:05.3`/`00:24.2`/`00:18.9`；几秒后（做了几次其它探索性操作、
+等价于多等了 1-2s）再读同一批字段，变成 `00:10.8`/`00:49.2`/`00:38.4`——跟同一批 mp3 源文件
+（`mp3-sample-track.mp3`）验证过的默认选区比例完全一致（10.8/60=18%、49.2/60=82%，呼应
+`CUT-CORE-02` 头注"默认选区比例固定 18%-82%、与文件内容无关"的结论）。中间没有任何用户操作，
+纯粹是"再等一下，值自己变了"。
+
+**根因（推测，未挖到 App 内部实现）**：编辑器的默认选区是基于波形/内容做过"高亮"分析后给出的，
+不是打开页面就立即算好的固定值；`start_time_text` 等字段在分析完成前会先渲染一个瞬时/中间值。
+`flac` 无损解码生成波形比 `mp3` 更慢，更容易在"刚进编辑器就读字段"这个时间点撞上分析还没收敛完
+的窗口——这批用例此前全在 mp3 源上验证过，从没复现过这个坑，换到 flac 源才第一次暴露。
+
+**影响面**：任何在进编辑器后**立刻**读 `start_time_text`/`end_time_text`/`progress_time_text`
+现算预期值的固化脚本都可能撞上，不限于 `CUT-PARAM-*`——`flow_cut_save.sh`/`flow_cut_core02.sh`/
+`flow_cut_fmt.sh` 等历史脚本能一直跑通，大概率是因为它们进编辑器后还有 `guide_mask_view` 循环
+（最多 5 次，每次一次 dump+判断）+ `play_btn` 兜底点击这两步天然吃掉了 1-2s，恰好躲过了这个
+窗口，不代表这个坑不存在，只是没在 mp3 源上被真机撞见过。
+
+**修**：`flow_cut_param_delete.sh` 在 `guide_mask_view`/`play_btn` 之后再显式 `sleep 1.5`，
+留够收敛时间才读字段（见脚本头注）。**这不是这一个脚本的专属修法**——任何新固化的、进编辑器后
+要现读选区字段的脚本，都建议照抄这个 `sleep 1.5`（或至少留意这个坑），尤其是源文件是 flac/wav
+等编码更慢的格式时；如果哪天某个脚本出现"预期时长和实际产物对不上、但产物本身用另一套工具核对
+是对的"这种诡异失败，先怀疑是不是撞上这个时序坑（读值读早了），不用立刻怀疑控件选择器变了或者
+App 功能本身有问题。
+
+## `awk` 把 `audio_envelope.py` 的 `NaN` 输出参与比较判成"满足阈值"，把真实缺陷误判成通过（2026-09-02，`CUT-PARAM-02` 用户复核揪出）
+
+**背景**：`tools/audio_envelope.py` 某个时间窗口算不出 RMS 值时（窗口落在实际解码音频时长
+之外，或该段是纯数字静音）会打印字符串 `FIELD:<name>=NaN`（工具头注写明"找不到/静音窗口打
+NaN"），供调用方自行判断——工具本身不下结论。所有消费它输出做阈值判定的固化脚本
+（`flow_cut_param.sh`/`flow_cut_param_delete.sh`/`flow_merge_crossfade.sh`）统一用这个模式：
+
+```bash
+if ! awk -v a="$FO_FRONT" -v b="$FO_BACK" 'BEGIN{exit !(a-b>=1.0)}'; then
+  log "严重异常：..."; ENV_OK=0
+fi
+```
+
+**现象**：`CUT-PARAM-02` 真机复核出 `淡出(前-87.1/后NaN)dB` 这种明显异常结果（-87.1dB 已接近
+数字静音，NaN 更是完全没算出来），脚本却打出"波形包络校验通过"、`exit 0`。用户看到这行断言
+直接问"这个怎么会是通过啊"，一追查才发现是判定逻辑本身的 bug，不是产物真的没问题。
+
+**根因**：`awk -v a="-87.1" -v b="NaN" 'BEGIN{print (a-b>=1.0)}'` 在这台 macOS 自带的 awk 上
+打印 `1`（真）——`a-b` 算出来是 `nan`，但 `nan>=1.0` 这个比较没有按 IEEE754 语义返回假，反而
+返回真。也就是说，**任何一侧只要是 `NaN`，这批固化脚本里所有形如 `x-y>=阈值` 的比较全部会
+误判成"满足阈值"**，把"这段根本没测出来"直接当成"确认合格"，是比"漏报"更隐蔽的一种误判——
+连日志里的原始数字（`NaN`）都摆在那儿，只是判定逻辑没接住。
+
+**没停在"只是个 awk 兼容性坑"**：顺手用 `ffmpeg -af silencedetect` 交叉核对了那份产物，
+确认 `NaN`/`-87.1dB` 不是量窗算错位置，产物末尾 3.83s（对应计算出的淡出跨度 3.85s）**真的是
+完整数字静音**，即 Fade Out 在 `2.3.6A` 版本上把整个淡出区间导出成了硬静音而不是响度渐变——
+是一个真实的、可复现的 App 缺陷（已登记 `BUG-CUT-PARAM-02-3`），不是测试脚本或环境的假象。
+这次"揪出误判"的收益不只是修好了判定逻辑本身，还额外抓到了一个原本会被这个 bug 永久掩盖的
+真缺陷。
+
+**修**：三个脚本的振幅包络判定块，在跑任何 `awk` 数值比较之前，先显式遍历该次分析用到的全部
+字段，逐个判等 `[ "$_v" = "NaN" ]`——命中就直接 `ENV_OK=0` 并打印诊断，**跳过**后续所有 `awk`
+比较（NaN 参与的比较已经不可信，没必要再跑）。**教训**：任何"某个测量点可能算不出值、用哨兵
+字符串表示"的场景，消费端在把这个值丢进数值比较之前，必须显式判断哨兵值本身，不能假设
+比较运算符会对哨兵值"自然地"给出符合直觉的假值——不同语言/不同 awk 实现对 NaN 的比较语义
+可能不遵守 IEEE754，写"防御性检查"时不能只测过一种实现就当通用结论。以后新脚本只要消费
+`tools/audio_envelope.py`（或任何会打 `NaN` 类哨兵值的工具）的输出做数值比较，都要照抄这个
+"先扫 NaN 再比较"的模式。

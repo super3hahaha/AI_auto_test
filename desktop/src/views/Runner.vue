@@ -133,6 +133,12 @@ const brainMode = ref(false); // 脚本自愈：失败自动交 claude 诊断+�
 // target.json 读回当前值；执行前若与勾选状态不一致，写回 target.json 再跑（adbkit 按
 // target.json 的 dump_backend 选后端，不是运行时参数）。
 const dumpU2 = ref(false);
+// 失败不登记：本轮所有格子的 issueSkip 预设为真，收尾登记问题清单阶段（issue_register）直接跳过，
+// 且 publish() 连带跳过同步表格/刷新Doc——探索性/调试跑（比如还在改固化脚本时反复试跑）失败往往
+// 是脚本没写好，不是真 App 缺陷，不想占用 issues.csv，也不想拿中间状态去刷新给别人看的线上产物。
+// 本轮只落本地执行记录，线上表格/Doc 维持上一轮已发布的样子。执行台里逐格仍是原来那套 issueSkip
+// 机制，收尾登记跑到某一格之前都能反悔（反悔不影响本轮是否同步/刷Doc——那个只看这里的勾选状态）。
+const noRegister = ref(false);
 async function loadDumpBackend() {
   if (!store.activeSlug) { dumpU2.value = false; return; }
   try {
@@ -201,22 +207,25 @@ function selectRange() {
   pickedCases.value = Array.from(set);
 }
 
-// 用例条目悬停提示：steps/expected 编号列出，供快速预览用例内容而不必打开 yaml。
+// 悬停提示浮层：用例条目=steps/expected 编号列出（预览用例内容而不必打开 yaml）；看板选项=纯文字说明
+// （原来直接铺在 checkbox 后面，挤占面板；收进「?」按钮悬停展示）。两种内容共用同一套浮层/定位逻辑。
 // 用自绘浮层而非原生 title（原生 tooltip 是系统灰底，跟应用配色不搭）；悬停满 2 秒才弹出，避免扫视列表时框到处闪。
 const HOVER_DELAY = 2000;
 const HIDE_GRACE = 150; // 离开条目到落到浮层上之间留的缓冲，否则鼠标一移到浮层上就先被 mouseleave 关掉了
-const hoverTip = ref<{ x: number; y: number; f: FlowRow } | null>(null);
+type TipContent = { steps: string[]; expected: string[] } | { text: string };
+const hoverTip = ref<{ x: number; y: number; content: TipContent } | null>(null);
 let hoverTimer: ReturnType<typeof setTimeout> | undefined;
 let hideTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingPos = { x: 0, y: 0 };
-function showTip(e: MouseEvent, f: FlowRow) {
+function showTip(e: MouseEvent, content: TipContent) {
   clearTimeout(hideTimer);
-  if (!f.steps.length && !f.expected.length) return;
+  const empty = "text" in content ? !content.text : !content.steps.length && !content.expected.length;
+  if (empty) return;
   clearTimeout(hoverTimer);
   pendingPos = { x: e.clientX, y: e.clientY };
   hoverTimer = setTimeout(() => {
     // 弹出后位置定住不再跟手，方便把鼠标移进浮层里滚动
-    hoverTip.value = { x: pendingPos.x, y: pendingPos.y, f };
+    hoverTip.value = { x: pendingPos.x, y: pendingPos.y, content };
   }, HOVER_DELAY);
 }
 function moveTip(e: MouseEvent) {
@@ -232,8 +241,13 @@ function cancelHide() {
 const tipStyle = computed(() => {
   if (!hoverTip.value) return {};
   const pad = 18;
-  const maxW = 620;
-  const maxH = 520;
+  // 防越界要按浮层实际最大尺寸算，不能不管内容种类都套用用例浮层(620×520)那个大盒子的尺寸算——
+  // 「?」按钮的纯文字浮层框小得多，套用大盒子的尺寸去clamp，越界判断会在按钮靠近窗口角落时
+  // 早早触发，把浮层甩到离鼠标一两百像素远的地方（实测：脚本自愈按钮贴在看板卡片右下角时，
+  // 浮层被算法搬到了屏幕中间）。
+  const compact = "text" in hoverTip.value.content;
+  const maxW = compact ? 320 : 620;
+  const maxH = compact ? 200 : 520;
   let left = hoverTip.value.x + pad;
   let top = hoverTip.value.y + pad;
   if (left + maxW > window.innerWidth) left = Math.max(8, hoverTip.value.x - maxW - pad);
@@ -327,6 +341,7 @@ async function launch(newBoard: boolean) {
       package: apkPath && pkg ? pkg : undefined,
       langCode: langCode.value || undefined,
       followDevice: ver === FOLLOW_DEVICE,
+      noRegister: noRegister.value,
     })
     .then(() => loadFlows()); // 跑完刷新用例列表拿最新 last_result
 }
@@ -632,7 +647,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
               v-for="f in frozen"
               :key="f.case_id"
               class="case-item"
-              @mouseenter="showTip($event, f)"
+              @mouseenter="showTip($event, { steps: f.steps, expected: f.expected })"
               @mousemove="moveTip"
               @mouseleave="hideTip"
             >
@@ -668,7 +683,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
               v-for="f in nonFrozen"
               :key="f.case_id"
               class="case-item locked"
-              @mouseenter="showTip($event, f)"
+              @mouseenter="showTip($event, { steps: f.steps, expected: f.expected })"
               @mousemove="moveTip"
               @mouseleave="hideTip"
             >
@@ -683,17 +698,33 @@ onActivated(() => { if (!runStore.running) loadAll(); });
         </div>
       </div>
 
-      <!-- 用例悬停浮层：steps/expected 编号列表，定位在弹出那一刻的鼠标位置附近 -->
-      <div v-if="hoverTip" class="case-tip" :style="tipStyle" @mouseenter="cancelHide" @mouseleave="hideTip">
-        <div v-if="hoverTip.f.steps.length" class="tip-sec">
-          <div class="tip-hd">步骤</div>
-          <ol><li v-for="(s, i) in hoverTip.f.steps" :key="i">{{ s }}</li></ol>
+      <!-- 悬停浮层：用例条目=steps/expected 编号列表；看板选项「?」按钮=纯文字说明。定位在弹出那一刻的鼠标位置附近。
+           Teleport 到 body：保证不受任何祖先容器的 overflow/flex 布局影响（更稳健，虽然实测跑偏的真因
+           是 tipStyle() 防越界 clamp 用的盒子尺寸不对，见下方注释）。 -->
+      <Teleport to="body">
+        <div
+          v-if="hoverTip"
+          class="case-tip"
+          :class="'text' in hoverTip.content ? 'tip-compact' : 'tip-wide'"
+          :style="tipStyle"
+          @mouseenter="cancelHide"
+          @mouseleave="hideTip"
+        >
+          <template v-if="'text' in hoverTip.content">
+            <p class="tip-text">{{ hoverTip.content.text }}</p>
+          </template>
+          <template v-else>
+            <div v-if="hoverTip.content.steps.length" class="tip-sec">
+              <div class="tip-hd">步骤</div>
+              <ol><li v-for="(s, i) in hoverTip.content.steps" :key="i">{{ s }}</li></ol>
+            </div>
+            <div v-if="hoverTip.content.expected.length" class="tip-sec">
+              <div class="tip-hd">预期</div>
+              <ol><li v-for="(s, i) in hoverTip.content.expected" :key="i">{{ s }}</li></ol>
+            </div>
+          </template>
         </div>
-        <div v-if="hoverTip.f.expected.length" class="tip-sec">
-          <div class="tip-hd">预期</div>
-          <ol><li v-for="(s, i) in hoverTip.f.expected" :key="i">{{ s }}</li></ol>
-        </div>
-      </div>
+      </Teleport>
 
       <!-- ── 右：设备 + 看板 + 执行 ── -->
       <div class="col dev-col">
@@ -722,24 +753,41 @@ onActivated(() => { if (!runStore.running) loadAll(); });
           </div>
           <label class="brain-opt" :class="{ on: brainMode }">
             <input type="checkbox" v-model="brainMode" />
-            <span class="brain-txt">
-              脚本自愈
-              <span class="muted brain-sub">失败时 Claude 接管：诊断→只改导航/健壮性→重跑（至多 3 次）。判为 App 缺陷则停。</span>
-            </span>
+            <span class="brain-txt">脚本自愈</span>
+            <button
+              type="button" class="help-btn" @click.stop.prevent
+              @mouseenter="showTip($event, { text: '失败时 Claude 接管：诊断→只改导航/健壮性→重跑（至多 3 次）。判为 App 缺陷则停。' })"
+              @mousemove="moveTip" @mouseleave="hideTip"
+            >?</button>
           </label>
           <label class="brain-opt" :class="{ on: dumpU2 }">
             <input type="checkbox" v-model="dumpU2" />
-            <span class="brain-txt">
-              UI dump 用 u2 加速
-              <span class="muted brain-sub">uiautomator2 单次 dump 更快，整轮实测约省一半时间；但需设备预装并保活 atx-agent，跟 Appium 互斥。写入 target.json 的 dump_backend。</span>
-            </span>
+            <span class="brain-txt">UI dump 用 u2 加速</span>
+            <button
+              type="button" class="help-btn" @click.stop.prevent
+              @mouseenter="showTip($event, { text: 'uiautomator2 单次 dump 更快，整轮实测约省一半时间；但需设备预装并保活 atx-agent，跟 Appium 互斥。写入 target.json 的 dump_backend。' })"
+              @mousemove="moveTip" @mouseleave="hideTip"
+            >?</button>
+          </label>
+          <label class="brain-opt" :class="{ on: noRegister }">
+            <input type="checkbox" v-model="noRegister" />
+            <span class="brain-txt">失败不登记</span>
+            <button
+              type="button" class="help-btn" @click.stop.prevent
+              @mouseenter="showTip($event, { text: '本轮失败/需复核格不写入问题清单（issues.csv），收尾也不同步表格/不刷新Doc，只存本地执行记录——线上表格/Doc 维持上一轮的样子。适合调试固化脚本时的反复试跑；执行台里仍可逐格反悔登记（不影响是否同步/刷Doc）。' })"
+              @mousemove="moveTip" @mouseleave="hideTip"
+            >?</button>
           </label>
           <button
             class="primary run-btn"
             :disabled="runStore.running || runStore.publishing"
             @click="runSelected"
           >
-            {{ runStore.running ? "执行中…" : runStore.publishing ? "收尾中…（登记/同步/刷新Doc）" : "▶ 执行选中" }}
+            {{
+              runStore.running ? "执行中…"
+              : runStore.publishing ? (runStore.noRegister ? "收尾中…（仅存执行记录）" : "收尾中…（登记/同步/刷新Doc）")
+              : "▶ 执行选中"
+            }}
           </button>
         </div>
       </div>
@@ -926,12 +974,17 @@ h2 { margin: 0; font-weight: 500; }
 
 .case-tip {
   position: fixed; z-index: 50; pointer-events: auto;
-  width: 620px; max-width: 90vw; max-height: 520px; overflow: auto;
+  max-width: 90vw; overflow: auto;
   background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 10px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
   padding: 12px 14px; font-size: 12px; line-height: 1.6; color: var(--text-primary);
 }
+/* 尺寸必须跟 tipStyle() 里 clamp 计算用的 maxW/maxH 对应，否则防越界算出来的位置和浮层实际
+   占用的空间不一致，靠近窗口角落时会把浮层甩得离鼠标很远（看板选项「?」按钮踩过这个坑）。 */
+.case-tip.tip-wide { width: 620px; max-height: 520px; }
+.case-tip.tip-compact { width: max-content; max-width: min(320px, 90vw); max-height: 200px; }
 .tip-sec + .tip-sec { margin-top: 10px; }
+.tip-text { margin: 0; white-space: pre-wrap; }
 .tip-hd { font-size: 11px; font-weight: 600; color: var(--text-accent); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
 .case-tip ol { margin: 0; padding-left: 18px; }
 .case-tip li { margin-bottom: 4px; }
@@ -943,11 +996,16 @@ h2 { margin: 0; font-weight: 500; }
 .board-opts { display: flex; flex-direction: column; gap: 8px; padding: 12px; }
 .radio { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
 .warn { color: var(--text-danger); font-size: 11px; }
-.brain-opt { display: flex; align-items: flex-start; gap: 8px; margin: 2px 12px 10px; padding: 8px 10px; border: 0.5px solid var(--border); border-radius: var(--radius); cursor: pointer; }
+.brain-opt { display: flex; align-items: center; gap: 8px; margin: 2px 12px 10px; padding: 8px 10px; border: 0.5px solid var(--border); border-radius: var(--radius); cursor: pointer; }
 .brain-opt.on { background: var(--bg-accent); border-color: var(--text-accent); }
-.brain-opt input { margin-top: 2px; }
-.brain-txt { font-size: 13px; line-height: 1.4; }
-.brain-sub { display: block; font-size: 11px; margin-top: 3px; }
+.brain-txt { font-size: 13px; line-height: 1.4; flex: 1; }
+.help-btn {
+  flex-shrink: 0; width: 16px; height: 16px; border-radius: 50%; padding: 0;
+  border: 0.5px solid var(--border); background: transparent; color: var(--text-secondary);
+  font-size: 11px; line-height: 1; cursor: pointer; /* 按钮本身已显示「?」，cursor:help 会在光标旁再叠一个系统「?」图标，冗余 */
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.help-btn:hover { border-color: var(--text-accent); color: var(--text-accent); }
 .run-btn { margin: 0 12px 12px; }
 
 .pill.sm, .sm { font-size: 11px; }

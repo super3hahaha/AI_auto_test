@@ -128,7 +128,7 @@ $AK waitfor id search_edit_text --timeout 6 >/dev/null
 # 系统默认输入法必须是不带联想的英文键盘——实测拼音等联想输入法会把 input text 送入的字符串整段
 # 替换成联想词（"mp3-sample-track.mp3" 变成"门票－3sample－track。门票3"这种），导致搜索失败；
 # 这不是 adbkit text 命令的 bug，是设备当前 IME 拦截改写了原始按键，见 gotchas.md。
-$AK text "$SRC_NAME" >/dev/null
+$AK text "$SRC_NAME" --assert-typed >/dev/null
 # 点选搜索结果：**按列表项自身的 id tv_name 点，不再用「文本+--index 1」**。
 # 早先靠「搜索框 EditText 回显(id=search_edit_text) + 列表项(id=tv_name)」这两个节点 text 都等于文件名、
 # 恒为 2 个匹配、取 index 1 定位列表项——但这个前提不稳：搜索结果行是异步渲染的，dump 若赶在结果行
@@ -220,7 +220,7 @@ if $AK waitfor text "$(t 音频已保存)" --timeout 15 >/dev/null 2>&1; then
   $AK tapid iv_rename --timeout 5 >/dev/null
   $AK waitfor id file_name --timeout 5 >/dev/null
   $AK key 67 >/dev/null   # KEYCODE_DEL 单次退格，删除整段选中的原文件名
-  $AK text "$NEWNAME" >/dev/null
+  $AK text "$NEWNAME" --assert-typed >/dev/null
   $AK tapid button1 --timeout 5 >/dev/null   # 对话框内「重命名」确认键（系统 AlertDialog 正向按钮，非 App 自定义 id）
   if $AK waitfor text "$NEWNAME.mp3" --timeout 8 >/dev/null 2>&1; then
     $AK --case "$CASE" shot 06-renamed "结果页文件名已重命名为 $NEWNAME.mp3" >/dev/null

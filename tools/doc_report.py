@@ -165,12 +165,16 @@ def version_from_link(link):
 
 def versions_label(pairs):
     """[(serial, link)] → 版本展示文案。全设备同版本只显示一次；不同版本按设备分别标注，
-    避免把"各台可能装的版本不一样"这件事含糊成一个数字。"""
+    避免把"各台可能装的版本不一样"这件事含糊成一个数字。
+    调用方传入的是 executions.csv 逐条执行明细（一条用例×一台设备=一行），同一台设备会
+    在多条用例里重复出现，这里必须按设备去重，否则同一台设备的标签会被拼接十几次。"""
     by_version = {}
     for serial, link in pairs:
         v = version_from_link(link)
         if v:
-            by_version.setdefault(v, []).append(serial)
+            sers = by_version.setdefault(v, [])
+            if serial not in sers:
+                sers.append(serial)
     if not by_version:
         return ""
     if len(by_version) == 1:
@@ -203,6 +207,32 @@ def devices_label(serials):
     """多台设备拼成一行人读的标签："oppo a31 (Android 12)、pixel7 (Android 13)"。"""
     labels = [device_label(s) for s in serials if s]
     return "、".join(labels) if labels else "-"
+
+
+def devices_by_os_desc(serials):
+    """按 Android 系统版本从高到低排（查不到版本的设备排最后，原有相对顺序不变）。"""
+    def key(s):
+        v = device_os_version(s)
+        try:
+            return (0, -float(v))
+        except ValueError:
+            return (1, 0.0)
+    return sorted(serials, key=key)
+
+
+def device_stats(serial, exec_rows):
+    """单台设备本轮的 (用例数, 通过, 失败, 待复核, 通过率文案)——按 executions.csv 里这台设备的
+    逐条「执行结果」统计，口径与总表一致：通过率 = 通过 / 已完成（已完成=执行结果非空的行，
+    未判定的不进分母）。同一条用例在多台设备各跑一次就各计一次，不去重——这正是多设备并行
+    要看的"这台设备自己的通过率"，不是"全局去重后的用例数"。"""
+    mine = [r for r in exec_rows if (r.get("serial") or "") == serial]
+    total = len(mine)
+    pass_n = sum(1 for r in mine if r.get("执行结果") == "通过")
+    fail_n = sum(1 for r in mine if r.get("执行结果") == "失败")
+    review_n = sum(1 for r in mine if r.get("执行结果") == "需复核")
+    done = sum(1 for r in mine if (r.get("执行结果") or "").strip())
+    rate = f"{pass_n / done * 100:.0f}%" if done else "—"
+    return total, pass_n, fail_n, review_n, rate
 
 
 def failed_cases_without_issue(queue, issues, exec_rows):
@@ -894,6 +924,23 @@ def build_report(live, drive, folder_id, want_images):
     b = DocBuilder()
     b.newline()
     live.flush(b)
+    # 分设备通过率：多设备并行时各台情况可能不一样，总表那一行盖不住"哪台设备拖了后腿"，
+    # 单起一张按 Android 版本从高到低排的表（应用户要求），不占用新的一级标题、不打乱后面
+    # 三/四/五节编号。
+    if len(run_serials) > 1:
+        b = DocBuilder()
+        b.para([("分设备通过率：", {"bold": True, "color": DARK})])
+        live.flush(b)
+        dev_order = devices_by_os_desc(run_serials)
+        dev_rows = [[device_label(s), *device_stats(s, exec_rows)] for s in dev_order]
+        live.table(
+            headers=["设备", "用例数", "通过", "失败", "待复核", "通过率"],
+            rows=dev_rows,
+            cell_color_fn=lambda ri, ci, text: [DARK, DARK, GREEN, RED, BLUE, BLUE][ci],
+        )
+        b = DocBuilder()
+        b.newline()
+        live.flush(b)
 
     # ---- 三、失败用例列表（表格）----
     b = DocBuilder()

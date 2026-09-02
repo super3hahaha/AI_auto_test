@@ -722,8 +722,15 @@ def _match_outside_panel(nodes, panel_ids):
     策略：按 panel_ids（如 parentPanel/customPanel）找到弹窗内容区的合并包围盒，优先取
     面板下方的空白居中点（实测：面板正上方紧贴边界~60px 处点击不会关闭——大概率还在
     Dialog Window 的阴影/触摸容差范围内算"内部"；下方留足 ≥150px 间距实测能关闭，见
-    docs/gotchas.md）；下方空间不够才退而取上方（同样要求 ≥150px 间距）。都不够
-    （说明弹窗本身占满全屏）返回 None，不乱点。"""
+    docs/gotchas.md）；下方空间不够才退而取上方（同样要求 ≥150px 间距）。
+    返回 (point_or_None, panel_present)：panel_present=False 时 nodes 里压根没找到
+    panel_ids，调用方不该做任何兜底动作；panel_present=True 但 point=None，说明面板
+    确实在屏、只是算不出安全空白点（常见于 dump 只拿到弹窗自己这个悬浮窗、够不到背后
+    App 主窗口节点，H 只能按面板自身包围盒估算、必然偏小——2026-08-31 真机实测
+    RING/VOICE 系列踩过：面板 bounds 到 [x,1642]，可用来估算 H 的节点全在这个悬浮窗
+    内，H 顶多算到 1642，上下都不够 150px 安全间距，误判"占满全屏"其实屏幕更高）。
+    调用方对 panel_present=True 的 None 可以安全地退化成按返回键——面板已确认存在，
+    对一个可取消对话框按返回是良定义动作，不是盲按。"""
     boxes = []
     for n in nodes:
         rid = n.get("resource-id") or ""
@@ -732,7 +739,7 @@ def _match_outside_panel(nodes, panel_ids):
             if m:
                 boxes.append(tuple(map(int, m.groups())))
     if not boxes:
-        return None
+        return None, False
     px1 = min(b[0] for b in boxes); py1 = min(b[1] for b in boxes)
     px2 = max(b[2] for b in boxes); py2 = max(b[3] for b in boxes)
     W = max(px2, max((int(m.group(3)) for n in nodes if (m := _BOUNDS.search(n.get("bounds") or ""))), default=px2))
@@ -740,10 +747,10 @@ def _match_outside_panel(nodes, panel_ids):
     cx = (px1 + px2) // 2
     GAP = 150  # 离面板边界的最小间距；实测 60px 太近点不掉，见上方 docstring
     if H - py2 >= GAP + 40:  # 优先面板下方（实测能可靠关闭）
-        return cx, min(H - 40, py2 + GAP)
+        return (cx, min(H - 40, py2 + GAP)), True
     if py1 >= GAP + 120:  # 下方不够才退而取上方（避开状态栏 ~80px）
-        return cx, max(120, py1 - GAP)
-    return None  # 面板几乎占满全屏，找不到安全空白处，别乱点
+        return (cx, max(120, py1 - GAP)), True
+    return None, True  # 面板确认在屏，但算不出安全空白点（常见于 H 被低估），交给调用方兜底
 
 
 def _match_nodes(nodes, attr, value, partial, nocase=False):
@@ -1017,15 +1024,20 @@ def build_nodes(root, skip_pkgs=()):
     }
 
 
-def _tap_selector(by, args):
+def _tap_selector(by, args, hold_ms=None):
+    """hold_ms 为空=普通点击；给了值=长按不移动（起止点写成同一坐标的 swipe，见 cmd_longpress）。"""
     hits, (center, v, b) = _find(by, args.value, index=args.index, partial=args.partial,
                                  from_xml=args.from_xml, from_cache=args.from_cache,
                                  timeout=args.timeout, interval=args.interval,
                                  nocase=getattr(args, "nocase", False))
     if len(hits) > 1:
         print(f"[warn] {by}={args.value!r} 有 {len(hits)} 个匹配，点第 {args.index} 个 ({v})", file=sys.stderr)
-    shell(f"input tap {center[0]} {center[1]}")
-    print(f"[tap] {by}={v} @ {center}（bounds={b}）")
+    if hold_ms:
+        shell(f"input swipe {center[0]} {center[1]} {center[0]} {center[1]} {hold_ms}")
+        print(f"[longpress] {by}={v} @ {center} 按住 {hold_ms}ms（bounds={b}）")
+    else:
+        shell(f"input tap {center[0]} {center[1]}")
+        print(f"[tap] {by}={v} @ {center}（bounds={b}）")
 
 
 def cmd_waitfor(args):
@@ -1123,12 +1135,20 @@ def _sweep_one_round(nodes, focus, rules, only=None, dry_run=False):
                 # 点弹窗外空白处关闭（setCanceledOnTouchOutside 类弹窗，如好评弹窗）。
                 # sel["of"] 给弹窗内容区的 id 列表（如 parentPanel/customPanel），
                 # 面板不在树里（弹窗还没渲染/已关）就不命中，不乱点。
-                c = _match_outside_panel(nodes, sel.get("of", []))
-                if c:
-                    cx, cy = c
+                pt, present = _match_outside_panel(nodes, sel.get("of", []))
+                if pt:
+                    cx, cy = pt
                     if not dry_run:
                         shell(f"input tap {cx} {cy}")
                     return (rule.get("id"), by, f"@({cx},{cy})", cx, cy)
+                if present:
+                    # 面板确认在屏，只是算不出安全空白点（常见于 dump 只拿到弹窗自己这个
+                    # 悬浮窗、够不到背后 App 主窗口节点，导致可用高度被低估、误判"占满全屏"，
+                    # 2026-08-31 真机实测见 _match_outside_panel 文档）。面板已确认存在，
+                    # 对可取消对话框按返回是良定义动作，退化成返回键，不算盲按。
+                    if not dry_run:
+                        shell("input keyevent 4")
+                    return (rule.get("id"), by, "KEYCODE_BACK(outside-panel兜底)", -1, -1)
                 continue
             hits = _match_nodes(nodes, _ATTR[by], sel["value"], sel.get("partial", False))
             if hits:
@@ -1196,6 +1216,18 @@ def cmd_tapdesc(args):
     _tap_selector("desc", args)
 
 
+def cmd_longpressid(args):
+    _tap_selector("id", args, hold_ms=args.hold_ms)
+
+
+def cmd_longpresstext(args):
+    _tap_selector("text", args, hold_ms=args.hold_ms)
+
+
+def cmd_longpressdesc(args):
+    _tap_selector("desc", args, hold_ms=args.hold_ms)
+
+
 def cmd_text(args):
     """`input text` 打字受设备当前输入法状态摆布：联想式 IME（拼音等）会把原始按键拦截改写成乱码
     （见 docs/gotchas.md 2026-07-21）。这个状态没法在打字前用 adb 可靠探测——2026-07-27 真机实测过：
@@ -1223,6 +1255,14 @@ def cmd_key(args):
 
 def cmd_swipe(args):
     print(shell(f"input swipe {args.x1} {args.y1} {args.x2} {args.y2} {args.ms}").stdout)
+
+
+def cmd_longpress(args):
+    """长按不移动：原地按住 hold_ms 后松手（弹出上下文菜单/长按删除确认这类只需要按住、不用
+    拖动的场景）。复用 `input swipe`（起止点写成同一坐标）而不是照搬 longdrag 的
+    motionevent/u2 双通道——那套是为了在按住途中真的移动，这里压根不移动，`input swipe`
+    从很老的 Android 版本起就有，不需要 longdrag 为兼容老设备找的那条退路。"""
+    print(shell(f"input swipe {args.x} {args.y} {args.x} {args.y} {args.hold_ms}").stdout)
 
 
 def _u2_device_soft():
@@ -1718,6 +1758,24 @@ def build_parser():
                        help="按 screen_id 查 .dumpcache；命中则免 dump，未命中则活 dump 并顺手写入该缓存槽")
         s.add_argument("--timeout", type=float, default=0.0, help="找不到时轮询等待秒数(默认0=单次)")
         s.add_argument("--interval", type=float, default=0.5, help="轮询间隔秒(默认0.5)")
+        s.set_defaults(fn=fn)
+    s = sub.add_parser("longpress"); s.add_argument("x"); s.add_argument("y")
+    s.add_argument("--hold-ms", type=int, default=800, dest="hold_ms", help="按住多久再松手，毫秒(默认800)")
+    s.set_defaults(fn=cmd_longpress)
+    # 按选择器长按：同 tapid/taptext/tapdesc 那套定位参数，外加按住时长
+    for name, fn in (("longpressid", cmd_longpressid), ("longpresstext", cmd_longpresstext),
+                     ("longpressdesc", cmd_longpressdesc)):
+        s = sub.add_parser(name)
+        s.add_argument("value")
+        s.add_argument("--index", type=int, default=0, help="多个匹配时点第几个(默认0)")
+        s.add_argument("--partial", action="store_true", help="子串匹配而非精确")
+        s.add_argument("--nocase", action="store_true", help="大小写不敏感匹配")
+        s.add_argument("--from", dest="from_xml", default=None, help="从已有 UI dump(xml) 定位，省去重新 dump")
+        s.add_argument("--from-cache", dest="from_cache", default=None,
+                       help="按 screen_id 查 .dumpcache；命中则免 dump，未命中则活 dump 并顺手写入该缓存槽")
+        s.add_argument("--timeout", type=float, default=0.0, help="找不到时轮询等待秒数(默认0=单次)")
+        s.add_argument("--interval", type=float, default=0.5, help="轮询间隔秒(默认0.5)")
+        s.add_argument("--hold-ms", type=int, default=800, dest="hold_ms", help="按住多久再松手，毫秒(默认800)")
         s.set_defaults(fn=fn)
     s = sub.add_parser("find")
     s.add_argument("by", choices=["id", "text", "desc"])

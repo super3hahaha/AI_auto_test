@@ -33,7 +33,7 @@ const busySerials = computed(() => new Set(runStore.runningSerials()));
 const caseId = ref("");
 const screen = ref<RecScreen | null>(null);
 const steps = ref<RecStep[]>([]);
-const mode = ref<"tap" | "swipe" | "longdrag" | "xy">("tap");
+const mode = ref<"tap" | "longpress" | "swipe" | "longdrag" | "xy">("tap");
 const busy = ref("");
 const err = ref("");
 const msg = ref("");
@@ -48,6 +48,7 @@ function showToast(t: string) {
 }
 const ambig = ref<RecNode | null>(null);
 const ambigPick = ref(0);
+const ambigKind = ref<"tap" | "longpress">("tap"); // 消歧弹层确认时要用触发它那一刻的 mode，不能事后固定成 tap
 const shot = ref<HTMLImageElement | null>(null);
 const stage = ref<HTMLElement | null>(null);
 const nat = ref<[number, number] | null>(null); // 截图真实像素，框定位的基准
@@ -414,6 +415,7 @@ const tally = computed(() => {
 
 const HINTS: Record<string, string> = {
   tap: "点屏幕上的框直接下发点击，记的是选择器不是坐标。红框=该选择器在全树不唯一，点了会先让你消歧。",
+  longpress: "长按模式：点屏幕上的框原地按住再松手（不移动），用于长按弹出菜单/长按删除确认这类场景。跟点击一样记选择器不记坐标。",
   swipe: "滑动模式：在屏幕上按下拖到终点松开。起止点会锚到所在控件的选择器 + 百分比，导出脚本时现算坐标。",
   longdrag: "长拖模式：同滑动，但先长按再拖（波形起止手柄这类要用它）。",
   xy: "硬坐标模式：点任意位置下发 tap x y。只在控件既无选择器、也没有能唯一定位的祖先时用，该步会被标红提醒必须改。",
@@ -488,7 +490,7 @@ async function act(body: Record<string, unknown>) {
     err.value = "";
     msg.value = "";
     busy.value = `执行 ${kind}…`; // step 消息到达即清（~0.2s），不上全屏 mask
-    if (kind !== "note") stale.value = true;
+    stale.value = true;
     sess.send({ t: "act", kind, body: rest, case: caseId.value.trim(), n: nextN,
                 auto_sweep: autoSweep.value });
     return;
@@ -530,17 +532,19 @@ function onBoxLeave() {
 }
 
 function pick(n: RecNode) {
-  if (mode.value !== "tap") return;
-  if (!n.sels.length) return act({ kind: "tap", x: n.c[0], y: n.c[1], anc: n.anc });
-  if (n.sels[0].n === 1) return act({ kind: "tap", sel: n.sels[0] });
+  if (mode.value !== "tap" && mode.value !== "longpress") return;
+  const kind = mode.value;
+  if (!n.sels.length) return act({ kind, x: n.c[0], y: n.c[1], anc: n.anc });
+  if (n.sels[0].n === 1) return act({ kind, sel: n.sels[0] });
   ambigPick.value = 0; // 有歧义：先让人挑一个能唯一定位的，或确认要用 --index
+  ambigKind.value = kind;
   ambig.value = n;
 }
 function confirmAmbig() {
   const n = ambig.value!;
   const sel: RecSel = n.sels[ambigPick.value];
   ambig.value = null;
-  act({ kind: "tap", sel });
+  act({ kind: ambigKind.value, sel });
 }
 
 function toDev(e: MouseEvent): [number, number] | null {
@@ -552,7 +556,7 @@ function toDev(e: MouseEvent): [number, number] | null {
 }
 
 function down(e: MouseEvent) {
-  if (mode.value === "tap" || !viewEl.value) return;
+  if (mode.value === "tap" || mode.value === "longpress" || !viewEl.value) return;
   const p = toDev(e);
   if (!p) return;
   if (mode.value === "xy") return act({ kind: "tap", x: p[0], y: p[1] });
@@ -581,8 +585,8 @@ function down(e: MouseEvent) {
 const ask = ref<{ title: string; hint: string; value: string } | null>(null);
 const askInput = ref<HTMLInputElement | null>(null);
 let askResolve: ((v: string | null) => void) | null = null;
-function askText(title: string, hint: string): Promise<string | null> {
-  ask.value = { title, hint, value: "" };
+function askText(title: string, hint: string, initial = ""): Promise<string | null> {
+  ask.value = { title, hint, value: initial };
   nextTick(() => askInput.value?.focus());
   return new Promise((r) => { askResolve = r; });
 }
@@ -597,9 +601,13 @@ async function typeText() {
   const v = await askText("输入文本", "打进当前有焦点的输入框（先点一下目标输入框）。会用 --assert-typed 校验真打进去了，防输入法联想乱码。");
   if (v) act({ kind: "text", value: v });
 }
-async function note() {
-  const v = await askText("给这一步记一句备注", "不操作设备，只写进录制文件，导出脚本时作为注释提示。");
-  if (v) act({ kind: "note", value: v });
+async function noteStep(s: any) {
+  const v = await askText(
+    "给这一步加备注",
+    "不操作设备，只挂在这一步上；导出脚本时会在这行代码前插入 # 备注：… 注释（如标记这是个检查点）。",
+    s.note || "",
+  );
+  if (v) s.note = v;
 }
 function undo() {
   steps.value.pop();
@@ -712,14 +720,14 @@ onMounted(async () => {
           <button class="mini" @click="act({ kind: 'key', code: 'KEYCODE_DEL' })">退格</button>
           <button class="mini" @click="typeText">输入文本</button>
           <button class="mini" :class="{ on: mode === 'swipe' }" @click="mode = mode === 'swipe' ? 'tap' : 'swipe'">滑动</button>
+          <button class="mini" :class="{ on: mode === 'longpress' }" @click="mode = mode === 'longpress' ? 'tap' : 'longpress'">长按</button>
           <button class="mini" :class="{ on: mode === 'longdrag' }" @click="mode = mode === 'longdrag' ? 'tap' : 'longdrag'">长拖</button>
           <button class="mini" :class="{ on: mode === 'xy' }" @click="mode = mode === 'xy' ? 'tap' : 'xy'">硬坐标</button>
-          <button class="mini" @click="note">备注</button>
         </div>
         <div v-if="screen.png_err" class="err small">
           截图失败（控件框仍可点，只是看不到画面）：{{ screen.png_err }}
         </div>
-        <div ref="stage" class="stage" :class="{ grab: mode !== 'tap' }" @mousedown="down"
+        <div ref="stage" class="stage" :class="{ grab: mode !== 'tap' && mode !== 'longpress' }" @mousedown="down"
              :style="screen.png ? {} : { width: '260px', height: '520px' }">
           <!-- .frame 的尺寸完全由 img 撑开（img 是它唯一的 in-flow 子元素），.overlay 用 inset:0
                铺满 .frame ⇒ overlay 与 img 严格同尺寸同位置，框用百分比定位就必然对齐。
@@ -810,9 +818,11 @@ onMounted(async () => {
         </div>
         <div v-for="s in steps" :key="s.n" class="card step">
           <div class="sn">#{{ s.n }}</div>
+          <button v-if="!s.note" class="mini snote" title="给这一步加备注" @click="noteStep(s)">备注</button>
           <button class="mini sdel" title="删除这一步" @click="deleteStep(s.n)">✕</button>
           <div class="sbody">
             <div class="slabel">{{ s.label }}</div>
+            <div v-if="s.note" class="note-line" title="点击改备注" @click="noteStep(s)">📝 {{ s.note }}</div>
             <div v-if="s.script?.length" class="mono cmd">
               <div v-for="(ln, i) in s.script" :key="i">{{ ln }}</div>
             </div>
@@ -966,8 +976,14 @@ h2 { margin: 0; font-weight: 500; }
 .sdel { position: absolute; top: 8px; right: 10px; padding: 0 6px; line-height: 20px; height: 20px;
         color: var(--text-secondary); }
 .sdel:hover { color: var(--text-danger); }
+.snote { position: absolute; top: 8px; right: 38px; padding: 0 6px; line-height: 20px; height: 20px;
+         color: var(--text-secondary); font-size: 11px; }
+.snote:hover { color: var(--text-accent, #2563eb); }
 .sbody { min-width: 0; }
 .slabel { font-weight: 500; font-size: 13px; }
+.note-line { font-size: 12px; margin: 4px 0; padding: 2px 8px; border-radius: 4px; cursor: pointer;
+             background: rgba(217, 119, 6, .12); color: #92400e; display: inline-block; word-break: break-all; }
+.note-line:hover { background: rgba(217, 119, 6, .2); }
 .cmd { font-size: 12px; background: var(--bg-code, rgba(127,127,127,.12)); padding: 2px 6px;
        border-radius: 4px; margin: 4px 0; display: inline-block; word-break: break-all; }
 .tag { display: inline-block; font-size: 11px; padding: 1px 7px; border-radius: 999px;

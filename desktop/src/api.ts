@@ -125,6 +125,7 @@ export interface RecStep {
   anchor?: { sel: RecSel; rx: number; ry: number }; // rx/ry 是相对锚控件 bounds 的**千分比**，可超出 0~1000
   anchor_to?: { sel: RecSel; rx: number; ry: number };
   straightened?: string; // 次方向手抖被对齐过的说明（工具动过什么要明示）
+  note?: string; // 用户手写的步骤备注（如"检查点"），导出脚本时落成这一步前的 # 注释
 }
 export interface StructureRow {
   module: string;

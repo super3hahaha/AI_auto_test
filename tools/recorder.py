@@ -192,7 +192,7 @@ def act_once(kind, body, case, n, before=None, before_labels=None, auto_sweep=Tr
     if before is None:
         # anchor_of（滑动/长拖锚控件、硬坐标兜底）需要节点树，光有 labels 不够，所以这两类必须现探
         before = probe(auto_sweep) if (before_labels is None or kind in ("swipe", "longdrag")
-                             or (kind == "tap" and not body.get("sel") and not body.get("anc"))) else None
+                             or (kind in ("tap", "longpress") and not body.get("sel") and not body.get("anc"))) else None
     b = set(before_labels if before_labels is not None else labels(before))
     cmd, label, extra = do_action(kind, body, before or {"nodes": []})
     out = ""
@@ -204,7 +204,7 @@ def act_once(kind, body, case, n, before=None, before_labels=None, auto_sweep=Tr
         # 是上次录制留下的**过时 dump**，adbkit 命中缓存就不会活 dump → 按陈旧坐标点错位置，
         # 而且看起来一切正常。录制期优化和脚本产物必须分开。
         run = list(cmd)
-        if kind == "tap" and body.get("sel"):
+        if kind in ("tap", "longpress") and body.get("sel"):
             run += ["--from-cache", CACHE_SLOT]
         r = ak(*run)
         out = ((r.stdout or "") + (r.stderr or "")).strip()[-600:]

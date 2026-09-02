@@ -100,23 +100,27 @@ def do_action(kind, body, screen):
     if kind == "note":
         return None, str(body.get("value") or "备注"), {}
 
-    if kind == "tap":
+    if kind in ("tap", "longpress"):
+        # longpress 跟 tap 走同一套定位逻辑（sel/anc/坐标锚三档全一样），差别只在动作动词
+        # 和落到脚本里的命令名——真正的长按手势在 adbkit 的 longpress/longpressid 等子命令里。
+        verb = "点击" if kind == "tap" else "长按"
+        selcmd = {"id": "tapid", "text": "taptext", "desc": "tapdesc"} if kind == "tap" else \
+                 {"id": "longpressid", "text": "longpresstext", "desc": "longpressdesc"}
         sel = body.get("sel")
         if sel:
-            cmd = [{"id": "tapid", "text": "taptext", "desc": "tapdesc"}[sel["by"]], sel["v"],
-                   "--timeout", "8"]
+            cmd = [selcmd[sel["by"]], sel["v"], "--timeout", "8"]
             if sel.get("idx"):
                 cmd += ["--index", str(sel["idx"])]
             warn = None if sel["n"] == 1 else f"{sel['by']}={sel['v']} 全树有 {sel['n']} 个匹配，靠 --index {sel.get('idx', 0)} 定位（脆，UI 一改就错行）"
-            return cmd, f"点击 {sel['v']}", {"sel": sel, "warn": warn}
+            return cmd, f"{verb} {sel['v']}", {"sel": sel, "warn": warn}
         x, y = int(body["x"]), int(body["y"])
         anc = body.get("anc")
         if anc:
             # 控件自身 id/text/desc 全空（剪辑器页返回箭头就是），但能靠「祖先唯一选择器 + 子节点
             # 路径」定位：录制时用当场坐标点，导出脚本时改成 bounds --child 现算，脚本里依然无硬坐标。
-            return ["tap", x, y], f"点击 {anc['v']} 的子控件[{anc['child']}]（自身无选择器）", {"child_anchor": anc}
+            return [kind, x, y], f"{verb} {anc['v']} 的子控件[{anc['child']}]（自身无选择器）", {"child_anchor": anc}
         a = anchor_of(screen, x, y)
-        return ["tap", x, y], f"点击坐标 ({x},{y})", {
+        return [kind, x, y], f"{verb}坐标 ({x},{y})", {
             "anchor": a, "needs_attention": "自身无选择器、也没有能唯一定位的祖先，只能录成硬坐标——导出的脚本这一步必须人工改（见 cmd_bounds 头注）",
         }
 
@@ -177,8 +181,9 @@ def action_lines(s):
     ca = s.get("child_anchor")
     if ca:
         # 坐标由 bounds --child 从实时 UI 树现算，跨分辨率；不用录制当时那对像素值
+        # kind 落进命令名（tap/longpress 都是 `<kind> x y` 形式），别硬写 tap 把长按坐没了
         return [f"set -- $($AK bounds {ca['by']} {q(ca['v'])} --child {ca['child']} --timeout 8 | sed -n 's/^BOUNDS=//p')",
-                '$AK tap $(( ($1 + $3) / 2 )) $(( ($2 + $4) / 2 ))']
+                f'$AK {s["kind"]} $(( ($1 + $3) / 2 )) $(( ($2 + $4) / 2 ))']
     a = s.get("anchor")
     if a and s["kind"] in ("swipe", "longdrag"):
         a2 = s.get("anchor_to") or a
@@ -227,6 +232,8 @@ def gen_flow(case, steps):
         L.append(f"log {q('步骤%d %s' % (s['n'], s['label']))}")
         if s.get("needs_attention"):
             L.append(f"# ⚠️ {s['needs_attention']}")
+        if s.get("note"):
+            L.append(f"# 备注：{s['note']}")
         L += action_lines(s)
         app = s["diff"]["appeared"]
         if app:

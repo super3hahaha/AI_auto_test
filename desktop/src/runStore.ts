@@ -127,6 +127,7 @@ export const runStore = reactive({
   title: "",
   slug: "",
   brain: false,
+  noRegister: false, // 本轮场景库勾了「失败不登记」——publish() 收尾据此跳过 syncSheets/genDocReport
   startedAt: 0,
   cells: [] as RunCell[],
   caseOrder: [] as string[], // 执行台列顺序＝用例库（queue.csv）原始顺序；start() 时定住，
@@ -177,6 +178,10 @@ export const runStore = reactive({
     cases: RunCaseSpec[]; // 用例定义（case_id→script/module 查找表），实际跑哪些格看 plan
     plan: Record<string, string[]>; // serial → 该设备要跑的 caseId 列表（静态执行计划，见 §2）
     brain: boolean;
+    noRegister?: boolean; // 场景库勾了「失败不登记」：本轮所有格子的 issueSkip 预设为真（收尾时跳过
+    // issue_register，复用现成的逐格 issueSkip 机制，执行台里仍可对某一格反悔），且 publish() 收尾
+    // 连带跳过 syncSheets/genDocReport——探索性/调试跑不想让失败占用 issues.csv，也不想拿反复试跑的
+    // 中间状态去刷新给别人看的线上表格/Doc。本轮只落本地执行记录，线上产物维持上一轮已发布的样子。
     newBoard: boolean;
     title: string;
     apkPath?: string; // 选了某个留存版本时，跑用例前先在每台设备上强制重装这个 apk
@@ -193,6 +198,7 @@ export const runStore = reactive({
     this.aborting = false;
     this.slug = opts.slug;
     this.brain = opts.brain;
+    this.noRegister = opts.noRegister ?? false;
     this.title = opts.title;
     this.selectedKey = "";
     this.startedAt = Date.now();
@@ -214,7 +220,7 @@ export const runStore = reactive({
           lines: [],
           recording: false,
           issue: "none",
-          issueSkip: false,
+          issueSkip: opts.noRegister ?? false,
         });
       }
     }
@@ -231,6 +237,9 @@ export const runStore = reactive({
         ? "脚本自愈已启用（引擎: on，失败步骤将由 claude 接管诊断+改脚本重跑）"
         : "脚本自愈未启用（引擎: off，失败步骤将诚实判失败）"
     );
+    if (opts.noRegister) {
+      this.pushEvent("已勾选「失败不登记」：本轮失败/需复核格收尾时不写入问题清单（可在执行台逐格反悔），收尾也不同步表格/刷新Doc，只存本地执行记录。");
+    }
     const caseCount = new Set(this.cells.map((c) => c.caseId)).size;
     this.pushEvent(
       `共 ${this.cells.length} 格待执行（${serials.length} 设备 · ${caseCount} 用例 · 设备间并行、设备内串行）`
@@ -466,8 +475,15 @@ export const runStore = reactive({
   // 收尾发布：先同步表格，再刷新 Doc 报告——doc_report 内部会重新按 queue.csv 当前状态投影，
   // 所以必须放在本轮所有 judge_result 落库之后，且顺序在 syncSheets 之后（各自独立、互不依赖，
   // 但都读同一份本地 ledger，串行跑避免并发写同一份 CSV）。
+  // 勾了「失败不登记」→ 连带跳过 syncSheets/genDocReport：这轮是调试/探索性跑，不止不想占用
+  // issues.csv，也不想拿反复试跑的中间状态去刷新给别人看的线上表格/Doc——线上产物维持上一轮
+  // 已发布的样子，本轮只落本地执行记录（finish() 里紧跟在 publish() 后面存）。
   async publish() {
     await this.registerIssues();
+    if (this.noRegister) {
+      this.pushEvent("已跳过同步表格/刷新Doc（勾了「失败不登记」，线上产物维持上一轮的样子）。");
+      return;
+    }
     await this.syncSheets();
     await this.genDocReport();
   },

@@ -355,6 +355,51 @@ CUT-CORE-01/MIX-CORE-01/SPLIT-CORE-01 都有重命名收尾这一步，新模块
     **排查现有脚本是否中招**：`grep -rn '><node' apps/*/flows/*.sh`，命中的都要照此改法补
     `tr -d '\n'` + `>[[:space:]]*<`；`grep -o '<node[^>]*resource-id="..."[^>]*>'` 这种只
     匹配"单个标签自身属性"（不跨标签）的写法不受影响，不用改。
+14. **凡是用 `$AK text` 往输入框打字的步骤，必须加 `--assert-typed`；不经过 `$AK reset` 的脚本
+    （force-stop 类）还要在重进 App 前手动 `ime set` 兜底切一次键盘**——`adbkit.py` 只在
+    `reset`（`pm clear`）里顺手把默认输入法切到不带联想的 ADB 哑键盘（`_ensure_ascii_ime()`，
+    见 `docs/decisions.md` #50），`text` 子命令本身既不检测也不切换。冒烟脚本（`$AK reset` 开头）
+    天然享受这层保护；纪律#6 里的"其他固化脚本"用 `force-stop` 重进、不走 `reset`，如果裸调
+    `$AK text`，一旦设备重启/被手工测试换过输入法，联想 IME 会把原始按键改写成乱码且**不报错**
+    （2026-09-02 自检发现：全仓库一度只有 `flow_voice_core.sh` 一个脚本手动兜底，其余十几个
+    force-stop 类脚本两种保护都没有，详见 `docs/decisions.md` #63）。**标准写法**：
+    ```bash
+    # force-stop 类脚本，重进 App 前先切键盘（reset 类脚本不用加，pm clear 时已顺手切过）：
+    adb -s "$S" shell ime set com.github.uiautomator/.AdbKeyboard >/dev/null 2>&1 || true
+    adb -s "$S" shell am force-stop "$PKG"
+    ...
+    # 每一处打字都挂 --assert-typed，不分 reset/force-stop：
+    $AK text "$SRC_NAME" --assert-typed >/dev/null
+    ```
+    `ime set` 是 best-effort（设备没装这个键盘会静默失败，不阻断脚本，只是失去这层主动防护）；
+    `--assert-typed` 才是真正兜底——打完字发现原文本没有原样出现在 UI 树上就当场 `sys.exit`
+    报出根因，不会让乱码悄悄流到下游断言才暴露成一个看起来像"App bug"的诡异失败。
+    **排查现有脚本是否中招**：
+    ```bash
+    for f in $(grep -rl 'AK text ' apps/*/flows/*.sh); do grep -q 'assert-typed' "$f" || echo "缺 assert-typed: $f"; done
+    ```
+
+15. **写判定/交互逻辑前，先看 `apps/<slug>/flows/_lib_*.sh` 有没有现成的共用函数可以 `source`
+    直接用，不要每份新脚本都从零手写一遍**——同一段逻辑被复制到第 3 份脚本时，早晚会在其中
+    一份改对、其余几份漏改。2026-09-02 真实复现过：`flow_cut_param.sh`/`flow_cut_param_delete.sh`/
+    `flow_merge_crossfade.sh` 三份脚本各自手写了一份"用 awk 比较 `tools/audio_envelope.py`
+    算出的 dB 值来判定淡入淡出是否渐变"，结果同一个 awk 把 `NaN` 判成"满足阈值"的坑在三处
+    分别复现、分别修（见 `docs/gotchas.md` 同日条目），比一开始就抽成共用库多花了三倍排查
+    成本。**现有共用库（在对应 flow 脚本里 `source "$(dirname "${BASH_SOURCE[0]}")/_lib_xxx.sh"`
+    即可用，函数名见各自文件头注）**：
+    - `_lib_ad_unlock.sh`：广告解锁类固化脚本（`UNLOCK-*`）公共函数——`sweep()`/
+      `watch_reward_ad()`/`mark_fail()`/`grant_first_run_permissions()`。
+    - `_lib_audio_envelope.sh`：用 `tools/audio_envelope.py` 的 RMS dB 输出断言"淡入淡出是否
+      真的渐变、音量是否真的变响"的公共函数——`db_ge()`/`assert_fade_ramp()`/
+      `assert_louder_than()`，内置 `NaN` 哨兵值防护（`db_ge` 里做的），不用自己再手写
+      `awk 'BEGIN{exit !(a-b>=...)}'` 这类数值比较。新固化一条涉及振幅包络判定的路径，
+      直接照抄该文件头注里的调用范例；判定形状跟 `assert_fade_ramp`/`assert_louder_than`
+      对不上（比如要跟多个稳态参照比、或跟前后均值而非端点比，如 `flow_merge_crossfade.sh`
+      的写法），就退一级只用最底层的 `db_ge()` 现拼公式——仍然拿到 `NaN` 防护，不要绕开它
+      直接手写裸 awk 比较。
+    判断"该不该抽共用库"的标准：正在写的判定/交互逻辑如果在两份以上脚本里出现过高度相似的
+    实现（哪怕当时是分别手写的），就该趁手上这次改动把它提炼成新的 `_lib_*.sh`，别继续复制
+    第三份；只出现过一次、还看不出会被复用的逻辑，留在脚本自己身上就好，不必提前抽象。
 
 ## 失败判定标准（硬规则，2026-07-22 起）
 

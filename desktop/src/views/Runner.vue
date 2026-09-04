@@ -3,7 +3,7 @@ import { ref, reactive, computed, onMounted, onActivated, watch } from "vue";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { api, type FlowRow, type DeviceRow, type ApkInfo, type ApkVersionInfo } from "../api";
 import { store } from "../store";
-import { runStore, AUTO_LANG } from "../runStore";
+import { runStore, AUTO_LANG, type RerunPlan } from "../runStore";
 import RunMonitor from "./RunMonitor.vue";
 import RunHistory from "./RunHistory.vue";
 
@@ -344,6 +344,26 @@ async function launch(newBoard: boolean) {
       noRegister: noRegister.value,
     })
     .then(() => loadFlows()); // 跑完刷新用例列表拿最新 last_result
+}
+
+// 「执行记录」页点「失败重跑」→ 跳回场景库，只勾失败用例，且逐格显式分派回它们各自失败的设备
+// （而不是本轮跑过的全部设备）。先现查一遍在线设备——失败当时在线的设备，此刻未必还连着。
+async function onRerunFailed(plan: RerunPlan) {
+  await loadDevices(); // 刷新右栏设备列表，避免刚插上的设备还没出现在勾选框里（见 loadDevices 内注释）
+  const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
+  const required = [...new Set(Object.values(plan.serialsByCase).flat())];
+  const missing = required.filter((s) => !online.has(s));
+  if (missing.length) {
+    const names = missing.map((s) => plan.labels[s] || s).join("、");
+    await message(`${names} 设备当前没有连接，请连接后再试。`, { title: "失败重跑", kind: "warning" });
+    return;
+  }
+  boardMode.value = "current"; // 重跑失败用例是续用当前批次，不应该顺手开新一轮
+  pickedCases.value = [...plan.cases];
+  pickedSerials.value = required;
+  Object.keys(rowSerials).forEach((k) => delete rowSerials[k]);
+  for (const cid of plan.cases) rowSerials[cid] = plan.serialsByCase[cid] ?? required;
+  subTab.value = "library";
 }
 
 // ── 左栏顶部：上传 APK（本地解析 → 装机 → 注册）──
@@ -802,7 +822,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
 
     <!-- ══════ 执行记录：完整跑完（未中止）的历史执行台快照，按 run 记录切换回看 ══════ -->
     <div v-show="subTab === 'history'" class="monitor-wrap">
-      <RunHistory ref="historyRef" />
+      <RunHistory ref="historyRef" @rerun-failed="onRerunFailed" />
     </div>
 
     <!-- 新建看板二次确认 -->

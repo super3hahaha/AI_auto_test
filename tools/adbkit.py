@@ -1098,10 +1098,17 @@ def cmd_focus(args):
     print(_current_focus())
 
 
-def _sweep_one_round(nodes, focus, rules, only=None, dry_run=False):
+_TERMINAL_BY = ("corner-tr", "keyevent-back", "force-stop")
+
+
+def _sweep_one_round(nodes, focus, rules, only=None, dry_run=False, escalate=None):
     """规则库里挑一条命中的就点掉，返回 (rule_id, by, value, cx, cy) 或 None（没命中不动手）。
     单轮逐规则、逐 match 选择器按序试，第一个命中即点即返回——被 cmd_sweep 和内部等待重试
-    （_wait_with_sweep）共用，逻辑只写一处。"""
+    （_wait_with_sweep）共用，逻辑只写一处。
+
+    escalate：_sweep_loop 传入的"已证明点了没用"的 rule id 集合——命中该规则时跳过前面
+    的 text/id/desc 类选择器，只保留 _TERMINAL_BY（corner-tr/keyevent-back/force-stop）
+    这几个结构化/系统级兜底。见 _sweep_loop 里 escalate 的计算逻辑注释。"""
     for rule in rules:
         if only and rule.get("id") not in only:
             continue
@@ -1110,7 +1117,10 @@ def _sweep_one_round(nodes, focus, rules, only=None, dry_run=False):
         scope = rule.get("scope", "")
         if not (scope in _ANY_SCOPE or (scope and scope in focus)):
             continue
-        for sel in rule.get("match", []):
+        matches = rule.get("match", [])
+        if escalate and rule.get("id") in escalate:
+            matches = [m for m in matches if m.get("by") in _TERMINAL_BY]
+        for sel in matches:
             by = sel.get("by", "id")
             if by == "corner-tr":
                 # 右上角关闭 X（无 text/desc/id 的 Image/Button）——结构化定位，不靠盲点坐标。
@@ -1131,6 +1141,18 @@ def _sweep_one_round(nodes, focus, rules, only=None, dry_run=False):
                 if not dry_run:
                     shell("input keyevent 4")
                 return (rule.get("id"), by, "KEYCODE_BACK", -1, -1)
+            if by == "force-stop":
+                # 比 keyevent-back 更狠的终极兜底：广告点击穿透跳进了一个有自己完整返回栈的
+                # 真实 App（如 com.android.vending 商店首页/分类页），BACK 只会在它内部一层层
+                # 往回翻页，翻几次都退不出来（2026-09-04 三星A05s真机复现：连按 3 次 BACK 全部
+                # 命中同一个 mCurrentFocus 窗口，页面在 vending 内部切来切去，就是不退出）。
+                # 用 `am force-stop` 直接杀掉整个进程，不管返回栈多深，一步到位；退出后交回
+                # flow 脚本自己的「App 不在前台，重新拉起」重试逻辑去拉回被测 App。sel["package"]
+                # 缺省时退化用 scope 本身（要求 scope 就是精确包名，不能是子串/通配）。
+                pkg = sel.get("package") or scope
+                if not dry_run:
+                    shell(f"am force-stop {pkg}")
+                return (rule.get("id"), by, f"am force-stop {pkg}", -1, -1)
             if by == "outside-panel":
                 # 点弹窗外空白处关闭（setCanceledOnTouchOutside 类弹窗，如好评弹窗）。
                 # sel["of"] 给弹窗内容区的 id 列表（如 parentPanel/customPanel），
@@ -1162,28 +1184,46 @@ def _sweep_one_round(nodes, focus, rules, only=None, dry_run=False):
 def _sweep_loop(rounds, interval, patience, rules=None, only=None, dry_run=False, verbose=True):
     """通用弹窗清障轮询主体：每轮 dump 一次界面，规则库里找一条命中就点掉（点完界面会变，
     下一轮重新 dump）；连续 patience 轮无命中即认为界面已清干净，提前收工。返回命中列表。
-    rules=None 时读默认规则库；被 cmd_sweep（CLI）和 _wait_with_sweep（内部等待重试）共用。"""
+    rules=None 时读默认规则库；被 cmd_sweep（CLI）和 _wait_with_sweep（内部等待重试）共用。
+
+    「命中却点了没用」自动升级到更强兜底（2026-09-04 三星Note9真机复现 SPLIT-CORE-01 时
+    发现）：某些广告 creative 的 desc="Close"/text="Skip" 这类节点确实存在于 accessibility
+    树里、坐标也点了，但视觉上被广告自己的另一层遮罩挡住，触摸事件传不到真正的关闭回调——
+    dump 出来一切正常、tap 也执行了，界面却纹丝不动，真机连续 15+ 轮全部重复命中同一个
+    desc=Close @ (62,62)，`mCurrentFocus` 的窗口 hash 全程没变过一次。这类选择器排在
+    match 列表前面，只要它还命中，_sweep_one_round 每轮都会在它这里 return，后面排着的
+    corner-tr/keyevent-back 兜底永远轮不到——即使这两个兜底本来能一发解决（真机验证：手动
+    补一次系统 BACK 键立刻退出）。修法：记录上一轮命中的 (rule_id, by)，如果这一轮的
+    `_current_focus()` 跟上一轮点击前完全相同（=上一次点击没有改变前台窗口）且上一次用的
+    不是终极兜底选择器，就把该 rule 加进 escalate 集合，之后这条规则只保留 corner-tr/
+    keyevent-back/force-stop 这几个不依赖"点中了会不会真的生效"的结构化/系统级手段。"""
     rules = rules if rules is not None else load_ad_rules()
     only_set = set(only) if only else None
     fired, quiet = [], 0
+    prev_focus, prev_hit, escalate = None, None, set()
     for rnd in range(1, rounds + 1):
         focus = _current_focus()
+        if prev_hit and focus == prev_focus and prev_hit[1] not in _TERMINAL_BY:
+            escalate.add(prev_hit[0])
         try:
             nodes = list(_dump_tree())
         except SystemExit:
             time.sleep(interval)  # dump 失败多为界面在动画/瞬时，歇一下再来
+            prev_focus, prev_hit = focus, None
             continue
-        hit = _sweep_one_round(nodes, focus, rules, only_set, dry_run)
+        hit = _sweep_one_round(nodes, focus, rules, only_set, dry_run, escalate=escalate)
         if hit:
             if verbose:
                 rid, by, v, cx, cy = hit
-                print(f"{'[命中]' if dry_run else '[点掉]'} 第{rnd}轮 {rid}: {by}={v} @ ({cx},{cy})")
+                tag = "[命中]" if dry_run else ("[点掉/升级兜底]" if rid in escalate else "[点掉]")
+                print(f"{tag} 第{rnd}轮 {rid}: {by}={v} @ ({cx},{cy})")
             fired.append(hit)
             quiet = 0
         else:
             quiet += 1
             if quiet >= patience:
                 break
+        prev_focus, prev_hit = focus, hit
         if rnd < rounds:
             time.sleep(interval)
     return fired

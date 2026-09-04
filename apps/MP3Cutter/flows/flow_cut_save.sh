@@ -25,6 +25,9 @@ CASE="CUT-CORE-01"   # 纯用例ID；证据路径里的设备段由 adbkit 按 -
 # 不传 LANG_CODE 时 t() 原样返回原文，行为与接入前完全一致；表路径不用写死，lang_helper 按
 # 设备实装 versionCode 自动备表（见 tools/lang_helper.sh、docs/decisions.md #55）。
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/lang_helper.sh"
+# settle_result_page()（结果页 dump 前再确认，防事后插屏广告二次盖住结果页）从这里来，
+# 见 tools/flow_result_settle.sh 头注 2026-09-04 条目。
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/flow_result_settle.sh"
 PKG="ringtone.maker.mp3.cutter.audio"   # 前台归属判断用：被全屏插屏广告/误触 BACK 弹回桌面时，据此把 App 重新拉回前台
 SRC="assets/mp3-sample-track.mp3"
 DEV_DST="/sdcard/Music/mp3-sample-track.mp3"
@@ -211,6 +214,9 @@ $AK tapid btn_convert --timeout 8 >/dev/null
 # 有广告就等它出跳过按钮点掉，没广告则连续 patience 轮无命中很快退，不会白等满 10s。
 sweep --rounds 10 --interval 1 --patience 3
 if $AK waitfor text "$(t 音频已保存)" --timeout 15 >/dev/null 2>&1; then
+  # dump 前再确认几轮（防事后插屏广告二次盖住结果页，见 tools/flow_result_settle.sh 头注
+  # 2026-09-04 条目），确认不掉也不阻塞，带着广告截图往下走。
+  settle_result_page text "$(t 音频已保存)"
   # 结果页同样不能只说"已生成"——读结果页 info 控件的"大小｜时长"文本存进断言；
   # 再跑一次 output-check 用编辑器选区算出的预期时长做交叉核对，MediaStore 那行的
   # 断言会带精确 _size/duration + 是否跟预期一致的结论，而不是"完整性通过"这种空话。

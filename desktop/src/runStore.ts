@@ -417,9 +417,13 @@ export const runStore = reactive({
 
   finish() {
     this.running = false;
+    // 必须在重置 this.aborting 之前拍下快照——registerIssues() 要靠这份快照判断「这一轮是不是
+    // 中止的」，如果直接用活的 this.aborting，读到时已经被下面这行重置成 false，判断永远失效
+    // （踩过的坑：中止的轮次照样把失败格自动登记进了 issues.csv）。
+    const aborted = this.aborting;
     this.aborting = false;
     // 先把本轮快照抓成局部引用（新一轮 start() 会另建新数组，这些引用仍指向本轮，不被后续 mutate）。
-    // completed 决定要不要存执行记录：中止（this.aborting 曾为真）/早退失败的轮次 completed 一直是 false。
+    // completed 决定要不要存执行记录：中止（aborted 为真）/早退失败的轮次 completed 一直是 false。
     const completed = this.completed;
     // runId：跑这轮时 store.runs 里当前批次的 run_id（新建看板会在 start() 里先 loadRuns 落定它）——
     // 落到执行记录的 meta 里，才能跟看板/证据/总览页的「轮次」概念对上，不然两套 id 各跑各的对不上号。
@@ -445,7 +449,7 @@ export const runStore = reactive({
     // publishing 全程占用（登记问题清单→同步→刷新Doc→补存执行记录），start() 据此拒绝在这之前开新一轮
     // ——避免上一轮仍在流式 push 的收尾日志串进下一轮已经清空重建的 events 数组。
     this.publishing = true;
-    void this.publish()
+    void this.publish(aborted)
       .then(() => (completed ? this.saveRecord(snap, cellsRef, eventsRef, true) : undefined))
       .finally(() => { this.publishing = false; });
   },
@@ -505,8 +509,8 @@ export const runStore = reactive({
   // 勾了「失败不登记」→ 连带跳过 syncSheets/genDocReport：这轮是调试/探索性跑，不止不想占用
   // issues.csv，也不想拿反复试跑的中间状态去刷新给别人看的线上表格/Doc——线上产物维持上一轮
   // 已发布的样子，本轮只落本地执行记录（finish() 里紧跟在 publish() 后面存）。
-  async publish() {
-    await this.registerIssues();
+  async publish(aborted = false) {
+    await this.registerIssues(aborted);
     if (this.noRegister) {
       this.pushEvent("已跳过同步表格/刷新Doc（勾了「失败不登记」，线上产物维持上一轮的样子）。");
       return;
@@ -519,7 +523,8 @@ export const runStore = reactive({
   // 必须排在 syncSheets/genDocReport 之前——那两个要读 issues.csv 才能把问题带进「问题清单」tab
   // 和 Doc 的失败详情。串行逐格调：headless claude 会写同一份 issues.csv，并发会撞车。
   // 中止的这一轮不登记（aborted 不是判定结果，且证据可能不完整）。fire-and-forget 风格：
-  // 单格失败只提示、不中断整个收尾。
+  // 单格失败只提示、不中断整个收尾。aborted 由 finish() 在重置 this.aborting 前拍下传入，
+  // 不能读活的 this.aborting——finish() 早就把它清成 false 了。
   // 手动切换某一格「本条不登记问题清单」——只在 issue 还是 "none"（收尾流程还没跑到它）时生效，
   // 供调试固化脚本时用：脚本没写好导致的失败不是真缺陷，不想每次都占用 issues.csv。
   toggleIssueSkip(serial: string, caseId: string) {
@@ -528,8 +533,8 @@ export const runStore = reactive({
     cell.issueSkip = !cell.issueSkip;
   },
 
-  async registerIssues() {
-    if (!this.slug || this.aborting) return;
+  async registerIssues(aborted = false) {
+    if (!this.slug || aborted) return;
     const targets = this.cells.filter(
       (c) => c.status === "fail" || c.status === "app_defect" || c.status === "needs_human"
     );

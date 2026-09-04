@@ -10,10 +10,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
-// 当前正在执行的 run（run_flow / auto_repair）的进程组 id（== 组长 pid）。中止靠它 kill 整组，
-// 把 python→bash→adb→claude 一并带走（子进程默认继承父进程组，见 stream_child 的 process_group）。
-// 一次只跑一个 run（执行台串行编排 + 跑时禁开新 run），故一个全局槽足够。
-static RUN_PGID: Mutex<Option<i32>> = Mutex::new(None);
+// 当前正在执行的所有 run（run_flow / auto_repair / judge_result）的进程组 id（== 组长 pid）。
+// 中止靠它 kill 整组，把 python→bash→adb→claude 一并带走（子进程默认继承父进程组，见
+// stream_child 的 process_group）。多设备并行后每台设备一个 worker 同时各跑一个进程，
+// 单槽会被后启动的覆盖、abort 只能停最后一个——改成 (key=serial, pgid) 多槽登记，
+// abort_run 遍历全杀。用 Vec 而非 HashMap：HashMap::new() 不是 const，static 初始化不了；
+// 条目至多设备数级别，线性 retain 足够。
+static RUN_PGIDS: Mutex<Vec<(String, i32)>> = Mutex::new(Vec::new());
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +30,10 @@ use tauri::{AppHandle, Manager};
 pub struct AppConfig {
     pub project_root: String,
     pub python: String,
+    // headless 调 claude CLI 用的模型（「脚本自愈」run_flow_repair + 收尾「问题登记」register_issue
+    // 共用同一个设置项）；""=跟随 claude CLI 自身默认，见 tools/auto_repair.py 的 AUTO_REPAIR_MODEL
+    // 与 tools/issue_register.py 的 ISSUE_REGISTER_MODEL。
+    pub claude_model: String,
     pub configured: bool, // 项目根是否已确认（含 config/target.example.json + tools/adbkit.py 的合法目录）
 }
 
@@ -62,6 +69,8 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
     let f = app_cfg_file(app);
     let mut root = String::new();
     let mut python = String::from("python3");
+    // 键缺失（老配置/从没存过）才落这个默认值；键存在且为 ""（用户显式选"跟随 CLI 默认"）要保留空串。
+    let mut claude_model = String::from("claude-sonnet-5");
     if let Ok(txt) = fs::read_to_string(&f) {
         if let Ok(v) = serde_json::from_str::<Value>(&txt) {
             root = v.get("project_root").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -69,6 +78,9 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
                 if !p.is_empty() {
                     python = p.to_string();
                 }
+            }
+            if let Some(m) = v.get("claude_model").and_then(|x| x.as_str()) {
+                claude_model = m.to_string();
             }
         }
     }
@@ -79,7 +91,7 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
         }
     }
     let configured = !root.is_empty() && is_project_root(Path::new(&root));
-    AppConfig { project_root: root, python, configured }
+    AppConfig { project_root: root, python, claude_model, configured }
 }
 
 #[tauri::command]
@@ -88,16 +100,24 @@ pub fn get_app_config(app: AppHandle) -> AppConfig {
 }
 
 #[tauri::command]
-pub fn set_app_config(app: AppHandle, project_root: String, python: String) -> Result<AppConfig, String> {
+pub fn set_app_config(
+    app: AppHandle,
+    project_root: String,
+    python: String,
+    claude_model: Option<String>,
+) -> Result<AppConfig, String> {
     let p = Path::new(&project_root);
     if !is_project_root(p) {
         return Err(format!(
             "该目录不像 AI_auto_test 项目根（缺 config/target.example.json 或 tools/adbkit.py）：{project_root}"
         ));
     }
+    // 不传 claude_model（旧调用点/仅改 root+python）时沿用已存的值，不覆盖成默认。
+    let model = claude_model.unwrap_or_else(|| load_app_config(&app).claude_model);
     let body = serde_json::json!({
         "project_root": project_root,
         "python": if python.is_empty() { "python3".into() } else { python },
+        "claude_model": model,
     });
     let f = app_cfg_file(&app);
     fs::write(&f, serde_json::to_string_pretty(&body).unwrap()).map_err(|e| e.to_string())?;
@@ -157,9 +177,7 @@ pub struct AppInfo {
     pub slug: String,
     pub app_name: String,
     pub package: String,
-    pub app_version: String,
     pub sheet_id: String,
-    pub serial: String,
     // target.json 的文件修改时间（unix 秒），仅用于同包名多条历史记录时取"最近使用的一条"
     pub updated_at: i64,
 }
@@ -200,9 +218,7 @@ pub fn list_apps(app: AppHandle) -> Result<Vec<AppInfo>, String> {
                     if n.is_empty() { slug.clone() } else { n }
                 },
                 package: s("package"),
-                app_version: s("app_version"),
                 sheet_id: s("sheet_id"),
-                serial: s("serial"),
                 slug,
                 updated_at,
             });
@@ -474,12 +490,16 @@ pub fn read_evidence(app: AppHandle, app_slug: String, run_id: String) -> Result
     Ok(out)
 }
 
-/// 读文本类证据（logs/ui/output-check）内容，前端内联展示。路径相对仓库根，与 App 无关。
+/// 读文本类证据（logs/ui/output-check/run-log）内容，前端内联展示。路径相对仓库根，与 App 无关。
+/// 必须按字节读 + lossy 解码，不能用 read_to_string：固化脚本流程日志（99-run-log）是原样落盘的
+/// 脚本输出，而 flow 在 LC_ALL=C 下跑 /bin/bash 3.2 时偶发会搅出坏字节（见 gotchas.md 的多字节 bug），
+/// read_to_string 会整条报 "stream did not contain valid UTF-8"、证据面板一个字都看不到。
 #[tauri::command]
 pub fn read_text_file(app: AppHandle, rel_path: String) -> Result<String, String> {
     let root = root_of(&app)?;
     let p = root.join(&rel_path);
-    fs::read_to_string(&p).map_err(|e| format!("读不到 {}: {e}", p.display()))
+    let bytes = fs::read(&p).map_err(|e| format!("读不到 {}: {e}", p.display()))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 // ---------------------------------------------------------------------------
@@ -583,7 +603,6 @@ pub struct DeviceRow {
     pub state: String, // device/offline/unauthorized（adb 原值）或 absent（登记过但当前未插上）
     pub model: String,
     pub alias: String,
-    pub is_default: bool,
     pub os_version: String, // 安卓版本号，仅在线设备才查（getprop ro.build.version.release）
 }
 
@@ -644,10 +663,15 @@ fn getprop(serial: &str, prop: &str) -> String {
     }
 }
 
+/// force=false（默认路径）：os_version 缓存优先，命中就完全不起 adb 子进程。安卓版本号对同一台
+/// 设备是准不变量（除非刷系统），而 getprop 是无线设备上 85~300ms 的网络往返 —— 执行台每次切回
+/// tab 都重查一遍是纯浪费（4 台串行实测 835ms，卡顿的 98%）。
+/// force=true：设备页显式「刷新」用，无条件重查所有在线设备，刷过系统的设备靠它更正。
+/// 需要查的那几台并发查（各起一个线程），耗时从 sum(N) 降到 max(N)。
 fn adb_devices(
     root: &Path,
-    default_serial: &str,
     aliases: &HashMap<String, String>,
+    force: bool,
 ) -> Result<Vec<DeviceRow>, String> {
     let out = Command::new("adb").args(["devices", "-l"]).output();
     let out = match out {
@@ -658,6 +682,8 @@ fn adb_devices(
     let mut cache = device_info_cache(root);
     let mut cache_dirty = false;
     let mut devices = vec![];
+    // 先解析出设备清单，把「要查 os_version 的在线设备」攒起来一起并发查
+    let mut parsed: Vec<(String, String, String)> = vec![]; // (serial, state, model)
     for line in text.lines().skip(1) {
         let line = line.trim();
         if line.is_empty() || line.starts_with('*') {
@@ -674,25 +700,61 @@ fn adb_devices(
             .find_map(|t| t.strip_prefix("model:"))
             .unwrap_or("")
             .to_string();
+        parsed.push((serial, state, model));
+    }
+    // 离线/未授权/未插上的不查（不值得等 adb 超时）；在线的：force 时全查，否则只查缓存没有的
+    let todo: Vec<String> = parsed
+        .iter()
+        .filter(|(serial, state, _)| {
+            state == "device"
+                && (force
+                    || cache
+                        .get(serial)
+                        .map(|c| c.os_version.is_empty())
+                        .unwrap_or(true))
+        })
+        .map(|(serial, _, _)| serial.clone())
+        .collect();
+    let mut queried: HashMap<String, String> = HashMap::new();
+    let handles: Vec<_> = todo
+        .into_iter()
+        .map(|serial| {
+            std::thread::spawn(move || {
+                let v = getprop(&serial, "ro.build.version.release");
+                (serial, v)
+            })
+        })
+        .collect();
+    for h in handles {
+        if let Ok((serial, v)) = h.join() {
+            queried.insert(serial, v);
+        }
+    }
+    for (serial, state, model) in parsed {
         let alias = aliases.get(&serial).cloned().unwrap_or_default();
         let os_version = if state == "device" {
-            getprop(&serial, "ro.build.version.release")
+            match queried.get(&serial) {
+                Some(v) => v.clone(),
+                // 没进 todo 说明缓存里有；取缓存值（拿不到就留空，下次 force 会补）
+                None => cache.get(&serial).map(|c| c.os_version.clone()).unwrap_or_default(),
+            }
         } else {
             String::new()
         };
-        // 查到了新值就刷新缓存，供下次拔掉后兜底显示
+        // 查到了新值就刷新缓存，供下次拔掉后兜底显示。只在值真的变了时置 dirty ——
+        // 缓存命中路径下每次都写盘毫无意义（切个 tab 就重写一遍 json）。
         if !model.is_empty() || !os_version.is_empty() {
             let entry = cache.entry(serial.clone()).or_default();
-            if !model.is_empty() {
+            if !model.is_empty() && entry.model != model {
                 entry.model = model.clone();
+                cache_dirty = true;
             }
-            if !os_version.is_empty() {
+            if !os_version.is_empty() && entry.os_version != os_version {
                 entry.os_version = os_version.clone();
+                cache_dirty = true;
             }
-            cache_dirty = true;
         }
         devices.push(DeviceRow {
-            is_default: !default_serial.is_empty() && serial == default_serial,
             serial,
             state,
             model,
@@ -709,7 +771,6 @@ fn adb_devices(
         }
         let cached = cache.get(serial).cloned().unwrap_or_default();
         devices.push(DeviceRow {
-            is_default: !default_serial.is_empty() && serial == default_serial,
             serial: serial.clone(),
             state: "absent".to_string(),
             model: cached.model,
@@ -723,13 +784,23 @@ fn adb_devices(
     Ok(devices)
 }
 
+/// 起 adb 子进程，必须 async + spawn_blocking：同步 command 在 Tauri 里跑在主线程上，
+/// 等 adb 的那段时间窗口事件循环停摆（切回执行台的「卡顿」感就是这么来的），而且前端
+/// Promise.all 并发的几个 invoke 会在主线程上排队，白等一遍。
+/// force 见 adb_devices：默认缓存优先，设备页显式刷新才传 true。
 #[tauri::command]
-pub fn list_devices(app: AppHandle, app_slug: String) -> Result<Vec<DeviceRow>, String> {
+pub async fn list_devices(
+    app: AppHandle,
+    _app_slug: String,
+    force: Option<bool>,
+) -> Result<Vec<DeviceRow>, String> {
     let root = root_of(&app)?;
-    let cfg = read_target(&root, &app_slug);
-    let default_serial = cfg.get("serial").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let aliases = device_aliases(&root);
-    adb_devices(&root, &default_serial, &aliases)
+    tauri::async_runtime::spawn_blocking(move || {
+        let aliases = device_aliases(&root);
+        adb_devices(&root, &aliases, force.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// 读取序列号→别名映射本身（不走 adb，纯读 config/device_aliases.json）。
@@ -740,6 +811,18 @@ pub fn read_device_aliases(app: AppHandle) -> Result<Vec<KV>, String> {
     Ok(device_aliases(&root)
         .into_iter()
         .map(|(key, value)| KV { key, value })
+        .collect())
+}
+
+/// 读取序列号/ip:port → 型号缓存（不走 adb，纯读 config/device_info_cache.json）。
+/// 证据查看器等场景没有别名登记时，用型号兜底显示，避免无线设备直接露出 ip:port。
+#[tauri::command]
+pub fn read_device_model_cache(app: AppHandle) -> Result<Vec<KV>, String> {
+    let root = root_of(&app)?;
+    Ok(device_info_cache(&root)
+        .into_iter()
+        .filter(|(_, v)| !v.model.is_empty())
+        .map(|(key, v)| KV { key, value: v.model })
         .collect())
 }
 
@@ -756,14 +839,21 @@ pub fn upsert_device_alias(app: AppHandle, serial: String, alias: String) -> Res
     write_device_aliases(&root, &map)
 }
 
-/// 删除设备别名登记：只影响 config/device_aliases.json，不影响物理设备连接本身
-/// （已插上的设备下次刷新仍会出现，只是 alias 变空）。
+/// 删除设备别名登记：清 config/device_aliases.json 里的登记。
+/// USB 设备物理插着的话下次刷新仍会出现（软件层面弄不掉 USB 连接，只是 alias 变空）。
+/// 网络 adb（serial 形如 ip:port）额外 `adb disconnect`——不然 adb server 记着这个地址，
+/// 下次 adb devices 扫描还是会把它列成 offline，删了等于没删。断开后要用再 adb connect 回来，
+/// 跑用例时 adbkit.py 的掉线自愈已经会自动重连，不影响自动化。
 #[tauri::command]
 pub fn delete_device_alias(app: AppHandle, serial: String) -> Result<(), String> {
     let root = root_of(&app)?;
     let mut map = device_aliases(&root);
     map.remove(&serial);
-    write_device_aliases(&root, &map)
+    write_device_aliases(&root, &map)?;
+    if serial.contains(':') {
+        let _ = Command::new("adb").args(["disconnect", &serial]).output();
+    }
+    Ok(())
 }
 
 /// 导出设备别名登记到给定路径（前端先用 save 对话框选路径）
@@ -929,19 +1019,6 @@ pub fn delete_text_resource(app: AppHandle, key: String) -> Result<(), String> {
     write_text_resources(&root, &list)
 }
 
-/// 设目标设备：写回 apps/<slug>/target.json 的 serial（app 允许写 config 的少数几处之一）
-#[tauri::command]
-pub fn set_target_serial(app: AppHandle, app_slug: String, serial: String) -> Result<(), String> {
-    let root = root_of(&app)?;
-    let p = app_root(&root, &app_slug).join("target.json");
-    let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
-    let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
-    v["serial"] = Value::String(serial);
-    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
-        .map_err(|e| e.to_string())?;
-    Ok(())
-}
-
 /// 设本轮范围：写回 apps/<slug>/target.json 的 scope（逗号拼接的用例ID）。
 /// 开新一轮前用本次勾选的用例同步它，让 new_run.py 内部重建的 board/summary 看板范围
 /// 跟桌面壳里实际要跑的用例保持一致，而不是退回 target.json 里旧的/空的 scope。
@@ -952,6 +1029,24 @@ pub fn set_target_scope(app: AppHandle, app_slug: String, scope: String) -> Resu
     let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
     let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
     v["scope"] = Value::String(scope);
+    fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// 设 UI dump 后端：写回 apps/<slug>/target.json 的 dump_backend（shell / u2）。
+/// u2 需设备预装并保活 atx-agent，切换前应先在设备上跑通 `tools/init_target.py --atx-init`
+/// 确认可连（见 decisions.md #30），这里不做设备端探测，纯写配置。
+#[tauri::command]
+pub fn set_target_dump_backend(app: AppHandle, app_slug: String, dump_backend: String) -> Result<(), String> {
+    if dump_backend != "shell" && dump_backend != "u2" {
+        return Err(format!("dump_backend 只能是 shell 或 u2，收到：{dump_backend}"));
+    }
+    let root = root_of(&app)?;
+    let p = app_root(&root, &app_slug).join("target.json");
+    let txt = fs::read_to_string(&p).map_err(|e| e.to_string())?;
+    let mut v: Value = serde_json::from_str(&txt).map_err(|e| e.to_string())?;
+    v["dump_backend"] = Value::String(dump_backend);
     fs::write(&p, serde_json::to_string_pretty(&v).map_err(|e| e.to_string())? + "\n")
         .map_err(|e| e.to_string())?;
     Ok(())
@@ -1134,13 +1229,22 @@ fn pump<R: std::io::Read>(r: R, ch: &Channel<String>) {
     }
 }
 
-/// track=true 的会被登记为「当前可中止的 run」：放进自己的进程组（子孙进程都跟着），
-/// 并把组 pid 记进 RUN_PGID，供 abort_run kill 整组；退出时清空。装机/注册/新建看板不登记。
-fn stream_child(mut cmd: Command, on_event: Channel<String>, track: bool) -> Result<i32, String> {
+/// track_key=Some(_) 的会被登记为「当前可中止的 run」：放进自己的进程组（子孙进程都跟着），
+/// 并以 (key, pgid) 记进 RUN_PGIDS，供 abort_run kill 全部进程组；退出时按 (key, pgid) 摘除。
+/// key 用 serial（设备间并行、设备内串行——同一 serial 同时至多一个 tracked 进程）。
+/// 装机/注册/新建看板/收尾同步不登记（track_key=None）。
+fn stream_child(mut cmd: Command, on_event: Channel<String>, track_key: Option<String>) -> Result<i32, String> {
     #[cfg(unix)]
-    if track {
+    if track_key.is_some() {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0); // 新建进程组、以本进程为组长 → 子孙共享该 pgid，中止时一网打尽
+    }
+    // track_key 恒为 serial（见上方函数注释）：回归要抢这台设备的 UiAutomation，先把可能挂着的
+    // 录制会话断掉——不然两边同时 dump 会互相 kill 掉对方的 uiautomator 进程，制造假失败
+    // （真机复现过：录制器常驻 daemon 没退，回归脚本 `adb shell uiautomator dump` 被系统直接
+    // SIGKILL，明明首页控件都在，脚本却报"找不到入口"）。
+    if let Some(key) = &track_key {
+        stop_recorder_session_internal(key);
     }
     let mut child = cmd
         .stdout(Stdio::piped())
@@ -1148,8 +1252,9 @@ fn stream_child(mut cmd: Command, on_event: Channel<String>, track: bool) -> Res
         .spawn()
         .map_err(|e| format!("启动失败：{e}"))?;
 
-    if track {
-        *RUN_PGID.lock().unwrap() = Some(child.id() as i32);
+    let pgid = child.id() as i32;
+    if let Some(key) = &track_key {
+        RUN_PGIDS.lock().unwrap().push((key.clone(), pgid));
     }
 
     let stdout = child.stdout.take();
@@ -1165,8 +1270,8 @@ fn stream_child(mut cmd: Command, on_event: Channel<String>, track: bool) -> Res
     }
     let _ = h_err.join();
     let status = child.wait().map_err(|e| e.to_string())?;
-    if track {
-        *RUN_PGID.lock().unwrap() = None;
+    if let Some(key) = &track_key {
+        RUN_PGIDS.lock().unwrap().retain(|(k, p)| !(k == key && *p == pgid));
     }
     Ok(status.code().unwrap_or(-1))
 }
@@ -1221,28 +1326,73 @@ fn pump_capture<R: std::io::Read>(r: R, ch: &Channel<String>, cap: &std::sync::M
     }
 }
 
-/// 中止当前正在跑的 run：向其进程组发 SIGTERM（可捕获，让 run_flow/auto_repair 有机会补记「已中止」
-/// 日志后退出），整组 python→bash→adb→claude 一起收。没有在跑的 run 返回 false。
+/// kill -TERM -<pgid>：负号表示整个进程组。
+#[cfg(unix)]
+fn term_pgid(pid: i32) {
+    let _ = Command::new("kill").args(["-TERM", &format!("-{pid}")]).status();
+}
+
+/// 探活（kill -0）+ 仍存活则补 SIGKILL 兜底——SIGTERM 可被忽略或来不及处理（尤其 claude CLI
+/// 这类外部二进制，退出行为不受本仓库控制），发完 TERM 不代表进程组真的没了。
+#[cfg(unix)]
+fn kill_pgid_if_alive(pid: i32) {
+    let alive = Command::new("kill")
+        .args(["-0", &format!("-{pid}")])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if alive {
+        let _ = Command::new("kill").args(["-KILL", &format!("-{pid}")]).status();
+    }
+}
+
+/// 应用退出（Cmd+Q / 系统关闭请求，不止是点了「停止执行」）前的兜底清理：把 RUN_PGIDS 里登记的
+/// 进程组全部收掉，避免 python/run_flow/auto_repair/claude 在应用主进程消失后变成孤儿进程继续
+/// 留在后台。同步阻塞最多 2 秒——应用本就在退出，等这一下换干净收尾是值得的。
+pub fn kill_all_run_pgids_blocking() {
+    let entries: Vec<(String, i32)> = RUN_PGIDS.lock().unwrap().clone();
+    if entries.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        for (_key, pid) in &entries {
+            term_pgid(*pid);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        for (_key, pid) in &entries {
+            kill_pgid_if_alive(*pid);
+        }
+    }
+}
+
+/// 中止当前正在跑的所有 run：向每个已登记的进程组发 SIGTERM（可捕获，让 run_flow/auto_repair
+/// 有机会补记「已中止」日志后退出），整组 python→bash→adb→claude 一起收。多设备并行时每台
+/// 设备一个进程组，全部一起停。没有在跑的 run 返回 false。SIGTERM 发出后台延迟探活，
+/// 对未响应的补发 SIGKILL 兜底，不阻塞本次调用返回。
 #[tauri::command]
 pub fn abort_run() -> Result<bool, String> {
-    let pgid = *RUN_PGID.lock().unwrap();
-    match pgid {
-        Some(pid) => {
-            #[cfg(unix)]
-            {
-                // kill -TERM -<pgid>：负号表示整个进程组
-                let _ = Command::new("kill")
-                    .args(["-TERM", &format!("-{pid}")])
-                    .status();
-                Ok(true)
-            }
-            #[cfg(not(unix))]
-            {
-                let _ = pid;
-                Err("当前平台暂不支持中止".into())
-            }
+    let entries: Vec<(String, i32)> = RUN_PGIDS.lock().unwrap().clone();
+    if entries.is_empty() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    {
+        let pids: Vec<i32> = entries.iter().map(|(_, p)| *p).collect();
+        for pid in &pids {
+            term_pgid(*pid);
         }
-        None => Ok(false),
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            for pid in &pids {
+                kill_pgid_if_alive(*pid);
+            }
+        });
+        Ok(true)
+    }
+    #[cfg(not(unix))]
+    {
+        Err("当前平台暂不支持中止".into())
     }
 }
 
@@ -1251,6 +1401,10 @@ pub fn abort_run() -> Result<bool, String> {
 fn python_cmd(root: &Path, python: &str, args: &[String], slug: Option<&str>) -> Command {
     let mut cmd = Command::new(python);
     cmd.args(args).current_dir(root);
+    // stdout 接的是管道（非 tty），CPython 默认走全缓冲（~8KB）而非行缓冲：auto_repair.py
+    // 里"Claude 接管诊断中…"这类关键播报会一直堆在缓冲区，直到诊断结束（可能卡 1-6 分钟）
+    // 才一次性冒出来，执行台日志区看起来像"卡住不动"。强制无缓冲让每行 print 立即到达管道。
+    cmd.env("PYTHONUNBUFFERED", "1");
     // 注意：这里【不要】注入 LANG/LC_ALL=…UTF-8。中文字段在日志里显示成 ���� 的根因不是
     // 「缺 UTF-8 locale」，恰恰相反——是 macOS 系统 /bin/bash（3.2）在 UTF-8 locale 下处理
     // 「变量紧贴多字节字面量」有多字节 bug。真正的修复是让 flow 的 bash 走字节模式（LC_ALL=C），
@@ -1269,11 +1423,14 @@ pub async fn run_flow(
     script: String,
     serial: String,
     lang_code: Option<String>,
+    follow_device: Option<bool>,
     on_event: Channel<String>,
 ) -> Result<i32, String> {
     let root = root_of(&app)?;
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        // 中止登记键 = serial（设备内串行，同 serial 同时至多一个 run）；无 serial 退回 case_id
+        let track_key = if serial.is_empty() { case_id.clone() } else { serial.clone() };
         let mut args = vec!["tools/run_flow.py".to_string(), case_id, script];
         if !serial.is_empty() {
             args.push(serial);
@@ -1286,7 +1443,14 @@ pub async fn run_flow(
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
             cmd.env("LANG_CODE", lc);
         }
-        stream_child(cmd, on_event, true)
+        // 场景库选了「跟随设备」（不装机，用设备上已装的 App 回归）时注入。注意：run_flow.py/
+        // adbkit.py 现在无条件现查设备真实安装版本（target.json 已不存静态 app_version 字段），
+        // 不再依赖这个环境变量做分支——这里保留注入只是把"这次是跟随设备"的语义透传下去，
+        // 供将来调试/扩展用，当前 Python 侧不读它也不影响正确性。
+        if follow_device.unwrap_or(false) {
+            cmd.env("AITEST_FOLLOW_DEVICE", "1");
+        }
+        stream_child(cmd, on_event, Some(track_key))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1302,31 +1466,43 @@ pub async fn run_flow_repair(
     script: String,
     serial: String,
     lang_code: Option<String>,
+    follow_device: Option<bool>,
     on_event: Channel<String>,
 ) -> Result<i32, String> {
     let root = root_of(&app)?;
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        let track_key = if serial.is_empty() { case_id.clone() } else { serial.clone() };
         let mut args = vec!["tools/auto_repair.py".to_string(), case_id, script];
         if !serial.is_empty() {
             args.push(serial);
         }
         let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        // 设置页选的自愈模型：auto_repair.py 用 os.environ.get("AUTO_REPAIR_MODEL", "claude-sonnet-5")，
+        // 这里显式设置（哪怕是空串="跟随 CLI 默认"）会覆盖它自己的默认值，见该文件顶部注释。
+        cmd.env("AUTO_REPAIR_MODEL", &cfg.claude_model);
         // auto_repair.py 转手调 run_flow.py 时 env=os.environ.copy()，同样会把这里注入的
-        // LANG_CODE 一路透传下去，见 run_flow 里的注释。
+        // LANG_CODE/AITEST_FOLLOW_DEVICE 一路透传下去，见 run_flow 里的注释。
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
             cmd.env("LANG_CODE", lc);
         }
-        stream_child(cmd, on_event, true)
+        if follow_device.unwrap_or(false) {
+            cmd.env("AITEST_FOLLOW_DEVICE", "1");
+        }
+        stream_child(cmd, on_event, Some(track_key))
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
-/// 某 App 的多语言文案表(apps/<slug>/lang/strings_table.json)覆盖了哪些语言代号——供场景库
-/// 「语言」选择器列出可选项；文件不存在（该 App 还没建过语言表）就返回空列表，前端据此隐藏/
-/// 禁用选择器，不报错。"default"(Android 未加 -<locale> 后缀的默认目录，含义因翻译包而异，
-/// 不是一个明确语言代号) 不作为可选项列出。
+/// 某 App 的多语言文案表覆盖了哪些语言代号——供场景库「语言」选择器列出可选项；一张表都还没
+/// 建过就返回空列表，前端据此隐藏/禁用选择器，不报错。"default"(Android 未加 -<locale> 后缀的
+/// 默认目录，不是一个明确语言代号) 不作为可选项列出。
+///
+/// 数据源是 `apps/<slug>/lang/index.json`（各 versionCode 一条，见 docs/decisions.md #55）而不是
+/// 单张表文件：表按被测 apk 的 versionCode 分开存，UI 上要选语言时还没选设备、不知道会跑哪一版，
+/// 所以列的是**所有已建版本的 locale 并集**（locale 集合跨版本几乎不变，真正按版本选表发生在
+/// 执行时的 `lang_table.py ensure`）。读 index 而不是扫 tables/ 里那些 1.4MB 的表，也快得多。
 #[tauri::command]
 pub fn list_lang_locales(app: AppHandle, app_slug: String) -> Result<Vec<String>, String> {
     let root = root_of(&app)?;
@@ -1335,19 +1511,19 @@ pub fn list_lang_locales(app: AppHandle, app_slug: String) -> Result<Vec<String>
 
 /// `list_lang_locales` 与 `resolve_device_lang_code` 共用的实际读表逻辑，抽出来避免重复解析。
 fn available_lang_locales(root: &Path, app_slug: &str) -> Result<Vec<String>, String> {
-    let path = app_root(root, app_slug).join("lang").join("strings_table.json");
+    let path = app_root(root, app_slug).join("lang").join("index.json");
     let txt = match fs::read_to_string(&path) {
         Ok(t) => t,
         Err(_) => return Ok(vec![]),
     };
     let v: Value = serde_json::from_str(&txt).map_err(|e| format!("{path:?} 解析失败：{e}"))?;
     let mut set = std::collections::BTreeSet::new();
-    if let Value::Object(entries) = v {
-        for (_key, locales) in entries {
-            if let Value::Object(m) = locales {
-                for loc in m.keys() {
+    if let Value::Object(versions) = v {
+        for (_code, meta) in versions {
+            if let Some(Value::Array(locales)) = meta.get("locales") {
+                for loc in locales.iter().filter_map(|l| l.as_str()) {
                     if loc != "default" {
-                        set.insert(loc.clone());
+                        set.insert(loc.to_string());
                     }
                 }
             }
@@ -1387,7 +1563,7 @@ fn device_locale_raw(serial: &str) -> String {
     }
 }
 
-/// BCP-47 系统语言（如 "ko-KR"/"zh-Hans-CN"/"id-ID"）→ `strings_table.json` 用的 Android 资源
+/// BCP-47 系统语言（如 "ko-KR"/"zh-Hans-CN"/"id-ID"）→ 语言表用的 Android 资源
 /// 目录代号（如 "ko"/"zh-rCN"/"in"）候选列表，按优先级尝试，第一个在表里实际存在的即采用。
 /// 中文按脚本/地区子标签区分简繁；`id`(现代 BCP-47) 是 Android 历史遗留的 `in` 这类别名单独映射；
 /// 其余语言取主语言子标签（region 一律丢弃，表里都是不带地区的裸语言代号）。
@@ -1407,7 +1583,7 @@ fn candidate_table_codes(raw: &str) -> Vec<String> {
     if lang.is_empty() {
         return vec![];
     }
-    // Android 沿用的历史遗留语言代号（偏离现行 ISO 639-1/BCP-47），strings_table.json 是从
+    // Android 沿用的历史遗留语言代号（偏离现行 ISO 639-1/BCP-47），语言表是从
     // Android values-<locale>/ 目录建的表，键用的就是这套旧代号。
     let legacy = match lang.as_str() {
         "id" => Some("in"),   // 印尼语：BCP-47 现行 id，Android 资源目录历史上一直用 in
@@ -1449,7 +1625,7 @@ pub async fn new_run(app: AppHandle, app_slug: String, on_event: Channel<String>
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let cmd = python_cmd(&root, &cfg.python, &["tools/new_run.py".to_string()], Some(&app_slug));
-        stream_child(cmd, on_event, false)
+        stream_child(cmd, on_event, None)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1464,7 +1640,7 @@ pub async fn sync_sheets(app: AppHandle, app_slug: String, on_event: Channel<Str
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let cmd = python_cmd(&root, &cfg.python, &["tools/sheets_sync.py".to_string()], Some(&app_slug));
-        stream_child(cmd, on_event, false)
+        stream_child(cmd, on_event, None)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1486,6 +1662,7 @@ pub async fn judge_result(
     let root = root_of(&app)?;
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
+        let track_key = if serial.is_empty() { case_id.clone() } else { serial.clone() };
         let mut args = vec!["tools/judge_result.py".to_string(), case_id];
         if !serial.is_empty() {
             args.push(serial);
@@ -1493,7 +1670,7 @@ pub async fn judge_result(
         args.push("--status".to_string());
         args.push(status);
         let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
-        stream_child(cmd, on_event, true)
+        stream_child(cmd, on_event, Some(track_key))
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1521,8 +1698,11 @@ pub async fn register_issue(
         }
         args.push("--status".to_string());
         args.push(status);
-        let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
-        stream_child(cmd, on_event, false)
+        let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        // 与 run_flow_repair 同一个设置项：issue_register.py 用 ISSUE_REGISTER_MODEL 环境变量
+        // （默认 os.environ.get(..., "claude-sonnet-5")），显式设置（含空串）会覆盖其自身默认值。
+        cmd.env("ISSUE_REGISTER_MODEL", &cfg.claude_model);
+        stream_child(cmd, on_event, None)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1536,7 +1716,7 @@ pub async fn doc_report(app: AppHandle, app_slug: String, on_event: Channel<Stri
     let cfg = load_app_config(&app);
     tauri::async_runtime::spawn_blocking(move || {
         let cmd = python_cmd(&root, &cfg.python, &["tools/doc_report.py".to_string()], Some(&app_slug));
-        stream_child(cmd, on_event, false)
+        stream_child(cmd, on_event, None)
     })
     .await
     .map_err(|e| e.to_string())?
@@ -1597,6 +1777,247 @@ pub struct ApkInfo {
     pub version: String,
     pub label: String,
     pub suggested_slug: String,
+}
+
+/// 录制器桥（tools/recorder.py 的 probe/act/export 三个无状态子命令）。
+///
+/// 为什么是"无状态桥"而不是把逻辑搬到 Rust：选择器候选/父锚推导/前后屏 diff/flow 草稿生成全在
+/// recorder.py 里，浏览器版（`recorder.py --serial X serve`）和桌面壳共用同一份实现，避免两处漂移。
+/// 录制过程中的步骤列表由前端（views/Recorder.vue）持有，act 时把上一屏的 labels 回传当 diff 基线，
+/// 所以这里每次调用都是独立进程、无需常驻会话。
+///
+/// 耗时：probe ≈ 1-3s（截图 + UI dump 并行），act ≈ 3-5s（动作 + 等界面稳 + 再探一屏）。前端必须
+/// 上 loading 态，不能让用户以为卡死。
+#[tauri::command]
+pub async fn recorder_cmd(
+    app: AppHandle,
+    app_slug: String,
+    sub: String,
+    serial: String,
+    payload: Option<String>,
+) -> Result<Value, String> {
+    let root = root_of(&app)?;
+    let cfg = load_app_config(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut args = vec![
+            "tools/recorder.py".to_string(),
+            "--serial".to_string(),
+            serial,
+            sub.clone(),
+        ];
+        if let Some(p) = payload {
+            args.push("--json".to_string());
+            args.push(p);
+        }
+        let out = python_cmd(&root, &cfg.python, &args, Some(&app_slug))
+            .output()
+            .map_err(|e| format!("启动 recorder.py 失败：{e}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr);
+            let msg: String = err.lines().rev().take(6).collect::<Vec<_>>().join(" / ");
+            return Err(format!("录制器 {sub} 失败：{}", if msg.is_empty() { "无错误输出".into() } else { msg }));
+        }
+        serde_json::from_slice::<Value>(&out.stdout)
+            .map_err(|e| format!("录制器 {sub} 的输出不是合法 JSON（{e}）：{}",
+                                 String::from_utf8_lossy(&out.stdout).chars().take(200).collect::<String>()))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// 录制器 V2：常驻 daemon 会话（tools/recorder_daemon.py，每设备一进程）
+// ---------------------------------------------------------------------------
+/// 活跃录制会话表。**独立于 RUN_PGIDS**：abort_run 的语义是「停止执行回归」，不该顺手杀掉
+/// 正在录制的会话；但应用退出（kill_all_run_pgids_blocking）要把两张表都收干净。
+struct RecSession {
+    pgid: i32,
+    port: u16,
+    token: String,
+}
+static REC_SESSIONS: Mutex<Vec<(String, RecSession)>> = Mutex::new(Vec::new());
+
+#[derive(Serialize, Clone)]
+pub struct RecSessionInfo {
+    pub port: u16,
+    pub token: String,
+    pub video: bool,
+}
+
+/// 起（或复用）一台设备的录制 daemon，返回前端直连 WS 所需的 {port, token, video}。
+/// daemon 启动成功的判据是 stdout 首行的 JSON（{"port":N,"token":"…","video":bool}）；
+/// 之后它的 stdout/stderr 由后台线程泵到本进程日志。已有同 serial 会话时先 TCP 探活，
+/// 活着直接复用（Recorder.vue 切走切回不重启会话），死了清掉重启。
+#[tauri::command]
+pub async fn recorder_session_start(
+    app: AppHandle,
+    app_slug: String,
+    serial: String,
+) -> Result<RecSessionInfo, String> {
+    let root = root_of(&app)?;
+    let cfg = load_app_config(&app);
+    tauri::async_runtime::spawn_blocking(move || {
+        // 这台设备正跑着回归（RUN_PGIDS 有登记）就拒绝起录制——前端按钮已经按这个置灰，这里是
+        // 兜底防线（比如别的入口没走按钮判断，或状态没同步过来）。回归那边启动时会反过来抢占
+        // 断开录制会话（见 stream_child），两条防线互补，不会出现"同时占用"的中间态。
+        if RUN_PGIDS.lock().unwrap().iter().any(|(k, _)| k == &serial) {
+            return Err("该设备正在跑回归，暂不能录制".to_string());
+        }
+        // 复用探活：端口还接得通就直接还给前端
+        {
+            let mut sessions = REC_SESSIONS.lock().unwrap();
+            if let Some((_, s)) = sessions.iter().find(|(k, _)| k == &serial) {
+                let addr = std::net::SocketAddr::from(([127, 0, 0, 1], s.port));
+                if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(500)).is_ok() {
+                    return Ok(RecSessionInfo { port: s.port, token: s.token.clone(), video: false });
+                }
+                let dead: Vec<i32> = sessions.iter().filter(|(k, _)| k == &serial).map(|(_, s)| s.pgid).collect();
+                #[cfg(unix)]
+                for p in dead {
+                    term_pgid(p);
+                }
+                sessions.retain(|(k, _)| k != &serial);
+            }
+        }
+        let args = vec![
+            "tools/recorder_daemon.py".to_string(),
+            "--serial".to_string(),
+            serial.clone(),
+            "--parent-pid".to_string(),
+            std::process::id().to_string(),
+        ];
+        let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0); // daemon 及其子进程（scrcpy 等）一组，收尾一网打尽
+        }
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::null()) // adb exec-out 会转发 stdin，GUI 进程的 stdin 是无效 fd（见 gotchas）
+            .spawn()
+            .map_err(|e| format!("启动 recorder_daemon 失败：{e}"))?;
+        let pgid = child.id() as i32;
+
+        // 读首行 JSON（15s 上限：python 冷启 + import ~1s，留足慢机余量）。放线程里读、主线程等，
+        // 避免 daemon 起不来时 read_line 永久阻塞。
+        let mut stdout = child.stdout.take().ok_or("拿不到 daemon stdout")?;
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let h = std::thread::spawn(move || {
+            let mut reader = BufReader::new(&mut stdout);
+            let mut line = String::new();
+            use std::io::BufRead;
+            let _ = reader.read_line(&mut line);
+            let _ = tx.send(line);
+            // 首行之后继续把 stdout 泵到日志（不能 drop 读端：daemon 写满管道缓冲会被 SIGPIPE）
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => eprintln!("[rec-daemon] {}", String::from_utf8_lossy(&buf).trim_end()),
+                }
+            }
+        });
+        let stderr = child.stderr.take();
+        std::thread::spawn(move || {
+            if let Some(err) = stderr {
+                let mut reader = BufReader::new(err);
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match reader.read_until(b'\n', &mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => eprintln!("[rec-daemon!] {}", String::from_utf8_lossy(&buf).trim_end()),
+                    }
+                }
+            }
+        });
+        let line = rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .map_err(|_| {
+                #[cfg(unix)]
+                term_pgid(pgid);
+                "recorder_daemon 15s 内没有输出启动信息（python 环境缺 websockets？看终端 [rec-daemon!] 日志）".to_string()
+            })?;
+        drop(h); // 泵线程自生自灭，跟随子进程 EOF 退出
+        let v: Value = serde_json::from_str(line.trim())
+            .map_err(|e| {
+                #[cfg(unix)]
+                term_pgid(pgid);
+                format!("daemon 首行不是合法 JSON（{e}）：{}", line.trim())
+            })?;
+        let port = v["port"].as_u64().unwrap_or(0) as u16;
+        let token = v["token"].as_str().unwrap_or("").to_string();
+        let video = v["video"].as_bool().unwrap_or(false);
+        if port == 0 || token.is_empty() {
+            #[cfg(unix)]
+            term_pgid(pgid);
+            return Err(format!("daemon 启动信息缺 port/token：{}", line.trim()));
+        }
+        REC_SESSIONS.lock().unwrap().push((
+            serial,
+            RecSession { pgid, port, token: token.clone() },
+        ));
+        Ok(RecSessionInfo { port, token, video })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// 停一台设备的录制会话（内部共用）：从 REC_SESSIONS 摘除 + SIGTERM 进程组（daemon 有 signal
+/// handler 做清理），2s 后 SIGKILL 兜底。给 #[tauri::command] 版本和 stream_child 的抢占逻辑共用。
+fn stop_recorder_session_internal(serial: &str) {
+    let pgids: Vec<i32> = {
+        let mut sessions = REC_SESSIONS.lock().unwrap();
+        let out = sessions.iter().filter(|(k, _)| k == serial).map(|(_, s)| s.pgid).collect();
+        sessions.retain(|(k, _)| k != serial);
+        out
+    };
+    #[cfg(unix)]
+    {
+        for p in &pgids {
+            term_pgid(*p);
+        }
+        let pids = pgids.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            for p in &pids {
+                kill_pgid_if_alive(*p);
+            }
+        });
+    }
+}
+
+/// 停掉一台设备的录制会话（前端「停止录制」按钮调）。
+#[tauri::command]
+pub fn recorder_session_stop(serial: String) -> Result<(), String> {
+    stop_recorder_session_internal(&serial);
+    Ok(())
+}
+
+/// 应用退出兜底的录制会话部分（由 kill_all_run_pgids_blocking 调）。
+pub fn kill_all_rec_sessions_blocking() {
+    let entries: Vec<i32> = REC_SESSIONS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, s)| s.pgid)
+        .collect();
+    if entries.is_empty() {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        for p in &entries {
+            term_pgid(*p);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        for p in &entries {
+            kill_pgid_if_alive(*p);
+        }
+    }
 }
 
 /// 本地解析 APK（不碰设备）：aapt dump badging 抠 package/versionName/application-label。
@@ -1696,6 +2117,19 @@ pub fn save_apk_version(app: AppHandle, slug: String, src_path: String, version:
     Ok(dest.to_string_lossy().to_string())
 }
 
+/// 从留存版本列表移出一个 APK 文件（App 库版本树的「删除」按钮）。硬删，不进回收站——
+/// 这只是本地缓存的安装包，随时能重新上传，不是像 removeApp 那样连用例/账本一起挪走的场景。
+/// 版本号按 save_apk_version 同一套 sanitize_version 拼文件名，不接收前端传来的路径，避免删错目录。
+#[tauri::command]
+pub fn delete_apk_version(app: AppHandle, slug: String, version: String) -> Result<(), String> {
+    let root = root_of(&app)?;
+    let path = apks_dir(&root, &slug).join(format!("{}.apk", sanitize_version(&version)));
+    if !path.exists() {
+        return Err(format!("版本文件不存在：{}", path.display()));
+    }
+    fs::remove_file(&path).map_err(|e| format!("删除失败：{e}"))
+}
+
 // ---------------------------------------------------------------------------
 // Claude CLI 状态（「Claude」自愈功能依赖本机已装 + 已登录的 claude CLI）
 // 登录判定只查凭据是否存在（macOS keychain 元数据 / 其他平台凭据文件），不读密钥值
@@ -1713,6 +2147,36 @@ pub struct ClaudeCliStatus {
     pub display_name: String,
     pub org_name: String,
     pub subscription: String, // 徽章文案（大写）：TEAM / MAX / PRO / ""
+}
+
+/// 从 Finder/Launchpad 双击启动的 GUI app（launchd 拉起），PATH 是系统最小 PATH，不会
+/// 加载 ~/.zshrc 等 shell rc 文件——所以 dmg 装的 app 里 `adb`/`aapt` 全部找不到，只有从
+/// 终端跑 start.command（走 login shell）才带得上用户自己配的 PATH。这里在进程启动时把
+/// 常见安装位置一次性补进 PATH：Command::new("adb") 直接继承，起的 python 子进程再调
+/// adb/aapt 也一并受益（子进程默认继承父进程环境，见 lib.rs::run 调用点）。
+pub fn fix_gui_app_path() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let mut extra: Vec<String> = vec![
+        format!("{home}/Library/Android/sdk/platform-tools"),
+        format!("{home}/Library/Android/sdk/tools"),
+        format!("{home}/.local/bin"),
+        "/opt/homebrew/bin".to_string(),
+        "/opt/homebrew/sbin".to_string(),
+        "/usr/local/bin".to_string(),
+    ];
+    for var in ["ANDROID_HOME", "ANDROID_SDK_ROOT"] {
+        if let Ok(sdk) = std::env::var(var) {
+            extra.push(format!("{sdk}/platform-tools"));
+        }
+    }
+    let existing = std::env::var("PATH").unwrap_or_default();
+    let mut dirs: Vec<String> = existing.split(':').map(|s| s.to_string()).collect();
+    for dir in extra {
+        if !dir.is_empty() && Path::new(&dir).is_dir() && !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    std::env::set_var("PATH", dirs.join(":"));
 }
 
 /// 找 claude 可执行文件：GUI app 的 PATH 常不含用户 shell 里的目录，先显式查常见安装位置，
@@ -1894,7 +2358,7 @@ pub async fn register_app(
             args.push(serial);
         }
         let cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
-        let code = stream_child(cmd, on_event.clone(), false)?;
+        let code = stream_child(cmd, on_event.clone(), None)?;
         if code != 0 {
             return Ok(code);
         }
@@ -2272,3 +2736,4 @@ pub fn move_to_trash(app: AppHandle, rel_paths: Vec<String>) -> Result<CleanupRe
 
     Ok(CleanupResult { removed, freed, errors })
 }
+

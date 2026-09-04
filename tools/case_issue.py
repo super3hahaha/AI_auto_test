@@ -40,12 +40,13 @@ upsert 语义（按问题ID）：
 """
 import csv, re, sys, argparse, datetime
 
-from _appctx import LEDGER  # 多 App 路径解析
+from _appctx import LEDGER, ledger_lock  # 多 App 路径解析
+import exec_ledger
 
 ISSUES = LEDGER / "issues.csv"
 EVID = LEDGER / "evidence.csv"
 HEADER = ["问题ID", "用例ID", "严重级别", "标题", "预期结果", "实际结果",
-          "复现步骤", "证据链接", "状态", "负责人备注"]
+          "复现步骤", "证据链接", "状态", "负责人备注", exec_ledger.DEVICE_COL]
 ID_RE = re.compile(r"^(BUG|BLOCK|GAP|RISK)-[A-Za-z0-9._-]+$")
 
 
@@ -56,28 +57,29 @@ def mark_key_evidence(case_id, file_path):
     if not EVID.exists():
         print(f"[case_issue] 警告：evidence.csv 不存在，跳过标关键（{file_path}）")
         return
-    rows = list(csv.reader(open(EVID, encoding="utf-8")))
-    if not rows:
-        print(f"[case_issue] 警告：evidence.csv 为空，跳过标关键（{file_path}）")
-        return
-    eh = rows[0]
-    try:
-        i_case, i_file, i_preview = eh.index("用例ID"), eh.index("文件/链接"), eh.index("截图预览")
-    except ValueError:
-        print("[case_issue] 警告：evidence.csv 表头缺列，跳过标关键")
-        return
-    hit = None
-    for r in reversed(rows[1:]):
-        if len(r) > max(i_case, i_file, i_preview) and r[i_case] == case_id and r[i_file] == file_path:
-            hit = r
-            break
-    if not hit:
-        print(f"[case_issue] 警告：evidence.csv 未找到匹配行（用例 {case_id} · {file_path}），跳过标关键；"
-              f"问题本身仍已登记，需人工核对路径是否与「文件/链接」列一致")
-        return
-    hit[i_preview] = "关键，供报告用"
-    with open(EVID, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows)
+    with ledger_lock():
+        rows = list(csv.reader(open(EVID, encoding="utf-8")))
+        if not rows:
+            print(f"[case_issue] 警告：evidence.csv 为空，跳过标关键（{file_path}）")
+            return
+        eh = rows[0]
+        try:
+            i_case, i_file, i_preview = eh.index("用例ID"), eh.index("文件/链接"), eh.index("截图预览")
+        except ValueError:
+            print("[case_issue] 警告：evidence.csv 表头缺列，跳过标关键")
+            return
+        hit = None
+        for r in reversed(rows[1:]):
+            if len(r) > max(i_case, i_file, i_preview) and r[i_case] == case_id and r[i_file] == file_path:
+                hit = r
+                break
+        if not hit:
+            print(f"[case_issue] 警告：evidence.csv 未找到匹配行（用例 {case_id} · {file_path}），跳过标关键；"
+                  f"问题本身仍已登记，需人工核对路径是否与「文件/链接」列一致")
+            return
+        hit[i_preview] = "关键，供报告用"
+        with open(EVID, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerows(rows)
     print(f"[case_issue] 已把证据 {file_path} 标为「关键，供报告用」")
 
 
@@ -94,6 +96,7 @@ def main():
     ap.add_argument("--status", default="待确认")
     ap.add_argument("--owner-note", default="")
     ap.add_argument("--key-evidence", default="", help="要标「关键」的证据文件相对仓库根路径（可选）")
+    ap.add_argument("--serial", default="", help="复现该问题的执行设备 serial（多设备并行时标明哪台复现）")
     a = ap.parse_args()
 
     if not ID_RE.match(a.issue_id):
@@ -102,49 +105,56 @@ def main():
 
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    # ledger/ 不进 git，fresh clone / 新 App 首登时文件可能不存在——补表头
-    if not ISSUES.exists():
-        ISSUES.parent.mkdir(parents=True, exist_ok=True)
+    with ledger_lock():  # 整段 read-modify-write 持锁（多设备并行/CLI 手动并行安全）
+        # ledger/ 不进 git，fresh clone / 新 App 首登时文件可能不存在——补表头。
+        # 建表头也要在锁内：exists 判断到写入之间若被并行写者插入数据行，锁外 truncate 会丢行
+        if not ISSUES.exists():
+            with open(ISSUES, "w", newline="", encoding="utf-8") as f:
+                csv.writer(f).writerow(HEADER)
+        exec_ledger.ensure_device_column(ISSUES)  # 旧账本补「执行设备」列（行尾）
+        rows = list(csv.reader(open(ISSUES, encoding="utf-8")))
+        if not rows:
+            rows = [list(HEADER)]
+        h = rows[0]
+        ix = {c: h.index(c) for c in HEADER if c in h}
+
+        def col(row, name):
+            i = ix.get(name)
+            return row[i] if (i is not None and i < len(row)) else ""
+
+        new_row = {
+            "问题ID": a.issue_id, "用例ID": a.case_id, "严重级别": a.severity,
+            "标题": a.title, "预期结果": a.expected, "实际结果": a.actual,
+            "复现步骤": a.repro, "证据链接": a.evidence, "状态": a.status,
+            "负责人备注": a.owner_note, exec_ledger.DEVICE_COL: a.serial,
+        }
+
+        updated = False
+        for r in rows[1:]:
+            while len(r) < len(h):
+                r.append("")
+            if col(r, "问题ID") == a.issue_id:
+                old_note = col(r, "负责人备注")
+                merged_note = new_row["负责人备注"] or old_note
+                # 复跑再次命中同一问题：保留原备注，尾部追加一条复现痕迹，不覆盖历史说明
+                merged_note = (merged_note + f"｜{now} 复跑再次复现").lstrip("｜")
+                # 同一问题在另一台设备也复现：设备列合并成逗号清单，不丢已有设备
+                old_devs = [d for d in col(r, exec_ledger.DEVICE_COL).split(",") if d]
+                if a.serial and a.serial not in old_devs:
+                    old_devs.append(a.serial)
+                for name in HEADER:
+                    if name in ix:
+                        r[ix[name]] = (merged_note if name == "负责人备注"
+                                       else ",".join(old_devs) if name == exec_ledger.DEVICE_COL
+                                       else new_row[name])
+                updated = True
+                break
+
+        if not updated:
+            rows.append([new_row.get(c, "") for c in h])
+
         with open(ISSUES, "w", newline="", encoding="utf-8") as f:
-            csv.writer(f).writerow(HEADER)
-
-    rows = list(csv.reader(open(ISSUES, encoding="utf-8")))
-    if not rows:
-        rows = [HEADER]
-    h = rows[0]
-    ix = {c: h.index(c) for c in HEADER if c in h}
-
-    def col(row, name):
-        i = ix.get(name)
-        return row[i] if (i is not None and i < len(row)) else ""
-
-    new_row = {
-        "问题ID": a.issue_id, "用例ID": a.case_id, "严重级别": a.severity,
-        "标题": a.title, "预期结果": a.expected, "实际结果": a.actual,
-        "复现步骤": a.repro, "证据链接": a.evidence, "状态": a.status,
-        "负责人备注": a.owner_note,
-    }
-
-    updated = False
-    for r in rows[1:]:
-        while len(r) < len(h):
-            r.append("")
-        if col(r, "问题ID") == a.issue_id:
-            old_note = col(r, "负责人备注")
-            merged_note = new_row["负责人备注"] or old_note
-            # 复跑再次命中同一问题：保留原备注，尾部追加一条复现痕迹，不覆盖历史说明
-            merged_note = (merged_note + f"｜{now} 复跑再次复现").lstrip("｜")
-            for name in HEADER:
-                if name in ix:
-                    r[ix[name]] = merged_note if name == "负责人备注" else new_row[name]
-            updated = True
-            break
-
-    if not updated:
-        rows.append([new_row.get(c, "") for c in h])
-
-    with open(ISSUES, "w", newline="", encoding="utf-8") as f:
-        csv.writer(f).writerows(rows)
+            csv.writer(f).writerows(rows)
 
     verb = "更新" if updated else "新增"
     print(f"[case_issue] {verb} 问题 {a.issue_id}（用例 {a.case_id} · {a.severity} · 状态 {a.status}）→ {ISSUES.name}")

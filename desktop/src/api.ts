@@ -7,15 +7,14 @@ import type { RunRecord, RunRecordMeta } from "./runStore";
 export interface AppConfig {
   project_root: string;
   python: string;
+  claude_model: string; // "脚本自愈"调 claude 用的模型；"" = 跟随 claude CLI 自身默认
   configured: boolean;
 }
 export interface AppInfo {
   slug: string;
   app_name: string;
   package: string;
-  app_version: string;
   sheet_id: string;
-  serial: string;
   updated_at: number;
 }
 export interface ApkInfo {
@@ -73,12 +72,60 @@ export interface DeviceRow {
   state: string;
   model: string;
   alias: string;
-  is_default: boolean;
   os_version: string;
 }
 export interface KV {
   key: string;
   value: string;
+}
+// ── 录制器（tools/recorder.py 的 JSON 契约，改一边要改两边）──
+export interface RecSel {
+  by: "id" | "text" | "desc";
+  v: string;
+  n: number; // 该选择器在全树的匹配数：>1 就是歧义，得配 idx
+  idx: number; // 本节点在该选择器所有匹配中的序号（= adbkit 的 --index）
+}
+export interface RecNode {
+  i: number;
+  b: [number, number, number, number]; // 设备物理像素 [l,t,r,b]
+  c: [number, number]; // 中心点
+  cls: string;
+  clk: boolean;
+  id: string;
+  text: string;
+  desc: string;
+  sels: RecSel[]; // 已排序：唯一的排前，同等唯一性下 id > text > desc
+  anc: { by: string; v: string; child: string } | null; // 自身无选择器时的父锚 + --child 路径
+}
+export interface RecScreen {
+  w: number; // ⚠️ 节点 bounds 的**包围盒**，不是屏幕尺寸：前台是对话框时只有对话框那么大。
+  h: number; //    画控件框绝不能用它当基准（会把框整体放大），要用 shot_w/shot_h
+  shot_w: number; // 截图真实像素（后端从 PNG IHDR 读），控件框定位的唯一正确基准
+  shot_h: number;
+  count: number;
+  png: string; // base64；为空说明截图失败，原因在 png_err（控件树仍可用，只是看不到画面）
+  png_err: string;
+  nodes: RecNode[];
+  labels: string[]; // 本屏可见文案（已去广告噪声）；下一步 act 回传当 diff 基线
+  backend: string; // 实际用的 dump 后端：u2 约 7× 于 shell；退回 shell 时用户该知道为什么变慢
+  auto_swept: number; // 本次探屏顺带自动清掉的广告全屏页个数（0=没遇到），见 recorder.py probe()
+}
+export interface RecStep {
+  n: number;
+  kind: string;
+  label: string;
+  cmd: string[] | null; // 录制当下实际执行的 adbkit 调用（用实时坐标）
+  script: string[]; // 这一步落进固化脚本时的样子：滑动/无选择器点击都是 bounds 现算，不含硬坐标
+  diff: { appeared: string[]; disappeared: string[] };
+  out?: string;
+  auto_swept?: number; // 这一步执行后顺带自动清掉的广告全屏页个数
+  warn?: string;
+  needs_attention?: string;
+  child_anchor?: { by: string; v: string; child: string };
+  anchor?: { sel: RecSel; rx: number; ry: number }; // rx/ry 是相对锚控件 bounds 的**千分比**，可超出 0~1000
+  anchor_to?: { sel: RecSel; rx: number; ry: number };
+  straightened?: string; // 次方向手抖被对齐过的说明（工具动过什么要明示）
+  note?: string; // 用户手写的步骤备注（如"检查点"），导出脚本时落成这一步前的 # 注释
 }
 export interface StructureRow {
   module: string;
@@ -120,6 +167,17 @@ export interface CleanupResult {
   freed: number;
   errors: string[];
 }
+export interface UpdateInfo {
+  version: string;
+  asset_name: string;
+  asset_url: string;
+  asset_size: number;
+  body: string;
+}
+export interface DownloadProgress {
+  downloaded: number;
+  total: number;
+}
 export interface ClaudeCliStatus {
   installed: boolean;
   path: string;
@@ -135,8 +193,8 @@ export interface ClaudeCliStatus {
 export const api = {
   // app 自身配置（项目根 + python）——与被测 App 无关
   getAppConfig: () => invoke<AppConfig>("get_app_config"),
-  setAppConfig: (project_root: string, python: string) =>
-    invoke<AppConfig>("set_app_config", { projectRoot: project_root, python }),
+  setAppConfig: (project_root: string, python: string, claude_model?: string) =>
+    invoke<AppConfig>("set_app_config", { projectRoot: project_root, python, claudeModel: claude_model }),
 
   // App 注册表 / 活跃 App
   listApps: () => invoke<AppInfo[]>("list_apps"),
@@ -152,13 +210,49 @@ export const api = {
     invoke<EvidenceRow[]>("read_evidence", { appSlug: slug, runId }),
   readTextFile: (relPath: string) => invoke<string>("read_text_file", { relPath }),
   listFlows: (slug: string) => invoke<FlowRow[]>("list_flows", { appSlug: slug }),
-  listDevices: (slug: string) => invoke<DeviceRow[]>("list_devices", { appSlug: slug }),
+  // force=true 才无条件重查安卓版本号（每台一次 adb getprop，无线设备 85~300ms）。默认走缓存优先，
+  // 供执行台这类「顺带刷新」的高频调用方用；设备页的显式「刷新」按钮传 true。
+  listDevices: (slug: string, force = false) =>
+    invoke<DeviceRow[]>("list_devices", { appSlug: slug, force }),
+  // ── 录制器 V2：常驻 daemon 会话（每设备一进程；前端拿 {port,token} 后直连 WS）──
+  // start 幂等：同 serial 已有活会话直接复用；stop 用于切设备/切 App 时收尾
+  recSessionStart: (slug: string, serial: string) =>
+    invoke<{ port: number; token: string; video: boolean }>("recorder_session_start", {
+      appSlug: slug, serial,
+    }),
+  recSessionStop: (serial: string) => invoke<void>("recorder_session_stop", { serial }),
+
+  // 查设备当前前台包名 → 反查是不是仓库里另一个已注册的 App；录制器点「开始/重新探屏」时调一次，
+  // 核对左栏选中的 App 目录跟手机上真实在跑的 App 是不是同一个，不是就由前端自动切（见 decisions.md）
+  recDetectApp: (slug: string, serial: string) =>
+    invoke<{ pkg: string | null; slug: string | null }>("recorder_cmd", {
+      appSlug: slug, sub: "detect_app", serial,
+    }),
+
+  // ── 录制器 legacy：三个无状态子命令（daemon 起不来时的降级链路），步骤列表由 Recorder.vue 持有 ──
+  // probe ≈ 1-3s，act ≈ 3-5s，调用方必须上 loading
+  recProbe: (slug: string, serial: string, autoSweep = true) =>
+    invoke<RecScreen>("recorder_cmd", {
+      appSlug: slug, sub: "probe", serial, payload: JSON.stringify({ auto_sweep: autoSweep }),
+    }),
+  recAct: (slug: string, serial: string, body: Record<string, unknown>) =>
+    invoke<{ step: RecStep; screen: RecScreen }>("recorder_cmd", {
+      appSlug: slug, sub: "act", serial, payload: JSON.stringify(body),
+    }),
+  recExport: (slug: string, serial: string, caseId: string, steps: RecStep[]) =>
+    invoke<{ dir: string; rec: string; flow: string; steps: number; shots: number }>("recorder_cmd", {
+      appSlug: slug, sub: "export", serial, payload: JSON.stringify({ case: caseId, steps }),
+    }),
+
   // 序列号→别名映射（纯读 config/device_aliases.json，不依赖设备在线）；证据按设备分组显示友好名用
   readDeviceAliases: () => invoke<KV[]>("read_device_aliases"),
-  setTargetSerial: (slug: string, serial: string) =>
-    invoke<void>("set_target_serial", { appSlug: slug, serial }),
+  // 序列号/ip:port→型号缓存（纯读 config/device_info_cache.json）；没有别名登记时兜底显示型号，
+  // 避免无线设备（serial 形如 192.168.x.x:5555）直接露出 ip:port
+  readDeviceModelCache: () => invoke<KV[]>("read_device_model_cache"),
   setTargetScope: (slug: string, scope: string) =>
     invoke<void>("set_target_scope", { appSlug: slug, scope }),
+  setTargetDumpBackend: (slug: string, dumpBackend: string) =>
+    invoke<void>("set_target_dump_backend", { appSlug: slug, dumpBackend }),
   readSummary: (slug: string) => invoke<KV[]>("read_summary", { appSlug: slug }),
   readStructure: (slug: string) => invoke<StructureRow[]>("read_structure", { appSlug: slug }),
 
@@ -189,20 +283,33 @@ export const api = {
   // Claude CLI 安装/登录状态（「脚本自愈」功能依赖它）
   checkClaudeCli: () => invoke<ClaudeCliStatus>("check_claude_cli"),
 
+  // 检测更新：查本仓库 GitHub Releases 最新 tag，有更新返回 UpdateInfo，已是最新返回 null
+  checkUpdate: () => invoke<UpdateInfo | null>("check_update"),
+  // 下载安装包到临时目录，onProgress 收下载进度，resolve 本地文件路径
+  downloadUpdate(url: string, assetName: string, onProgress: (p: DownloadProgress) => void) {
+    const ch = new Channel<DownloadProgress>();
+    ch.onmessage = onProgress;
+    return invoke<string>("download_update", { url, assetName, onProgress: ch });
+  },
+  // 静默安装并重启 app（mac 覆盖 /Applications 下的包，win 走 nsis /S）；调用后当前进程会退出
+  applyUpdate: (savePath: string) => invoke<void>("apply_update", { savePath }),
+
   // 流式：返回 promise（resolve 退出码）；onLine 收每行日志。langCode 不传/空串=不注入
-  // LANG_CODE，固化脚本里的 t() 走原文直通（未接过语言机制的脚本行为不变）。
-  runFlow(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, onLine: (line: string) => void) {
+  // LANG_CODE，固化脚本里的 t() 走原文直通（未接过语言机制的脚本行为不变）。followDevice=true
+  // 时给子进程注入 AITEST_FOLLOW_DEVICE=1（当前 run_flow.py/adbkit.py 无条件现查真实安装版本，
+  // 不再依赖这个变量分支，仅保留把"跟随设备"语义透传下去）。
+  runFlow(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, followDevice: boolean, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;
-    return invoke<number>("run_flow", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, onEvent: ch });
+    return invoke<number>("run_flow", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, followDevice, onEvent: ch });
   },
   // 「脚本自愈」执行（失败自动交 claude 诊断+改脚本重跑，至多 3 次）
-  runFlowRepair(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, onLine: (line: string) => void) {
+  runFlowRepair(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, followDevice: boolean, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;
-    return invoke<number>("run_flow_repair", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, onEvent: ch });
+    return invoke<number>("run_flow_repair", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, followDevice, onEvent: ch });
   },
-  // 某 App 的多语言文案表覆盖了哪些语言代号（apps/<slug>/lang/strings_table.json）；
+  // 某 App 的多语言文案表覆盖了哪些语言代号（读 apps/<slug>/lang/index.json 各版本的并集）；
   // 该 App 还没建过语言表则返回空数组，场景库据此隐藏语言选择器。
   listLangLocales: (slug: string) => invoke<string[]>("list_lang_locales", { appSlug: slug }),
   // 语言选「自动」时，执行前逐台设备现查一次系统当前语言并换算成表里的代号；raw=adb 读到的
@@ -278,6 +385,8 @@ export const api = {
   listApkVersions: (slug: string) => invoke<ApkVersionInfo[]>("list_apk_versions", { slug }),
   saveApkVersion: (slug: string, srcPath: string, version: string) =>
     invoke<string>("save_apk_version", { slug, srcPath, version }),
+  deleteApkVersion: (slug: string, version: string) =>
+    invoke<void>("delete_apk_version", { slug, version }),
 
   // 执行记录：完整跑完（未中止）的一轮执行台快照持久化（apps/<slug>/ledger/run_records/）
   saveRunRecord: (slug: string, record: RunRecord) =>

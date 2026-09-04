@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { ref, onMounted, watch } from "vue";
+import { confirm } from "@tauri-apps/plugin-dialog";
 import { api, type DeviceRow } from "../api";
 import { store } from "../store";
 
@@ -8,11 +9,13 @@ const loading = ref(false);
 const err = ref("");
 const msg = ref("");
 
-async function load() {
+// 「刷新」按钮传 force=true：无条件重查安卓版本号，刷过系统的设备靠这条路更正缓存里的旧值。
+// 进页面/改完别名后的重载不 force（那些场景版本号不可能变，没必要每台等一次 adb getprop）。
+async function load(force = false) {
   loading.value = true;
   err.value = "";
   try {
-    devices.value = await api.listDevices(store.activeSlug);
+    devices.value = await api.listDevices(store.activeSlug, force);
   } catch (e: any) {
     err.value = String(e);
   } finally {
@@ -33,17 +36,6 @@ function statePill(state: string) {
   if (state === "device") return "pill-success";
   if (state === "absent") return "pill-muted";
   return "pill-warning";
-}
-
-async function setDefault(serial: string) {
-  msg.value = "";
-  try {
-    await api.setTargetSerial(store.activeSlug, serial);
-    msg.value = `已设为默认目标设备（写入 ${store.activeSlug} 的 target.serial）：${serial}`;
-    await load();
-  } catch (e: any) {
-    err.value = String(e);
-  }
 }
 
 // 别名编辑（增/改）
@@ -70,7 +62,11 @@ async function saveEdit(serial: string) {
 
 // 删除别名登记（不影响物理设备连接，只是这台设备从「已知设备」里移除/清空别名）
 async function removeDevice(d: DeviceRow) {
-  if (!confirm(`确认删除设备登记 ${d.alias || d.serial}？\n仅清除别名登记，不影响设备物理连接。`)) return;
+  const ok = await confirm(`仅清除别名登记，不影响设备物理连接。`, {
+    title: `确认删除设备登记 ${d.alias || d.serial}？`,
+    kind: "warning",
+  });
+  if (!ok) return;
   try {
     await api.deleteDeviceAlias(d.serial);
     msg.value = `已删除设备登记：${d.serial}`;
@@ -127,20 +123,21 @@ async function importDevices() {
   }
 }
 
-watch(() => store.activeSlug, load);
-onMounted(load);
+// 都要写成显式 arrow：直接传 load 会把 watch 的 newValue / 事件对象当成 force 实参
+watch(() => store.activeSlug, () => load());
+onMounted(() => load());
 </script>
 
 <template>
   <div>
     <div class="hd">
       <h2>设备</h2>
-      <button @click="load">刷新</button>
+      <button @click="load(true)">刷新</button>
       <button @click="showAdd = !showAdd">{{ showAdd ? "取消添加" : "添加设备" }}</button>
       <button @click="exportDevices">导出</button>
       <button @click="importDevices">导入</button>
     </div>
-    <p class="muted">选一台设为默认目标（写回当前 App 的 <span class="mono">target.serial</span>），执行台与主循环默认用它。别名登记存在 <span class="mono">config/device_aliases.json</span>，跨 App 共享。</p>
+    <p class="muted">执行台里逐次显式指定要跑的设备，这里只管理设备别名登记。别名登记存在 <span class="mono">config/device_aliases.json</span>，跨 App 共享。</p>
 
     <div v-if="showAdd" class="card add-form">
       <input v-model="newSerial" placeholder="序列号（adb devices 可查）" class="mono" />
@@ -180,8 +177,6 @@ onMounted(load);
           <td>{{ d.model || "—" }}</td>
           <td>{{ d.os_version ? `Android ${d.os_version}` : "—" }}</td>
           <td class="right">
-            <span v-if="d.is_default" class="pill pill-accent">当前默认</span>
-            <button v-else-if="d.state === 'device'" @click="setDefault(d.serial)">设为默认</button>
             <button class="mini danger" @click="removeDevice(d)">删除</button>
           </td>
         </tr>

@@ -3,7 +3,7 @@ import { ref, reactive, computed, onMounted, onActivated, watch } from "vue";
 import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { api, type FlowRow, type DeviceRow, type ApkInfo, type ApkVersionInfo } from "../api";
 import { store } from "../store";
-import { runStore, AUTO_LANG } from "../runStore";
+import { runStore, AUTO_LANG, type RerunPlan } from "../runStore";
 import RunMonitor from "./RunMonitor.vue";
 import RunHistory from "./RunHistory.vue";
 
@@ -16,15 +16,24 @@ const subTab = ref<"library" | "monitor" | "history">("library");
 // 切到「执行记录」子 tab 时刷新列表（Runner 被 keep-alive 保活，子 tab 用 v-show 不会触发子组件生命周期）
 const historyRef = ref<InstanceType<typeof RunHistory> | null>(null);
 watch(subTab, (v) => { if (v === "history") historyRef.value?.reload(); });
+// 执行台看板常驻挂载，别名/型号缓存靠 loadDevices() 主动催更新（见 loadDevices 内注释）
+const monitorRef = ref<InstanceType<typeof RunMonitor> | null>(null);
 
 // ── 中栏：当前 App 的用例/固化脚本 ──
 const flows = ref<FlowRow[]>([]);
 const pickedCases = ref<string[]>([]); // 勾选的固化用例 case_id
 
-// ── 左栏：语言选择（LANG_CODE，显式指定，不做设备语言自动探测——见 2026-07-27 讨论）──
-// 空串 = 不注入 LANG_CODE，固化脚本里的 t() 走原文直通，跟接入语言机制前完全一样。
-// 可选项来自该 App 的 apps/<slug>/lang/strings_table.json 实际覆盖的语言代号，没建过表的
-// App 这里是空列表，选择器隐藏（不强迫每个 App 都配语言）。
+// ── 左栏：语言选择（LANG_CODE）──
+// 只给三档：自动 / 简体中文 / 英语。语言表现在是从 apk 直接建的，覆盖 98 个 locale（见
+// docs/decisions.md #55），全列出来下拉根本没法用，而实际回归只跑这三档。要临时跑别的语言
+// 走命令行：`LANG_CODE=ja bash apps/<slug>/flows/flow_xxx.sh <serial>`。
+//
+// 原来那档「跟随脚本原文」（空串 = 不注入 LANG_CODE）一并去掉：绝大多数固化脚本的 SRC_LANG
+// 就是 zh-rCN，选「简体中文」时 LANG_CODE == SRC_LANG，t() 原样直通、不查表，跟不注入完全等价。
+// （少数 `export SRC_LANG=en` 的脚本选中文会真去查表把英文原文换成中文——那正是期望行为。）
+//
+// 三档仍受「该 App 表里到底有没有这个语言」约束：表里没有 zh-rCN/en 的 App 不显示对应那项，
+// 避免给出一个选了必然查不到的选项。一张表都没建过的 App 整张卡片隐藏。
 const LANG_LABELS: Record<string, string> = {
   "zh-rCN": "简体中文", "zh-rTW": "繁体中文", en: "英语", ja: "日语", ko: "韩语",
   fr: "法语", de: "德语", es: "西班牙语", it: "意大利语", pt: "葡萄牙语", ru: "俄语",
@@ -35,31 +44,115 @@ function langLabel(code: string) {
   if (code === AUTO_LANG) return "自动（跟随设备当前系统语言）";
   return LANG_LABELS[code] ? `${LANG_LABELS[code]}（${code}）` : code;
 }
+// 下拉实际提供的语言档（AUTO 之外）。想加档改这里，不用动后端——后端 listLangLocales 仍返回
+// 表里全部 locale，这里只是挑要暴露的几个。
+const LANG_CHOICES = ["zh-rCN", "en"] as const;
 const langLocales = ref<string[]>([]);
+// 表里真有的那几档才给选
+const langOptions = computed(() => LANG_CHOICES.filter((c) => langLocales.value.includes(c)));
 const langCodeBySlug = reactive<Record<string, string>>({}); // slug -> 上次选的语言，切 App 记住各自的选择
 // 默认「自动」——没手动选过的 App 默认让每台设备执行前现查自己的系统语言，而不是默认不切换。
-// 用 ?? 而非 ||：用户显式选"跟随脚本原文"存的是 ""，是有意义的值，不能被默认值顶掉。
 const langCode = computed({
   get: () => (store.activeSlug ? langCodeBySlug[store.activeSlug] ?? AUTO_LANG : AUTO_LANG),
   set: (v: string) => { if (store.activeSlug) langCodeBySlug[store.activeSlug] = v; },
 });
 async function loadLangLocales() {
   langLocales.value = store.activeSlug ? await api.listLangLocales(store.activeSlug) : [];
-  // 该 App 语言表里已不含之前选的那个显式代号（比如换了张新表）→ 清掉，别悄悄拿着失效值去跑；
-  // "自动"/"跟随脚本原文" 两个哨兵值不受此清理影响（它们本来就不是表里的语言代号）。
+  // 之前记住的选择已不在下拉里（换了张新表、或本来选的是收窄前那 98 档里的某个语言）→ 退回
+  // 「自动」，别拿着一个下拉里根本不存在的值去跑（v-model 会显示成空白，用户看不出跑的是什么）。
   const v = langCode.value;
-  if (v && v !== AUTO_LANG && !langLocales.value.includes(v)) langCode.value = "";
+  if (v !== AUTO_LANG && !langOptions.value.includes(v as typeof LANG_CHOICES[number])) {
+    langCode.value = AUTO_LANG;
+  }
 }
 // ── 右栏：设备 + 看板 + 执行 ──
 const devices = ref<DeviceRow[]>([]);
 const pickedSerials = ref<string[]>([]);
+
+// ── 「用例 × 设备」逐格分派（docs/handoff-parallel-multidevice.md §5.4）──
+// 默认语义不变：勾了的用例在所有勾选设备上跑（=矩阵，整行铺满）。勾选 >1 台设备时，
+// 每条已勾用例行尾出现设备 chips，可逐格取消 → 显式分派（该用例只落勾中的设备）。
+// rowSerials[caseId] 存该行的显式覆盖；没有条目 = 跟随 pickedSerials 全铺（含后勾的新设备）。
+const rowSerials = reactive<Record<string, string[]>>({});
+function rowDevs(caseId: string): string[] {
+  // 只勾 1 台设备时 chips 不出现（见下方模板 v-if），此时不存在"分派"这回事——必须无条件跟随
+  // pickedSerials，不能套用之前多设备时留下的覆盖（哪怕它是空数组）。否则「之前勾 2 台时把某
+  // 几条用例的 chips 全点掉」这个历史状态，会在退回单设备后变成"看不见 chips 却分派不到任何
+  // 设备"，用户既看不到问题、也无从修复（真实复现过：CUT-EDGE-01/02、MERGE-COUNT-01）。
+  if (pickedSerials.value.length <= 1) return pickedSerials.value;
+  const base = rowSerials[caseId] ?? pickedSerials.value;
+  return base.filter((s) => pickedSerials.value.includes(s)); // 与当前勾选设备求交，掉线/取消勾选自动剪枝
+}
+function toggleRowDev(caseId: string, serial: string) {
+  const cur = new Set(rowDevs(caseId));
+  if (cur.has(serial)) cur.delete(serial);
+  else cur.add(serial);
+  // 按 pickedSerials 顺序存，chips 显示顺序稳定
+  rowSerials[caseId] = pickedSerials.value.filter((s) => cur.has(s));
+}
+// 一行是不是"整行铺满"（跟随全部勾选设备）——铺满时可以把覆盖条目删掉，让后勾的新设备自动加入
+function resetRowDevs(caseId: string) {
+  delete rowSerials[caseId];
+}
+// chips 显示文本：优先设备别名，其次型号（无线设备 serial 是 ip:port，截尾 4 位会变成端口号 5555，
+// 没意义，所以型号优先于截尾兜底），最后才退回 serial 尾 4 位（完整 serial 放 title 悬停可见）。
+// 【必须能区分同名设备】手上两台 Pixel_4 没设别名时 model 完全一样，chips 上是两个"Pixel_4"，
+// 逐格分派时根本不知道点的是哪台（真实踩过：以为在用有线那台，其实选的是另一台无线的）。
+// 所以重名时补一段区分标识——无线取 IP 末段（.239 比端口 5555 有意义），USB 取 serial 尾 4 位。
+// 只在**真有重名**时才补，避免所有 chip 无脑变长。根治办法仍是去「设备」tab 给它们起别名。
+function baseLabel(serial: string) {
+  const d = devices.value.find((x) => x.serial === serial);
+  return d?.alias || d?.model || serial.slice(-4);
+}
+function chipLabel(serial: string) {
+  const base = baseLabel(serial);
+  if (devices.value.filter((x) => baseLabel(x.serial) === base).length < 2) return base;
+  const tail = serial.includes(":") ? serial.split(":")[0].split(".").pop() : serial.slice(-4);
+  return `${base}·${tail}`;
+}
+function chipTitle(serial: string) {
+  const d = devices.value.find((x) => x.serial === serial);
+  return `${serial}（${serial.includes(":") ? "无线" : "USB"}）${d?.model ? " · " + d.model : ""}`;
+}
+// 执行计划：serial → caseId[]（用例顺序按中栏列表顺序，即 frozen 的顺序）
+function buildPlan(cases: { case_id: string }[]): Record<string, string[]> {
+  const plan: Record<string, string[]> = {};
+  for (const s of pickedSerials.value) plan[s] = [];
+  for (const c of cases) {
+    for (const s of rowDevs(c.case_id)) plan[s].push(c.case_id);
+  }
+  for (const s of Object.keys(plan)) {
+    if (!plan[s].length) delete plan[s]; // 一格没分到的设备不起 worker
+  }
+  return plan;
+}
 const boardMode = ref<"current" | "new">("current"); // 关联当前 / 新建看板
 const brainMode = ref(false); // 脚本自愈：失败自动交 claude 诊断+改脚本重跑
+// UI dump 后端：shell(默认,纯adb,零依赖) / u2(uiautomator2,整轮实测约快2倍，需设备预装并保活
+// atx-agent，跟 Appium 会抢 UiAutomation 互斥，见 decisions.md #30)。切 App 时随 loadAll 从
+// target.json 读回当前值；执行前若与勾选状态不一致，写回 target.json 再跑（adbkit 按
+// target.json 的 dump_backend 选后端，不是运行时参数）。
+const dumpU2 = ref(false);
+// 失败不登记：本轮所有格子的 issueSkip 预设为真，收尾登记问题清单阶段（issue_register）直接跳过，
+// 且 publish() 连带跳过同步表格/刷新Doc——探索性/调试跑（比如还在改固化脚本时反复试跑）失败往往
+// 是脚本没写好，不是真 App 缺陷，不想占用 issues.csv，也不想拿中间状态去刷新给别人看的线上产物。
+// 本轮只落本地执行记录，线上表格/Doc 维持上一轮已发布的样子。执行台里逐格仍是原来那套 issueSkip
+// 机制，收尾登记跑到某一格之前都能反悔（反悔不影响本轮是否同步/刷Doc——那个只看这里的勾选状态）。
+const noRegister = ref(false);
+async function loadDumpBackend() {
+  if (!store.activeSlug) { dumpU2.value = false; return; }
+  try {
+    const cfg = await api.readTargetConfig(store.activeSlug);
+    dumpU2.value = cfg?.dump_backend === "u2";
+  } catch {
+    dumpU2.value = false;
+  }
+}
 const err = ref("");
 const confirmNewBoard = ref(false);
 
-const frozen = computed(() => flows.value.filter((f) => f.has_flow));
-const nonFrozen = computed(() => flows.value.filter((f) => !f.has_flow));
+const frozen = computed(() => flows.value.filter((f) => f.has_flow && matchesPriority(f)));
+const nonFrozen = computed(() => flows.value.filter((f) => !f.has_flow && matchesPriority(f)));
 
 // 优先级配色：P0(danger) > P1(warning) > P2(accent，浅蓝区分于 P3) > P3(muted)
 function priorityPill(p: string) {
@@ -69,7 +162,26 @@ function priorityPill(p: string) {
   return "pill-muted";
 }
 
-// 全选/取消全选：只对固化用例生效（非固化用例本来就锁着不可勾）
+// 优先级筛选：勾中的几档只看这几档；一档都不勾 = 不筛选（全部显示），避免"取消到一档不剩=空列表"的反直觉。
+// 只列出当前 flows 里实际出现过的优先级（P0 通常没有用例就不出现按钮），按 P0>P1>P2>P3 固定顺序。
+const priorityFilter = ref<Set<string>>(new Set());
+const showPriorityMenu = ref(false);
+const allPriorities = computed(() => {
+  const present = new Set(flows.value.map((f) => f.priority).filter(Boolean));
+  return ["P0", "P1", "P2", "P3"].filter((p) => present.has(p));
+});
+function togglePriority(p: string) {
+  const set = new Set(priorityFilter.value);
+  if (set.has(p)) set.delete(p);
+  else set.add(p);
+  priorityFilter.value = set;
+}
+function matchesPriority(f: FlowRow) {
+  return priorityFilter.value.size === 0 || (!!f.priority && priorityFilter.value.has(f.priority));
+}
+
+// 全选/取消全选：只对固化用例生效（非固化用例本来就锁着不可勾）；frozen 已按优先级筛选，
+// 筛选生效时「全选」只选中当前可见的那些，符合直觉。
 function selectAllCases() {
   pickedCases.value = frozen.value.map((f) => f.case_id);
 }
@@ -95,22 +207,25 @@ function selectRange() {
   pickedCases.value = Array.from(set);
 }
 
-// 用例条目悬停提示：steps/expected 编号列出，供快速预览用例内容而不必打开 yaml。
+// 悬停提示浮层：用例条目=steps/expected 编号列出（预览用例内容而不必打开 yaml）；看板选项=纯文字说明
+// （原来直接铺在 checkbox 后面，挤占面板；收进「?」按钮悬停展示）。两种内容共用同一套浮层/定位逻辑。
 // 用自绘浮层而非原生 title（原生 tooltip 是系统灰底，跟应用配色不搭）；悬停满 2 秒才弹出，避免扫视列表时框到处闪。
 const HOVER_DELAY = 2000;
 const HIDE_GRACE = 150; // 离开条目到落到浮层上之间留的缓冲，否则鼠标一移到浮层上就先被 mouseleave 关掉了
-const hoverTip = ref<{ x: number; y: number; f: FlowRow } | null>(null);
+type TipContent = { steps: string[]; expected: string[] } | { text: string };
+const hoverTip = ref<{ x: number; y: number; content: TipContent } | null>(null);
 let hoverTimer: ReturnType<typeof setTimeout> | undefined;
 let hideTimer: ReturnType<typeof setTimeout> | undefined;
 let pendingPos = { x: 0, y: 0 };
-function showTip(e: MouseEvent, f: FlowRow) {
+function showTip(e: MouseEvent, content: TipContent) {
   clearTimeout(hideTimer);
-  if (!f.steps.length && !f.expected.length) return;
+  const empty = "text" in content ? !content.text : !content.steps.length && !content.expected.length;
+  if (empty) return;
   clearTimeout(hoverTimer);
   pendingPos = { x: e.clientX, y: e.clientY };
   hoverTimer = setTimeout(() => {
     // 弹出后位置定住不再跟手，方便把鼠标移进浮层里滚动
-    hoverTip.value = { x: pendingPos.x, y: pendingPos.y, f };
+    hoverTip.value = { x: pendingPos.x, y: pendingPos.y, content };
   }, HOVER_DELAY);
 }
 function moveTip(e: MouseEvent) {
@@ -126,8 +241,13 @@ function cancelHide() {
 const tipStyle = computed(() => {
   if (!hoverTip.value) return {};
   const pad = 18;
-  const maxW = 620;
-  const maxH = 520;
+  // 防越界要按浮层实际最大尺寸算，不能不管内容种类都套用用例浮层(620×520)那个大盒子的尺寸算——
+  // 「?」按钮的纯文字浮层框小得多，套用大盒子的尺寸去clamp，越界判断会在按钮靠近窗口角落时
+  // 早早触发，把浮层甩到离鼠标一两百像素远的地方（实测：脚本自愈按钮贴在看板卡片右下角时，
+  // 浮层被算法搬到了屏幕中间）。
+  const compact = "text" in hoverTip.value.content;
+  const maxW = compact ? 320 : 620;
+  const maxH = compact ? 200 : 520;
   let left = hoverTip.value.x + pad;
   let top = hoverTip.value.y + pad;
   if (left + maxW > window.innerWidth) left = Math.max(8, hoverTip.value.x - maxW - pad);
@@ -150,15 +270,19 @@ async function loadDevices() {
   const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
   pickedSerials.value = pickedSerials.value.filter((s) => online.has(s));
   if (!pickedSerials.value.length) {
-    const def = devices.value.find((d) => d.is_default) || devices.value.find((d) => d.state === "device");
-    if (def) pickedSerials.value = [def.serial];
+    const first = devices.value.find((d) => d.state === "device");
+    if (first) pickedSerials.value = [first.serial];
   }
+  // list_devices 刚查到的型号已经落盘（config/device_info_cache.json），但执行台看板（RunMonitor）
+  // 靠 v-show 常驻挂载，自己的别名/型号缓存只在首次挂载时读过一次——这里主动催它重读，不然场景库
+  // 这边刷新出了型号，看板标题栏还停在挂载那一刻的旧值（无线设备表现为一直露 ip:port）。
+  await monitorRef.value?.reload();
 }
 
 async function loadAll() {
   err.value = "";
   try {
-    await Promise.all([loadFlows(), loadDevices(), loadLangLocales()]);
+    await Promise.all([loadFlows(), loadDevices(), loadLangLocales(), loadDumpBackend()]);
   } catch (e: any) {
     err.value = String(e);
   }
@@ -166,44 +290,80 @@ async function loadAll() {
 
 // 「▶ 执行选中」→ 校验 → 跳到执行台 tab → 交给 runStore 串行编排（for 设备 × for 用例）
 function runSelected() {
-  // 收尾阶段（sync_sheets/doc_report）跑完前禁止开新一轮：它们跑完会把当前 doc_id 写回
-  // target.json，若这时用户已经手动/自动开了新一轮（尤其「新建看板」会先建一份新 Doc、
-  // 也回写 target.json），旧一轮收尾晚完成的那次写入会把新 Doc 的 doc_id 覆盖回旧的——
-  // 线上明明刷新成功，desktop 却把指针指回了上一轮的 Doc。见 docs/gotchas.md 对应条目。
-  if (runStore.running || runStore.syncing || runStore.docGenerating) return;
+  // 收尾阶段（登记问题清单→同步表格→刷新Doc→存执行记录）跑完前禁止开新一轮：一是 sync_sheets/
+  // doc_report 会把当前 doc_id 写回 target.json，若这时新一轮已经开跑（尤其「新建看板」会先建一份
+  // 新 Doc、也回写 target.json），旧一轮收尾晚完成的那次写入会把新 Doc 的 doc_id 覆盖回旧的——线上
+  // 明明刷新成功，desktop 却把指针指回了上一轮的 Doc（见 docs/gotchas.md 对应条目）；二是旧一轮收尾
+  // 还在流式 push 的日志会串进新一轮已经清空重建的事件面板。runStore.publishing 覆盖收尾全程（不只
+  // syncing/docGenerating 两段，「登记问题清单」「存执行记录」这两段窗口也要挡），start() 内部也会
+  // 再挡一层（防住「新建看板」二次确认弹窗直接调 launch() 绕过这里的情况）。
+  if (runStore.running || runStore.publishing) return;
   if (!store.activeSlug) { err.value = "请先在左栏选一个 App"; return; }
   const cases = frozen.value.filter((f) => pickedCases.value.includes(f.case_id));
   if (!cases.length) { err.value = "中栏请至少勾选一个固化用例"; return; }
   if (!pickedSerials.value.length) { err.value = "右栏请至少勾选一台设备"; return; }
+  // 逐格分派校验：每个勾选用例至少落一台设备（把设备 chips 全点掉的行拦下来）
+  const orphan = cases.filter((c) => !rowDevs(c.case_id).length).map((c) => c.case_id);
+  if (orphan.length) { err.value = `这些用例没有分配任何设备：${orphan.join(", ")}（点行尾设备 chips 或重置整行）`; return; }
   err.value = "";
   if (boardMode.value === "new") { confirmNewBoard.value = true; return; }
   launch(false);
 }
 
-function launch(newBoard: boolean) {
+async function launch(newBoard: boolean) {
   confirmNewBoard.value = false;
   const cases = frozen.value
     .filter((f) => pickedCases.value.includes(f.case_id))
     .map((f) => ({ case_id: f.case_id, script: f.script, module: f.module }));
+  // 执行计划：整行全铺 = 矩阵；有行做过 chips 取舍 = 显式分派。两者同一条编排路径。
+  const plan = buildPlan(cases);
+  const planSerials = Object.keys(plan);
+  const cellCount = planSerials.reduce((n, s) => n + plan[s].length, 0);
+  const isMatrix = cellCount === cases.length * planSerials.length;
+  // adbkit 按 target.json 的 dump_backend 选后端，不是运行时参数——执行前先把勾选状态写回，
+  // 保证固化脚本这次真的用的是 UI 上看到的后端（而不是上次残留的值）。
+  const slug = store.activeSlug;
+  await api.setTargetDumpBackend(slug, dumpU2.value ? "u2" : "shell");
   subTab.value = "monitor"; // 立即跳到执行台看实时过程
   // 选了某个留存版本 → 执行前先在每台设备上强制重装这个版本（不管设备当前是不是已经是它）
-  const slug = store.activeSlug;
   const ver = selectedVersion[slug];
-  const apkPath = ver ? appVersions[slug]?.find((v) => v.version === ver)?.path : undefined;
+  const apkPath = ver && ver !== FOLLOW_DEVICE ? appVersions[slug]?.find((v) => v.version === ver)?.path : undefined;
   const pkg = store.activeApp()?.package;
   runStore
     .start({
       slug,
       cases,
-      serials: [...pickedSerials.value],
+      plan,
       brain: brainMode.value,
       newBoard,
-      title: `${slug} · ${cases.length} 用例 × ${pickedSerials.value.length} 设备${ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
+      title: `${slug} · ${cases.length} 用例 × ${planSerials.length} 设备${isMatrix ? "" : `（分派 ${cellCount} 格）`}${ver === FOLLOW_DEVICE ? " · 跟随设备" : ver ? ` · ${ver}` : ""}${langCode.value === AUTO_LANG ? " · 语言自动" : langCode.value ? ` · ${langLabel(langCode.value)}` : ""}`,
       apkPath: apkPath && pkg ? apkPath : undefined,
       package: apkPath && pkg ? pkg : undefined,
       langCode: langCode.value || undefined,
+      followDevice: ver === FOLLOW_DEVICE,
+      noRegister: noRegister.value,
     })
     .then(() => loadFlows()); // 跑完刷新用例列表拿最新 last_result
+}
+
+// 「执行记录」页点「失败重跑」→ 跳回场景库，只勾失败用例，且逐格显式分派回它们各自失败的设备
+// （而不是本轮跑过的全部设备）。先现查一遍在线设备——失败当时在线的设备，此刻未必还连着。
+async function onRerunFailed(plan: RerunPlan) {
+  await loadDevices(); // 刷新右栏设备列表，避免刚插上的设备还没出现在勾选框里（见 loadDevices 内注释）
+  const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
+  const required = [...new Set(Object.values(plan.serialsByCase).flat())];
+  const missing = required.filter((s) => !online.has(s));
+  if (missing.length) {
+    const names = missing.map((s) => plan.labels[s] || s).join("、");
+    await message(`${names} 设备当前没有连接，请连接后再试。`, { title: "失败重跑", kind: "warning" });
+    return;
+  }
+  boardMode.value = "current"; // 重跑失败用例是续用当前批次，不应该顺手开新一轮
+  pickedCases.value = [...plan.cases];
+  pickedSerials.value = required;
+  Object.keys(rowSerials).forEach((k) => delete rowSerials[k]);
+  for (const cid of plan.cases) rowSerials[cid] = plan.serialsByCase[cid] ?? required;
+  subTab.value = "library";
 }
 
 // ── 左栏顶部：上传 APK（本地解析 → 装机 → 注册）──
@@ -258,15 +418,19 @@ async function doUpload() {
       const code = await api.installApk(apkPath.value, apkInfo.value.package, serial, (l) => uploadLog.value.push(l));
       if (code !== 0) { uploadStatus.value = `✖ 装机失败（${serial}，exit ${code}）`; uploading.value = false; return; }
     }
-    // 2) 注册（init_target.py + 补 app_slug + 建工作区）：勾了设备用第一台探测；没勾就留空，
-    // 只有一台在线设备时后端会自动选中它，多台在线又没勾选会报错提示用 --serial 指定。
-    const primary = uploadSerials.value[0] || "";
+    // 2) 注册（init_target.py + 补 app_slug + 建工作区）：勾了设备用第一台探测；没勾（仅注册，跳过装机）
+    // 也必须给 --serial，否则多台设备在线时 init_target.py 因无法唯一确定探测设备而报错退出——
+    // 用户明确要求"不勾就该直接注册成功"，所以静默兜底取在线列表第一台。
+    const primary = uploadSerials.value[0] || devices.value.find((d) => d.state === "device")?.serial || "";
     uploadLog.value.push(`$ AITEST_APP=${slug} python3 tools/init_target.py ${apkInfo.value.package}${primary ? ` --serial ${primary}` : ""} --write`);
     const code = await api.registerApp(slug, apkInfo.value.package, primary, (l) => uploadLog.value.push(l));
     if (code !== 0) { uploadStatus.value = `✖ 注册失败（exit ${code}）`; uploading.value = false; return; }
     // 留存这个版本的 apk 文件，供以后同 slug 下多版本切换执行时直接装机用
     await api.saveApkVersion(slug, apkPath.value, apkInfo.value.version || "unknown");
-    delete appVersions[slug]; // 清缓存，下次展开重新拉取（带上刚存的这个版本）
+    // 已展开的话直接重新拉取（带上刚存的这个版本）；没展开就只清缓存，等下次展开再拉——
+    // 光 delete 缓存对已展开的树不够：它不会再触发 toggleAppExpand，会一直卡在清缓存后的空态上。
+    if (expandedApps.has(slug)) await fetchApkVersions(slug);
+    else delete appVersions[slug];
     uploadStatus.value = `✔ 已注册并选中 ${slug}`;
     await store.loadApps();
     await store.setActive(slug);
@@ -287,21 +451,27 @@ function selectApp(slug: string) {
 // 懒加载：第一次展开某个 App 才去查它的版本列表，查过就缓存，不用一次性把所有 App 的版本都拉一遍。
 const expandedApps = reactive(new Set<string>());
 const appVersions = reactive<Record<string, ApkVersionInfo[]>>({});
-// slug -> 用户手动点选的版本。不点选就一直是 undefined——展示用 a.app_version（上次上传注册时探测到的版本）、
-// 执行时也不强制重装，都走老逻辑。只有显式点了某个版本行，这两处才会跟着切换到点选的那个版本。
+// slug -> 用户手动点选的版本。不点选就一直是 undefined——展示为"—"（target.json 不再存静态
+// app_version 快照，没有旧值可退），执行时也不强制重装，都走老逻辑。只有显式点了某个版本行，
+// 这两处才会跟着切换到点选的那个版本。
+// 哨兵值 FOLLOW_DEVICE：显式选择"跟随设备"——语义上等同于不选任何版本（执行前不装机），
+// 但作为列表里一个可点选的条目存在，让用户能从"之前点过某个版本"的状态显式切回来
+// （原逻辑里 selectedVersion 一旦点过某个版本就没有办法回到"不强制装机"，见本次需求）。
+const FOLLOW_DEVICE = "__follow_device__";
 const selectedVersion = reactive<Record<string, string>>({});
+
+async function fetchApkVersions(slug: string) {
+  try {
+    appVersions[slug] = await api.listApkVersions(slug); // 仅供选择列表用；不自动预选，选不选是用户的事
+  } catch (e: any) {
+    err.value = String(e);
+  }
+}
 
 async function toggleAppExpand(slug: string) {
   if (expandedApps.has(slug)) { expandedApps.delete(slug); return; }
   expandedApps.add(slug);
-  if (!appVersions[slug]) {
-    try {
-      const versions = await api.listApkVersions(slug);
-      appVersions[slug] = versions; // 仅供选择列表用；不自动预选，选不选是用户的事
-    } catch (e: any) {
-      err.value = String(e);
-    }
-  }
+  if (!appVersions[slug]) await fetchApkVersions(slug);
 }
 
 function pickVersion(slug: string, version: string) {
@@ -312,6 +482,25 @@ function pickVersion(slug: string, version: string) {
 function fmtSize(bytes: number): string {
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)}KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+// 从 App 库版本树移出一个留存 APK（apps/<slug>/apks/<version>.apk）。硬删不进回收站——
+// 只是本地缓存的安装包，重新上传即可找回，不像 removeApp 那样牵连用例/账本。
+async function removeApkVersion(slug: string, version: string) {
+  const ok = await confirm(`删除后需要重新上传才能再选到这个版本。`, {
+    title: `确认删除留存版本「${version}」？`,
+    kind: "warning",
+  });
+  if (!ok) return;
+  try {
+    await api.deleteApkVersion(slug, version);
+    // 删的正是当前选中版本：文件已经没了，没有旧元数据可退，显式切成「跟随设备」——
+    // 跟 FOLLOW_DEVICE 哨兵值本来的语义一致。
+    if (selectedVersion[slug] === version) selectedVersion[slug] = FOLLOW_DEVICE;
+    await fetchApkVersions(slug);
+  } catch (e: any) {
+    err.value = String(e);
+  }
 }
 
 async function removeApp(slug: string) {
@@ -331,7 +520,11 @@ async function removeApp(slug: string) {
   }
 }
 
-watch(() => store.activeSlug, () => { pickedCases.value = []; loadAll(); });
+watch(() => store.activeSlug, () => {
+  pickedCases.value = [];
+  Object.keys(rowSerials).forEach((k) => delete rowSerials[k]); // 逐格分派覆盖是 per-App 的，切 App 清掉
+  loadAll();
+});
 onMounted(() => { loadAll(); });
 // keep-alive 保活后切回本 tab 时刷新设备/用例列表；正在执行则不动，避免打断在跑的任务与日志。
 onActivated(() => { if (!runStore.running) loadAll(); });
@@ -376,10 +569,19 @@ onActivated(() => { if (!runStore.running) loadAll(); });
                     <span v-if="a.slug === store.activeSlug" class="dot">●</span>
                     <button class="app-del" title="删除此 App" @click.stop="removeApp(a.slug)">✕</button>
                   </div>
-                  <div class="app-sub muted">{{ selectedVersion[a.slug] || a.app_version || "—" }} · {{ a.package }}</div>
+                  <div class="app-sub muted">{{ selectedVersion[a.slug] === FOLLOW_DEVICE ? "跟随设备" : (selectedVersion[a.slug] || "—") }} · {{ a.package }}</div>
                 </div>
               </div>
               <div v-if="expandedApps.has(a.slug)" class="app-version-list">
+                <div
+                  class="app-version-item follow-device"
+                  :class="{ on: selectedVersion[a.slug] === FOLLOW_DEVICE }"
+                  @click="pickVersion(a.slug, FOLLOW_DEVICE)"
+                  title="不装机，直接用设备上按包名找到的当前已装 App 来回归"
+                >
+                  <span>跟随设备</span>
+                  <span class="muted app-version-size">不装机</span>
+                </div>
                 <div v-if="!appVersions[a.slug]?.length" class="muted app-version-empty">还没有留存的 APK 版本</div>
                 <div
                   v-for="v in appVersions[a.slug]"
@@ -391,14 +593,16 @@ onActivated(() => { if (!runStore.running) loadAll(); });
                 >
                   <span class="mono">{{ v.version }}</span>
                   <span class="muted app-version-size">{{ fmtSize(v.size) }}</span>
+                  <button class="app-version-del" title="删除此留存版本" @click.stop="removeApkVersion(a.slug, v.version)">✕</button>
                 </div>
               </div>
             </div>
           </div>
         </div>
 
-        <!-- 语言选择（LANG_CODE）：只在该 App 已建过 apps/<slug>/lang/strings_table.json 时才出现，
-             没建表的 App 这里不显示，不强迫每个 App 都配语言。选中的语言透传给 run_flow/run_flow_repair
+        <!-- 语言选择（LANG_CODE）：只在该 App 已建过语言表（apps/<slug>/lang/index.json 有记录）时才出现，
+             没建表的 App 这里不显示，不强迫每个 App 都配语言。只暴露 自动/简体中文/英语 三档，
+             见上面 LANG_CHOICES 处的说明。选中的语言透传给 run_flow/run_flow_repair
              注入 LANG_CODE 环境变量，接入了 tools/lang_helper.sh 的固化脚本据此查表换算断言文案；
              未接入的老脚本不受影响（跟没有这项选择之前行为一致）。-->
         <div class="card langbox" v-if="langLocales.length">
@@ -406,16 +610,16 @@ onActivated(() => { if (!runStore.running) loadAll(); });
           <div class="col-body lang-body">
             <select class="lang-select" v-model="langCode">
               <option :value="AUTO_LANG">自动（跟随设备当前系统语言）</option>
-              <option value="">跟随脚本原文（不切换 LANG_CODE）</option>
-              <option v-for="code in langLocales" :key="code" :value="code">{{ langLabel(code) }}</option>
+              <option v-for="code in langOptions" :key="code" :value="code">{{ langLabel(code) }}</option>
             </select>
             <div class="muted lang-hint" v-if="langCode === AUTO_LANG">
               执行前逐台设备现查系统当前语言并换算成表里的代号再注入 LANG_CODE；某台设备的语言在
               语言表里没有对应词条时，那台不注入、仍按脚本原文断言（其它设备不受影响）。
             </div>
             <div class="muted lang-hint" v-else>
-              执行时注入 LANG_CODE={{ langCode || "（不注入）" }}；只影响已接入
+              执行时注入 LANG_CODE={{ langCode }}；只影响已接入
               <span class="mono">tools/lang_helper.sh</span> 的固化脚本，未接入的仍按固化时的原文断言。
+              要跑这三档以外的语言，命令行传 <span class="mono">LANG_CODE=&lt;代号&gt;</span>。
             </div>
           </div>
         </div>
@@ -426,6 +630,27 @@ onActivated(() => { if (!runStore.running) loadAll(); });
         <div class="col-hd">
           <span>用例（{{ store.activeSlug || "未选 App" }}）</span>
           <div class="case-toolbar">
+            <div v-if="allPriorities.length" class="filter-wrap">
+              <button
+                class="sm icon-btn"
+                :class="{ on: priorityFilter.size }"
+                title="按优先级筛选"
+                @click="showPriorityMenu = !showPriorityMenu"
+              >
+                <svg width="13" height="13" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M1 2h14l-5 6v5l-4 2v-7L1 2z" stroke="currentColor" stroke-width="1.3" stroke-linejoin="round" />
+                </svg>
+                <span v-if="priorityFilter.size" class="filter-badge">{{ priorityFilter.size }}</span>
+              </button>
+              <div v-if="showPriorityMenu" class="menu-backdrop" @click="showPriorityMenu = false"></div>
+              <div v-if="showPriorityMenu" class="priority-menu" @click.stop>
+                <label v-for="p in allPriorities" :key="p" class="priority-menu-item">
+                  <input type="checkbox" :checked="priorityFilter.has(p)" @change="togglePriority(p)" />
+                  <span class="pill sm" :class="priorityPill(p)">{{ p }}</span>
+                </label>
+                <button v-if="priorityFilter.size" class="sm menu-clear" @click="priorityFilter = new Set()">清空</button>
+              </div>
+            </div>
             <button class="sm" @click="selectAllCases">全选</button>
             <button class="sm" @click="selectRange">区间选择</button>
             <button class="sm" @click="clearAllCases">取消全选</button>
@@ -433,12 +658,16 @@ onActivated(() => { if (!runStore.running) loadAll(); });
           </div>
         </div>
         <div class="col-body">
+          <div v-if="frozen.length && pickedSerials.length > 1" class="muted grid-hint">
+            已勾 {{ pickedSerials.length }} 台设备：默认每条勾选用例在所有设备上跑（矩阵）；点用例行尾的
+            设备 chips 可逐格取消 → 指定用例只落指定设备（显式分派）。
+          </div>
           <template v-if="frozen.length">
             <label
               v-for="f in frozen"
               :key="f.case_id"
               class="case-item"
-              @mouseenter="showTip($event, f)"
+              @mouseenter="showTip($event, { steps: f.steps, expected: f.expected })"
               @mousemove="moveTip"
               @mouseleave="hideTip"
             >
@@ -447,6 +676,23 @@ onActivated(() => { if (!runStore.running) loadAll(); });
               <span class="case-mod muted">{{ f.module }}</span>
               <span v-if="f.purpose" class="case-purpose muted">{{ f.purpose }}</span>
               <span v-if="f.priority" class="pill sm" :class="priorityPill(f.priority)">{{ f.priority }}</span>
+              <!-- 逐格分派 chips：仅多设备 + 该用例已勾时出现；点击不联动 label 的勾选框 -->
+              <span v-if="pickedCases.includes(f.case_id) && pickedSerials.length > 1" class="dev-chips">
+                <button
+                  v-for="s in pickedSerials"
+                  :key="s"
+                  class="dev-chip mono"
+                  :class="{ on: rowDevs(f.case_id).includes(s) }"
+                  :title="chipTitle(s)"
+                  @click.prevent.stop="toggleRowDev(f.case_id, s)"
+                >{{ chipLabel(s) }}</button>
+                <button
+                  v-if="rowSerials[f.case_id]"
+                  class="dev-chip reset"
+                  title="重置：该用例回到「所有勾选设备都跑」"
+                  @click.prevent.stop="resetRowDevs(f.case_id)"
+                >↺</button>
+              </span>
             </label>
           </template>
           <div v-else-if="store.activeSlug" class="muted empty-hint">该 App 还没有固化用例（queue.csv 无固化脚本行）。</div>
@@ -457,7 +703,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
               v-for="f in nonFrozen"
               :key="f.case_id"
               class="case-item locked"
-              @mouseenter="showTip($event, f)"
+              @mouseenter="showTip($event, { steps: f.steps, expected: f.expected })"
               @mousemove="moveTip"
               @mouseleave="hideTip"
             >
@@ -472,17 +718,33 @@ onActivated(() => { if (!runStore.running) loadAll(); });
         </div>
       </div>
 
-      <!-- 用例悬停浮层：steps/expected 编号列表，定位在弹出那一刻的鼠标位置附近 -->
-      <div v-if="hoverTip" class="case-tip" :style="tipStyle" @mouseenter="cancelHide" @mouseleave="hideTip">
-        <div v-if="hoverTip.f.steps.length" class="tip-sec">
-          <div class="tip-hd">步骤</div>
-          <ol><li v-for="(s, i) in hoverTip.f.steps" :key="i">{{ s }}</li></ol>
+      <!-- 悬停浮层：用例条目=steps/expected 编号列表；看板选项「?」按钮=纯文字说明。定位在弹出那一刻的鼠标位置附近。
+           Teleport 到 body：保证不受任何祖先容器的 overflow/flex 布局影响（更稳健，虽然实测跑偏的真因
+           是 tipStyle() 防越界 clamp 用的盒子尺寸不对，见下方注释）。 -->
+      <Teleport to="body">
+        <div
+          v-if="hoverTip"
+          class="case-tip"
+          :class="'text' in hoverTip.content ? 'tip-compact' : 'tip-wide'"
+          :style="tipStyle"
+          @mouseenter="cancelHide"
+          @mouseleave="hideTip"
+        >
+          <template v-if="'text' in hoverTip.content">
+            <p class="tip-text">{{ hoverTip.content.text }}</p>
+          </template>
+          <template v-else>
+            <div v-if="hoverTip.content.steps.length" class="tip-sec">
+              <div class="tip-hd">步骤</div>
+              <ol><li v-for="(s, i) in hoverTip.content.steps" :key="i">{{ s }}</li></ol>
+            </div>
+            <div v-if="hoverTip.content.expected.length" class="tip-sec">
+              <div class="tip-hd">预期</div>
+              <ol><li v-for="(s, i) in hoverTip.content.expected" :key="i">{{ s }}</li></ol>
+            </div>
+          </template>
         </div>
-        <div v-if="hoverTip.f.expected.length" class="tip-sec">
-          <div class="tip-hd">预期</div>
-          <ol><li v-for="(s, i) in hoverTip.f.expected" :key="i">{{ s }}</li></ol>
-        </div>
-      </div>
+      </Teleport>
 
       <!-- ── 右：设备 + 看板 + 执行 ── -->
       <div class="col dev-col">
@@ -511,17 +773,41 @@ onActivated(() => { if (!runStore.running) loadAll(); });
           </div>
           <label class="brain-opt" :class="{ on: brainMode }">
             <input type="checkbox" v-model="brainMode" />
-            <span class="brain-txt">
-              脚本自愈
-              <span class="muted brain-sub">失败时 Claude 接管：诊断→只改导航/健壮性→重跑（至多 3 次）。判为 App 缺陷则停。</span>
-            </span>
+            <span class="brain-txt">脚本自愈</span>
+            <button
+              type="button" class="help-btn" @click.stop.prevent
+              @mouseenter="showTip($event, { text: '失败时 Claude 接管：诊断→只改导航/健壮性→重跑（至多 3 次）。判为 App 缺陷则停。' })"
+              @mousemove="moveTip" @mouseleave="hideTip"
+            >?</button>
+          </label>
+          <label class="brain-opt" :class="{ on: dumpU2 }">
+            <input type="checkbox" v-model="dumpU2" />
+            <span class="brain-txt">UI dump 用 u2 加速</span>
+            <button
+              type="button" class="help-btn" @click.stop.prevent
+              @mouseenter="showTip($event, { text: 'uiautomator2 单次 dump 更快，整轮实测约省一半时间；但需设备预装并保活 atx-agent，跟 Appium 互斥。写入 target.json 的 dump_backend。' })"
+              @mousemove="moveTip" @mouseleave="hideTip"
+            >?</button>
+          </label>
+          <label class="brain-opt" :class="{ on: noRegister }">
+            <input type="checkbox" v-model="noRegister" />
+            <span class="brain-txt">失败不登记</span>
+            <button
+              type="button" class="help-btn" @click.stop.prevent
+              @mouseenter="showTip($event, { text: '本轮失败/需复核格不写入问题清单（issues.csv），收尾也不同步表格/不刷新Doc，只存本地执行记录——线上表格/Doc 维持上一轮的样子。适合调试固化脚本时的反复试跑；执行台里仍可逐格反悔登记（不影响是否同步/刷Doc）。' })"
+              @mousemove="moveTip" @mouseleave="hideTip"
+            >?</button>
           </label>
           <button
             class="primary run-btn"
-            :disabled="runStore.running || runStore.syncing || runStore.docGenerating"
+            :disabled="runStore.running || runStore.publishing"
             @click="runSelected"
           >
-            {{ runStore.running ? "执行中…" : (runStore.syncing || runStore.docGenerating) ? "收尾中…（同步/刷新Doc）" : "▶ 执行选中" }}
+            {{
+              runStore.running ? "执行中…"
+              : runStore.publishing ? (runStore.noRegister ? "收尾中…（仅存执行记录）" : "收尾中…（登记/同步/刷新Doc）")
+              : "▶ 执行选中"
+            }}
           </button>
         </div>
       </div>
@@ -531,12 +817,12 @@ onActivated(() => { if (!runStore.running) loadAll(); });
 
     <!-- ══════ 执行台：实时监控（矩阵 + 进度 + 过程 + 中止）══════ -->
     <div v-show="subTab === 'monitor'" class="monitor-wrap">
-      <RunMonitor />
+      <RunMonitor ref="monitorRef" />
     </div>
 
     <!-- ══════ 执行记录：完整跑完（未中止）的历史执行台快照，按 run 记录切换回看 ══════ -->
     <div v-show="subTab === 'history'" class="monitor-wrap">
-      <RunHistory ref="historyRef" />
+      <RunHistory ref="historyRef" @rerun-failed="onRerunFailed" />
     </div>
 
     <!-- 新建看板二次确认 -->
@@ -550,7 +836,13 @@ onActivated(() => { if (!runStore.running) loadAll(); });
         </p>
         <div class="dactions">
           <button @click="confirmNewBoard = false">取消</button>
-          <button class="primary" @click="launch(true)">确认开新一轮并执行</button>
+          <button
+            class="primary"
+            :disabled="runStore.running || runStore.publishing"
+            @click="launch(true)"
+          >
+            {{ runStore.publishing ? "上一轮收尾中，请稍候…" : "确认开新一轮并执行" }}
+          </button>
         </div>
       </div>
     </div>
@@ -574,7 +866,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
             <input v-model="slugEdit" class="slug-input mono" />
           </div>
           <div class="up-dev">
-            <div class="muted small">装到哪些设备（可不选；不选则跳过装机直接注册，仅当该包已装在某台在线设备上时可行——只有一台在线会自动用它探测，多台在线且不选会报错）</div>
+            <div class="muted small">装到哪些设备（可不选；不选则跳过装机直接注册，仅当该包已装在某台在线设备上时可行——多台在线且不选时默认取列表第一台探测）</div>
             <div v-if="!devices.length" class="muted small">无在线设备。</div>
             <label v-for="d in devices" :key="d.serial" class="dev-item">
               <input type="checkbox" :value="d.serial" v-model="uploadSerials" :disabled="d.state !== 'device'" />
@@ -655,12 +947,46 @@ h2 { margin: 0; font-weight: 500; }
 .app-version-item:hover { background: var(--surface-1); }
 .app-version-item.on { background: var(--bg-accent); color: var(--text-accent); }
 .app-version-size { margin-left: auto; font-size: 11px; }
+.app-version-del {
+  padding: 0 5px; font-size: 11px; line-height: 16px;
+  color: var(--text-muted); background: transparent; border: none; border-radius: 4px; cursor: pointer;
+}
+.app-version-del:hover { color: var(--text-danger, #d33); background: var(--surface-2, rgba(0,0,0,0.06)); }
+.follow-device { border-bottom: 0.5px solid var(--border); margin-bottom: 2px; padding-bottom: 6px; }
 
 .case-item { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: var(--radius); font-size: 13px; cursor: pointer; }
 .case-item:hover { background: var(--surface-1); }
 .case-item.locked { opacity: 0.6; cursor: default; }
 
+/* 「用例 × 设备」逐格分派 */
+.grid-hint { font-size: 11px; line-height: 1.5; padding: 6px 8px 2px; }
+.dev-chips { display: inline-flex; align-items: center; gap: 4px; flex-shrink: 0; margin-left: auto; }
+.dev-chip {
+  font-size: 10px; padding: 1px 7px; border-radius: 999px; cursor: pointer;
+  border: 0.5px solid var(--border); background: var(--surface-2); color: var(--text-muted);
+  text-decoration: line-through; opacity: 0.7;
+}
+.dev-chip.on { background: var(--bg-accent); color: var(--text-accent); border-color: var(--text-accent); text-decoration: none; opacity: 1; }
+.dev-chip.reset { text-decoration: none; opacity: 1; }
+.dev-chip:hover { border-color: var(--border-strong, var(--text-accent)); }
+
 .case-toolbar { display: flex; gap: 6px; }
+.filter-wrap { position: relative; }
+.icon-btn { display: inline-flex; align-items: center; justify-content: center; padding: 3px 7px; position: relative; color: var(--text-secondary); }
+.icon-btn.on { color: var(--text-accent); border-color: var(--text-accent); }
+.filter-badge {
+  position: absolute; top: -5px; right: -5px; background: var(--text-accent); color: #fff;
+  font-size: 9px; line-height: 1; padding: 2px 4px; border-radius: 999px;
+}
+.menu-backdrop { position: fixed; inset: 0; z-index: 39; }
+.priority-menu {
+  position: absolute; top: 100%; left: 0; margin-top: 4px; z-index: 40; min-width: 100px;
+  display: flex; flex-direction: column; gap: 6px; padding: 8px;
+  background: var(--surface-2); border: 0.5px solid var(--border); border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+.priority-menu-item { display: flex; align-items: center; gap: 6px; font-size: 12px; cursor: pointer; }
+.menu-clear { align-self: flex-end; }
 .case-id { flex-shrink: 0; }
 .case-mod { flex-shrink: 0; font-size: 12px; max-width: 25%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .case-purpose { flex: 1; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -668,12 +994,17 @@ h2 { margin: 0; font-weight: 500; }
 
 .case-tip {
   position: fixed; z-index: 50; pointer-events: auto;
-  width: 620px; max-width: 90vw; max-height: 520px; overflow: auto;
+  max-width: 90vw; overflow: auto;
   background: var(--surface-2); border: 0.5px solid var(--border); border-radius: 10px;
   box-shadow: 0 8px 28px rgba(0, 0, 0, 0.22);
   padding: 12px 14px; font-size: 12px; line-height: 1.6; color: var(--text-primary);
 }
+/* 尺寸必须跟 tipStyle() 里 clamp 计算用的 maxW/maxH 对应，否则防越界算出来的位置和浮层实际
+   占用的空间不一致，靠近窗口角落时会把浮层甩得离鼠标很远（看板选项「?」按钮踩过这个坑）。 */
+.case-tip.tip-wide { width: 620px; max-height: 520px; }
+.case-tip.tip-compact { width: max-content; max-width: min(320px, 90vw); max-height: 200px; }
 .tip-sec + .tip-sec { margin-top: 10px; }
+.tip-text { margin: 0; white-space: pre-wrap; }
 .tip-hd { font-size: 11px; font-weight: 600; color: var(--text-accent); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 4px; }
 .case-tip ol { margin: 0; padding-left: 18px; }
 .case-tip li { margin-bottom: 4px; }
@@ -685,11 +1016,16 @@ h2 { margin: 0; font-weight: 500; }
 .board-opts { display: flex; flex-direction: column; gap: 8px; padding: 12px; }
 .radio { display: flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
 .warn { color: var(--text-danger); font-size: 11px; }
-.brain-opt { display: flex; align-items: flex-start; gap: 8px; margin: 2px 12px 10px; padding: 8px 10px; border: 0.5px solid var(--border); border-radius: var(--radius); cursor: pointer; }
+.brain-opt { display: flex; align-items: center; gap: 8px; margin: 2px 12px 10px; padding: 8px 10px; border: 0.5px solid var(--border); border-radius: var(--radius); cursor: pointer; }
 .brain-opt.on { background: var(--bg-accent); border-color: var(--text-accent); }
-.brain-opt input { margin-top: 2px; }
-.brain-txt { font-size: 13px; line-height: 1.4; }
-.brain-sub { display: block; font-size: 11px; margin-top: 3px; }
+.brain-txt { font-size: 13px; line-height: 1.4; flex: 1; }
+.help-btn {
+  flex-shrink: 0; width: 16px; height: 16px; border-radius: 50%; padding: 0;
+  border: 0.5px solid var(--border); background: transparent; color: var(--text-secondary);
+  font-size: 11px; line-height: 1; cursor: pointer; /* 按钮本身已显示「?」，cursor:help 会在光标旁再叠一个系统「?」图标，冗余 */
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.help-btn:hover { border-color: var(--text-accent); color: var(--text-accent); }
 .run-btn { margin: 0 12px 12px; }
 
 .pill.sm, .sm { font-size: 11px; }

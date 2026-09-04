@@ -1,6 +1,14 @@
 # handoff —— 多设备并行执行（设计与实施指引）
 
-> 状态：**设计定稿，未动工**（2026-07-21）。目标读者=接手实现的 Claude。
+> 状态：**已实施**（2026-07-28，全部 5 步落地，见 [decisions.md](decisions.md) #39）。本文保留为架构说明。
+> 实施时对原稿的修正：① 账本锁改成**按进程计数可重入**（原示例不可重入，compile→project 嵌套会自锁死）；
+> ② queue 聚合挂在 `case_result` 落库时（`exec_ledger.apply_to_queue`）而非 compile——桌面收尾链路不跑 compile；
+> ③ §4 写点清单已过时：判定链路重构后新增 judge_result/issue_register/case_issue/auto_repair 等写点，均已包锁；
+> ④ `case_result.py` 原本不知道 serial，新增 `--serial`（judge_result 透传）；
+> ⑤ §5.4 网格 UI 没做整张大表：保留「勾用例+勾设备=矩阵」默认语义，>1 台设备时用例行尾设备 chips 逐格取消=显式分派；
+> ⑥「执行设备」列一律加在**行尾**（sheets_sync 的条件着色按列号，插中间会错位）。
+>
+> 原稿如下（2026-07-21）。目标读者=接手实现的 Claude。
 > 讨论触发：用户问「多设备跑用例是并行还是串行」→ 现状全串行 → 用户要「靠开多个 bash 并行跑」，
 > 并明确**两种用法**：① 多台设备跑**相同**用例（矩阵，比兼容性）；② **指定**用例跑在**指定**设备
 > （显式分派，按机型/能力/版本亲和）。**没有分片/动态负载均衡**（用户明确不需要）。本文把「怎么改」
@@ -213,18 +221,25 @@ AITEST_APP=MP3Cutter python3 tools/run_flow.py CONV-CORE-01  <脚本> R5CN308X8L
 - **adb server**：单例 daemon，原生支持多设备并发命令。
 - **adbkit 的 `SERIAL`/`CFG`**：进程级变量（`--serial` 覆盖，`adbkit.py:1049`），各进程独立不共享。
 
-## 7. 推荐实施顺序（增量，每步可独立验证）
+## 7. 推荐实施顺序（增量，每步可独立验证）——2026-07-28 全部完成 ✅
 
-1. **§5.1 账本锁**（改动最小、是一切并行前提）→ 验证：开两终端各跑一台的 run_flow，跑完检查
-   evidence/queue/log 行数内容完整、无覆盖、无交错半行。**到这一步「多开 bash 手动并行」即可用**。
-2. **§5.3+§5.4 桌面壳并行（矩阵优先）**：Rust map + 前端 `Promise.all`，先支持现有笛卡尔积=矩阵语义真并行。
-   验证：选 2 台 × 2 用例，两台 running 同时亮、中止能停两台、收尾只 compile+sync 一次。
-3. **§5.2 三元组 executions 表 + 流水 tab 加 serial 列**：executions 承载逐台结果（底层真值）；
-   evidence/log/issues 加「执行设备」列；queue 退化为用例详情 + 聚合概览列。这是数据模型正式二维化。
-4. **§5.2 云端 Sheet 轻量多设备视图**（用户 2026-07-21 方案）：测试队列退化为用例详情、三个流水 tab 加
-   执行设备列、结果看问题清单——**不做宽矩阵**。数据层（第 3 步）就绪后这步基本是 `sheets_sync` 加列/调投影。
-5. **§5.4 「用例 × 设备」勾选网格**：让桌面壳 UI 能表达显式分派（不再只有「全矩阵」一种勾法）。编排与数据都是
-   已有的静态路径，只是把 plan 的来源从「叉乘」换成「网格勾选」，几乎零额外成本。
+1. [x] **§5.1 账本锁**（2026-07-28）：`tools/_appctx.py` `ledger_lock()`（可重入 flock），全仓写点已包锁并
+   grep 核对（`grep -nE 'open\([A-Za-z_][^,)]*,\s*"[wa]"' tools/*.py`）。验证：3 进程 × 40 并发 upsert
+   无丢更新/无半行。**「多开 bash 手动并行」自此可用**。
+2. [x] **§5.3+§5.4 桌面壳并行（矩阵）**（2026-07-28）：Rust `RUN_PGIDS: Mutex<Vec<(String,i32)>>`（key=serial）+
+   `abort_run` 遍历全杀；前端 `runStore.start` 收 `plan`、`Promise.all` 起设备 worker（worker 内串行），
+   收尾（registerIssues→sync→doc）统一一次。
+3. [x] **§5.2 三元组 executions 表 + 流水 tab 加 serial 列**（2026-07-28）：新增 `tools/exec_ledger.py` +
+   `ledger/executions.csv`（run_flow 写执行事实、case_result `--serial` 写判定、聚合回 queue）；
+   log/evidence/issues 行尾加「执行设备」列（老账本 `ensure_device_column` 就地迁移）。
+   验证：双设备矩阵模拟（devA 通过/devB 失败并行）→ executions 各记各的、queue 聚合「失败」、log 不串台。
+4. [x] **§5.2 云端 Sheet 轻量多设备视图**（2026-07-28）：三个流水 tab 的「执行设备」列加在行尾，
+   `sheets_sync`（csv 直投）与条件着色（按列号）零改动自动带上；不做宽矩阵，executions 不单开 tab。
+5. [x] **§5.4 「用例 × 设备」逐格分派**（2026-07-28）：未做整张网格大表——保留「勾用例+勾设备=矩阵」
+   默认语义，勾 >1 台设备时每条已勾用例行尾出设备 chips，逐格取消=显式分派（`rowSerials` 覆盖，
+   `buildPlan()` 产出 plan），校验「每个勾选用例至少落一台」。
+
+> 待办（不属于本 handoff 的实施步骤）：真机 ≥2 台跑一轮完整矩阵验证，见 `docs/todo.md` #5。
 
 > 单台/手动显式分派在第 1 步（CLI）就能覆盖；桌面壳矩阵真并行在第 2 步；**同用例多设备的逐台结果回溯
 > 必须等第 3 步——按用户需求不能省**（本次讨论对原方案的最大修正：从「非必需增强」升级为一等目标）。

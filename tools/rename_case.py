@@ -15,7 +15,7 @@
 """
 import csv, pathlib, re, sys
 
-from _appctx import CASES, LEDGER
+from _appctx import CASES, LEDGER, ledger_lock
 
 
 def main():
@@ -49,25 +49,26 @@ def main():
     old_path.rename(new_path)
     print(f"[rename_case] {old_path.name} → {new_path.name}，id 字段已同步改")
 
-    for fname in ("queue.csv", "board.csv"):
-        path = LEDGER / fname
-        if not path.exists():
-            continue
-        rows = list(csv.reader(open(path, encoding="utf-8")))
-        if not rows:
-            continue
-        header = rows[0]
-        if "用例ID" not in header:
-            continue
-        i_id = header.index("用例ID")
-        changed = 0
-        for r in rows[1:]:
-            if len(r) > i_id and r[i_id] == old_id:
-                r[i_id] = new_id
-                changed += 1
-        if changed:
-            csv.writer(open(path, "w", newline="", encoding="utf-8")).writerows(rows)
-            print(f"[rename_case] {fname}：{changed} 行 用例ID {old_id} → {new_id}")
+    with ledger_lock():  # 账本 read-modify-write 统一持锁（多设备并行安全）
+        for fname in ("queue.csv", "board.csv"):
+            path = LEDGER / fname
+            if not path.exists():
+                continue
+            rows = list(csv.reader(open(path, encoding="utf-8")))
+            if not rows:
+                continue
+            header = rows[0]
+            if "用例ID" not in header:
+                continue
+            i_id = header.index("用例ID")
+            changed = 0
+            for r in rows[1:]:
+                if len(r) > i_id and r[i_id] == old_id:
+                    r[i_id] = new_id
+                    changed += 1
+            if changed:
+                csv.writer(open(path, "w", newline="", encoding="utf-8")).writerows(rows)
+                print(f"[rename_case] {fname}：{changed} 行 用例ID {old_id} → {new_id}")
 
     print(f"[rename_case] log.csv/evidence.csv/issues.csv 里 {old_id} 的历史行不动，"
           "问题单要不要跟着改用例ID自己判断")

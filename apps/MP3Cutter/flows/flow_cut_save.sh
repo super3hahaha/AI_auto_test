@@ -22,9 +22,12 @@ S="$1"
 AK="python3 tools/adbkit.py --serial $S"
 CASE="CUT-CORE-01"   # 纯用例ID；证据路径里的设备段由 adbkit 按 --serial 自动加，别把 serial 掺进 --case
 # 多语言查表：LANG_CODE=ko bash apps/MP3Cutter/flows/flow_cut_save.sh <serial> 即可换语言跑；
-# 不传 LANG_CODE 时 t() 原样返回原文，行为与接入前完全一致。见 tools/lang_helper.sh。
+# 不传 LANG_CODE 时 t() 原样返回原文，行为与接入前完全一致；表路径不用写死，lang_helper 按
+# 设备实装 versionCode 自动备表（见 tools/lang_helper.sh、docs/decisions.md #55）。
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/lang_helper.sh"
-TABLE="apps/MP3Cutter/lang/strings_table.json"
+# settle_result_page()（结果页 dump 前再确认，防事后插屏广告二次盖住结果页）从这里来，
+# 见 tools/flow_result_settle.sh 头注 2026-09-04 条目。
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/flow_result_settle.sh"
 PKG="ringtone.maker.mp3.cutter.audio"   # 前台归属判断用：被全屏插屏广告/误触 BACK 弹回桌面时，据此把 App 重新拉回前台
 SRC="assets/mp3-sample-track.mp3"
 DEV_DST="/sdcard/Music/mp3-sample-track.mp3"
@@ -66,9 +69,15 @@ $AK focus 2>/dev/null | grep -q "$PKG" || { log "App 不在前台，重新拉起
 # dump_hierarchy 能看到 WebView 覆盖层里的 `关闭` 节点，sweep 规则直接点得到，盲点兜底不再需要；
 # 而那 8 连点里 y=15/40 落在状态栏区、两列自上而下快速点会被系统当成「下拉」手势把通知栏拉出来
 # 盖住页面（还有 AD_W 取物理尺寸 1440 而非 override 1080 导致 x 越界的 bug）。详见 gotchas.md。
-CUT_ENTRY="$(t 音频裁剪 mp3_cutter)"   # resource-id=ll_cut 真机核对确认是 mp3_cutter 这个 key（非 audio_cutter，两者zh-rCN撞车）
+CUT_ENTRY="$(t 音频裁剪 mp3_cutter)"   # 仅作兜底/日志用途，见下方说明
+# 2026-08-17 真机复现（192.168.209.171:5555）：系统 locale 仍是 zh-Hans-CN，但首页六宫格
+# tile 的文案渲染成了英文「Audio Cutter」而非「音频裁剪」（同一批设备早前跑 CONV-CORE-01
+# 时该处还是中文，尚未查清是 App 显示语言跟随逻辑变化还是这批机型的间歇状态）——原来靠
+# t() 查表出的固定中文文案去 waitfor/taptext，在这种情况下必然等 8s 超时，且现象(按钮清晰
+# 可见且已激活) 极易被误判成产品缺陷（见 gotchas.md 2026-08-17 条目）。改成按 resource-id
+# ll_cut 定位/点击，不依赖显示语言，从根上不怕这类语言不同步问题。
 for _ in $(seq 1 15); do
-  $AK waitfor text "$CUT_ENTRY" --timeout 1 >/dev/null 2>&1 && break
+  $AK waitfor id ll_cut --timeout 1 >/dev/null 2>&1 && break
   # App 被广告任务/残留状态弹回桌面时 focus 不含包名——重新拉回前台，别停在桌面空转
   $AK focus 2>/dev/null | grep -q "$PKG" || { log "广告页把 App 弹出，重新拉起"; $AK launch >/dev/null 2>&1; sleep 3; }
   sweep --rounds 5 --interval 1.2 --patience 2
@@ -76,24 +85,42 @@ for _ in $(seq 1 15); do
   $AK tapid close-button --timeout 2 >/dev/null 2>&1 || true
   $AK tapdesc "Interstitial close button" --timeout 2 >/dev/null 2>&1 || true
 done
-# 首页截图挪到这里：清广告循环退出后才截，并挂真实门控——『音频裁剪』必须在屏才记「通过」。
-# 若广告（含关不掉的 WebView 插屏）还盖着首页，音频裁剪就不在 uiautomator 树里 → shot 记「失败」
+# 首页截图挪到这里：清广告循环退出后才截，并挂真实门控——『音频裁剪』tile 必须在屏才记「通过」。
+# 若广告（含关不掉的 WebView 插屏）还盖着首页，ll_cut 就不在 uiautomator 树里 → shot 记「失败」
 # 并非0退出，set -e 让整轮如实判失败，而不是把广告截图当首页判过（修掉历史假阳性）。
+# --assert-text 不能再硬编码 CUT_ENTRY（显示语言可能是中文也可能是英文，见上）——现读 ll_cut
+# 子节点当前真实文案存入 CUT_LABEL 用来断言，断言永远跟当次真实显示的语言一致；读不到（比如
+# 页面结构又变了）才退回 t() 查表值兜底，保证这条断言不会因为读不到就直接跳过。
+# 2026-08-18 真机踩过（VOICE-CORE-01 固化时发现，见 skill flow-freeze「两个 dump 后端排版不同」）：
+# shell 后端 dump 整份单行、u2 后端缩进多行，父子标签间隔着换行+空格，下面这条"父标签 `>` 紧跟
+# 子标签 `<node`"的正则只吃 shell 那种单行格式，u2 时匹配不到——静默退回 t() 兜底值，语言不对
+# 时直接把 --assert-text 判失败。先拍平成单行再 grep 消掉两种后端的排版差异。
+HOME_XML=$($AK --case "$CASE" ui 01-home 2>/dev/null | tr -d '\n')
+CUT_LABEL=$(grep -oE '<node[^>]*resource-id="[^"]*id/ll_cut"[^>]*>[[:space:]]*<node[^>]*text="[^"]*"' <<< "$HOME_XML" \
+  | grep -oE 'text="[^"]*"$' | sed 's/^text="//; s/"$//')
+[ -n "$CUT_LABEL" ] || CUT_LABEL="$CUT_ENTRY"
 # --assert-gone 兜一发原生广告标志（WebView 创意不进树，对其为盲区，仅作 belt-and-suspenders）。
 # --assert-timeout 6 给首页控件慢一拍出现留余量。
-$AK --case "$CASE" shot 01-home "App 首页正常显示（隐私同意弹窗已关、无插屏广告遮挡）" \
-  --assert-text "$CUT_ENTRY" --assert-gone 测试广告 --assert-timeout 6 >/dev/null; log "首页(已门控)"
+$AK --case "$CASE" shot 01-home "App 首页正常显示（隐私同意弹窗已关、无插屏广告遮挡），入口文案「$CUT_LABEL」" \
+  --assert-text "$CUT_LABEL" --assert-gone 测试广告 --assert-timeout 6 >/dev/null; log "首页(已门控，入口=$CUT_LABEL)"
 # 测试广告(--assert-gone)不查表：这是 AdMob 插屏的固定占位文案，不是 app 自身 strings.xml
 # 资源、不随设备语言变化，仅作 belt-and-suspenders，见脚本头注。
-$AK taptext "$CUT_ENTRY" --timeout 8 >/dev/null
+$AK tapid ll_cut --timeout 8 >/dev/null
 # 点「音频裁剪」后依次弹：文件访问(App内btn) → 通知权限(系统) → 音频权限(系统)，
 # 清数据后每次都会重新出现；顺序/是否出现可能随系统版本变化。
 # 文件访问是 App 内自定义按钮(id=btn)，不在通用库里，单独点；命中就点，没有就跳过。
-$AK tapid btn --timeout 6 >/dev/null 2>&1 || true
-# 通知/音频这两个系统权限弹窗改交给 sweep（perm-allow 规则覆盖 allow/allow_all/foreground 变体，
-# 顺序无关、有几个点几个），比原来固定点两次 permission_allow_button 更稳，还顺带兜这一步的广告。
-sweep --rounds 5 --interval 0.6 --patience 2
-$AK waitfor text "$(t 选择音频)" --timeout 8 --cache picker >/dev/null
+# 2026-07-29：原来只兜一轮 sweep+单次8s等待，实测某些设备权限弹窗节奏更慢/更多轮，单轮不够
+# 会直接超时（真机复现）。改成多轮兜底（每轮补点一次文件访问按钮+sweep+短等一次），命中就跳出；
+# 不改变判定本身——循环耗尽后最后再等一次，找不到仍如实交给下面的失败路径。
+PICKER_FOUND=0
+for _ in 1 2 3; do
+  $AK tapid btn --timeout 2 >/dev/null 2>&1 || true
+  # 通知/音频这两个系统权限弹窗改交给 sweep（perm-allow 规则覆盖 allow/allow_all/foreground 变体，
+  # 顺序无关、有几个点几个），比原来固定点两次 permission_allow_button 更稳，还顺带兜这一步的广告。
+  sweep --rounds 5 --interval 0.6 --patience 2
+  $AK waitfor text "$(t 选择音频)" --timeout 4 --cache picker >/dev/null 2>&1 && { PICKER_FOUND=1; break; }
+done
+[ "$PICKER_FOUND" = "1" ] || $AK waitfor text "$(t 选择音频)" --timeout 4 --cache picker >/dev/null
 $AK --case "$CASE" shot 02-picker "进入「选择音频」列表" >/dev/null; log "选择音频"
 
 # 2026-07-17 改为搜索定位：点搜索图标 → 输入文件名 → 点结果，比在长列表里翻找/裸猜第一项更稳。
@@ -104,7 +131,7 @@ $AK waitfor id search_edit_text --timeout 6 >/dev/null
 # 系统默认输入法必须是不带联想的英文键盘——实测拼音等联想输入法会把 input text 送入的字符串整段
 # 替换成联想词（"mp3-sample-track.mp3" 变成"门票－3sample－track。门票3"这种），导致搜索失败；
 # 这不是 adbkit text 命令的 bug，是设备当前 IME 拦截改写了原始按键，见 gotchas.md。
-$AK text "$SRC_NAME" >/dev/null
+$AK text "$SRC_NAME" --assert-typed >/dev/null
 # 点选搜索结果：**按列表项自身的 id tv_name 点，不再用「文本+--index 1」**。
 # 早先靠「搜索框 EditText 回显(id=search_edit_text) + 列表项(id=tv_name)」这两个节点 text 都等于文件名、
 # 恒为 2 个匹配、取 index 1 定位列表项——但这个前提不稳：搜索结果行是异步渲染的，dump 若赶在结果行
@@ -169,6 +196,9 @@ $AK tapid btn_convert --timeout 8 >/dev/null
 # 有广告就等它出跳过按钮点掉，没广告则连续 patience 轮无命中很快退，不会白等满 10s。
 sweep --rounds 10 --interval 1 --patience 3
 if $AK waitfor text "$(t 音频已保存)" --timeout 15 >/dev/null 2>&1; then
+  # dump 前再确认几轮（防事后插屏广告二次盖住结果页，见 tools/flow_result_settle.sh 头注
+  # 2026-09-04 条目），确认不掉也不阻塞，带着广告截图往下走。
+  settle_result_page text "$(t 音频已保存)"
   # 结果页同样不能只说"已生成"——读结果页 info 控件的"大小｜时长"文本存进断言；
   # 再跑一次 output-check 用编辑器选区算出的预期时长做交叉核对，MediaStore 那行的
   # 断言会带精确 _size/duration + 是否跟预期一致的结论，而不是"完整性通过"这种空话。
@@ -189,15 +219,14 @@ if $AK waitfor text "$(t 音频已保存)" --timeout 15 >/dev/null 2>&1; then
   # 2026-07-23：原为精确到分钟，同分钟内连跑会撞名导致重命名误判失败，改成精确到秒
   # （见 docs/gotchas.md 2026-07-23 条目）。
   # 点文件名旁的铅笔图标(id/iv_rename，实测点它会弹「重命名」对话框)：EditText(id=file_name)
-  # 已预填原文件名且已获焦，光标不一定在末尾——先 MOVE_END 再连续退格清空（原名长度不定，
-  # 退格次数给足 40 次兜底，清不干净也不会误删到对话框外）。button1(重命名)在文本未变化时是
-  # disabled 的，只要新文件名和原名不同就会置为 enabled，天然满足。
+  # 已预填原文件名且整体选中——单次 KEYCODE_DEL 即可清空整段选中内容，不需要 MOVE_END+循环退格
+  # （2026-07-28 真机验证，见 docs/gotchas.md）。button1(重命名)在文本未变化时是 disabled 的，
+  # 只要新文件名和原名不同就会置为 enabled，天然满足。
   NEWNAME="cut$(date +%Y%m%d_%H%M%S)"
   $AK tapid iv_rename --timeout 5 >/dev/null
   $AK waitfor id file_name --timeout 5 >/dev/null
-  $AK key 123 >/dev/null   # KEYCODE_MOVE_END
-  for i in $(seq 1 40); do $AK key 67 >/dev/null; done   # KEYCODE_DEL 连续退格清空原名
-  $AK text "$NEWNAME" >/dev/null
+  $AK key 67 >/dev/null   # KEYCODE_DEL 单次退格，删除整段选中的原文件名
+  $AK text "$NEWNAME" --assert-typed >/dev/null
   $AK tapid button1 --timeout 5 >/dev/null   # 对话框内「重命名」确认键（系统 AlertDialog 正向按钮，非 App 自定义 id）
   if $AK waitfor text "$NEWNAME.mp3" --timeout 8 >/dev/null 2>&1; then
     $AK --case "$CASE" shot 06-renamed "结果页文件名已重命名为 $NEWNAME.mp3" >/dev/null
@@ -221,6 +250,10 @@ else
   log "结果: 未见'音频已保存'，已截图待查"
   FAILED=1
 fi
+
+LS=$($AK --case "$CASE" logscan final 2>&1)
+grep -qE '，[1-9][0-9]* 条命中' <<< "$LS" && { log "logscan 命中崩溃/异常"; FAILED=1; }
+log "崩溃扫描已跑（见 evidence.csv logs 行）"
 log "DONE（FAILED=$FAILED）"
 [ "$FAILED" = "1" ] && exit 1
 exit 0

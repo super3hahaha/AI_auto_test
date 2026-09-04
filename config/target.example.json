@@ -1,6 +1,5 @@
 {
   "package": "com.example.app",
-  "serial": "",
   "db_name": "app.db",
   "evidence_root": "evidence",
   "date": "",
@@ -14,20 +13,17 @@
   "report_title": "",
   "app_name": "",
   "app_slug": "",
-  "app_version": "",
   "main_activity": "",
   "build": "",
 
   "_说明": {
     "package": "被测 App 包名，adbkit 全靠它 run-as / launch / clear",
-    "serial": "多设备时填 adb devices 里的序列号；单设备留空",
     "db_name": "App 私有目录 databases/ 下的主 sqlite 文件名；不做 DB 断言可留空",
     "app_name": "展示用的 App 全名（如从 apk 里 aapt 读到的）；new_run.py 建看板标题会带上它（`<app_name> <board_title> - <date> <HH:MM>`），留空则标题不含 App 名",
     "app_slug": "证据目录简称（evidence/<app_slug>/<version>/...），跟 app_name 分开是因为全名常带空格/&，直接当目录名不好看；留空则退回用 app_name，再空退回包名最后一段",
-    "app_version": "被测版本号，决定证据目录第二层；换版本记得连 build 一起改",
     "main_activity": "launch 子命令用来 am start 显式启动页；留空会退回 monkey 启动",
     "build": "构建类型 + debuggable 判定说明（决定黑盒/白盒 oracle 深度），文本供人看，代码不解析",
-    "_tools": "以上 app_name/app_slug/app_version/main_activity/build/db_name 换包时可用 tools/init_target.py <包名> 自动探测（默认只打印，--write 才落盘；app_name/app_version 建议人工核对后再写，见 docs/gotchas.md）",
+    "_tools": "以上 app_name/app_slug/main_activity/build/db_name 换包时可用 tools/init_target.py <包名> 自动探测（默认只打印，--write 才落盘；app_name 建议人工核对后再写，见 docs/gotchas.md）。serial/app_version 不是本文件的字段——serial 没有「默认设备」这回事（多设备并行下 executions.csv 才是逐台真值），app_version 由 adbkit.py/run_flow.py 每次现查设备真实安装版本（见 _appctx.probe_installed_version），不用静态配置",
     "evidence_root": "证据根目录，相对项目根",
     "date": "留空=用今天(YYYYMMDD)；复现历史某轮时可固定",
     "run_id": "本轮执行批次 ID（格式 YYYYMMDD-HHMM），由 new_run.py 开一轮时自动生成并回填，无需手填。证据目录按它归档（evidence/<app>/<ver>/<run_id>/...），同日多轮不撞、桌面壳可按批次查证据。留空时 adbkit 退回用纯日期段（兼容旧机器）。见 docs/decisions.md #31",

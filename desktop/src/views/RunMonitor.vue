@@ -1,6 +1,8 @@
 <script setup lang="ts">
-import { ref, reactive, computed, watch, nextTick } from "vue";
-import { runStore, labelOf, type CellStatus, type IssueState, type MonitorSource } from "../runStore";
+import { ref, reactive, computed, watch, nextTick, onMounted } from "vue";
+import { runStore, labelOf, type CellStatus, type IssueState, type MonitorSource, type RerunPlan } from "../runStore";
+import { api } from "../api";
+import { store } from "../store";
 
 defineOptions({ name: "RunMonitor" });
 
@@ -8,24 +10,78 @@ defineOptions({ name: "RunMonitor" });
 // running/aborting/syncing/docGenerating 在快照里恒 false → 头部显示「已完成/空闲」、中止按钮禁用。
 const props = defineProps<{ source?: MonitorSource | null }>();
 const M = props.source ?? runStore;
+// 传了 source（历史快照）才是「执行记录」页——头部把中止按钮换成「失败重跑」（中止按钮对已完成的
+// 历史记录本就永远禁用，留着没意义）；实时执行台（不传 source）保留原来的中止按钮。
+const isRecord = computed(() => !!props.source);
+const emit = defineEmits<{ (e: "rerun-failed", plan: RerunPlan): void }>();
 
 // 问题清单自动登记状态的中文短标（收尾阶段流转）
 function issueLabel(s: IssueState): string {
-  return { none: "", registering: "登记中…", registered: "已登记", manual: "人工" }[s];
+  return { none: "", registering: "登记中…", registered: "已登记", manual: "人工", skipped: "已跳过" }[s];
 }
-// 卡片 / 失败摘要上的徽标只显示「还需要处理」的状态——已自动登记完成（registered）
-// 不再占地方提示，只留「待人工登记」（manual）继续提醒，避免登记完成后仍反复刷屏。
+// 卡片 / 失败摘要上的徽标只显示「还需要处理」或「用户特意选了不一样结果」的状态——已自动登记
+// 完成（registered）不再占地方提示；「待人工登记」（manual）继续提醒；「已跳过」（skipped）是
+// 用户手动选的，跟默认路径不一样，留个标记方便回头确认当时为什么没登记。
 function showIssuePill(s: IssueState): boolean {
-  return s === "manual";
+  return s === "manual" || s === "skipped";
+}
+// 收尾流程还没跑到这一格（issue 仍是 "none"）且这一格是失败/需复核 → 可以切换「本条要不要登记」。
+// 调试固化脚本时常见：失败是脚本没写好，不是真缺陷，不想每次收尾都自动占用 issues.csv。
+function canToggleSkip(status: CellStatus, issue: IssueState): boolean {
+  return issue === "none" && (status === "fail" || status === "app_defect" || status === "needs_human");
 }
 
-type Filter = "all" | "ok" | "bad" | "needs";
+type Filter = "all" | "ok" | "bad";
 const filter = ref<Filter>("all");
 const eventsBox = ref<HTMLElement | null>(null);
 
 const serials = computed(() => M.serials());
 const caseIds = computed(() => M.caseIds());
 const hasRun = computed(() => M.cells.length > 0);
+
+// 序列号→别名/型号：矩阵/失败摘要里的 serial 无线连接时是 ip:port，没有这层兜底会直接露出端口号
+// （同 Evidence.vue/Runner.vue 的坑，见 docs/gotchas.md）。别名优先，没有就退回型号，再没有才原样显示。
+const aliasMap = ref<Record<string, string>>({});
+const modelMap = ref<Record<string, string>>({});
+function deviceLabel(serial: string): string {
+  return aliasMap.value[serial] || modelMap.value[serial] || serial;
+}
+// 实时过程日志的行文本是 run_flow.py/adbkit 里的固化脚本自己 log() 出来的（形如 "[$S] xxx"），
+// $S 就是原始 adb serial（带冒号），不是模板插值拼出来的字段，没法直接换成 deviceLabel(serial)
+// ——只能在渲染前对已知 serial 做一次字符串替换。已知 serial 集合=本轮涉及的 serials ∪ 别名/型号
+// 表的 key，命中才替换，避免误伤日志正文里凑巧出现的数字串。
+const knownSerials = computed(() => {
+  const set = new Set<string>(serials.value);
+  Object.keys(aliasMap.value).forEach((k) => set.add(k));
+  Object.keys(modelMap.value).forEach((k) => set.add(k));
+  return [...set];
+});
+function labelizeText(text: string): string {
+  let out = text;
+  for (const s of knownSerials.value) {
+    if (out.includes(s)) {
+      const label = deviceLabel(s);
+      if (label !== s) out = out.split(s).join(label);
+    }
+  }
+  return out;
+}
+// RunMonitor 靠 v-show 常驻挂载（见 Runner.vue「执行台」容器），onMounted 只会跑这一次——
+// 场景库设备面板之后点「刷新」查到新型号/别名，只会更新磁盘缓存文件，不会自动触发这里重读。
+// 暴露 reload() 给 Runner.vue 在 loadDevices() 里主动调用，两边缓存才能对得上（真实症状：无线设备
+// 首次连接时看板还没查到型号显示 ip:port，场景库刷新后型号已知，看板标题栏却仍卡在 ip:port）。
+async function loadDeviceLabels() {
+  try {
+    const kvs = await api.readDeviceAliases();
+    aliasMap.value = Object.fromEntries(kvs.map((k) => [k.key, k.value]));
+  } catch { /* 别名读不到无妨，退化为显示型号/serial */ }
+  try {
+    const kvs = await api.readDeviceModelCache();
+    modelMap.value = Object.fromEntries(kvs.map((k) => [k.key, k.value]));
+  } catch { /* 型号缓存读不到无妨，退化为显示 serial */ }
+}
+defineExpose({ reload: loadDeviceLabels });
+onMounted(loadDeviceLabels);
 
 // 设备面板折叠态（按 serial 记，默认展开；纯 UI 态，不放 runStore）
 const collapsedMap = reactive<Record<string, boolean>>({});
@@ -43,19 +99,48 @@ function doneCountOf(s: string): number {
   return cellsOf(s).filter((c) => c.status !== "waiting" && c.status !== "running" && !c.recording).length;
 }
 function countsOf(s: string) {
-  const c = { ok: 0, bad: 0, needs: 0 };
+  const c = { ok: 0, bad: 0 };
   for (const cell of cellsOf(s)) {
     if (cell.status === "pass" || cell.status === "healed") c.ok++;
-    else if (cell.status === "fail" || cell.status === "app_defect") c.bad++;
-    else if (cell.status === "needs_human") c.needs++;
+    else if (cell.status === "fail" || cell.status === "app_defect" || cell.status === "needs_human") c.bad++;
   }
   return c;
+}
+
+// 设备总耗时：累加该设备所有格子的 elapsed（各格串行执行，求和≈墙钟时间）
+function totalElapsedOf(s: string): number {
+  return cellsOf(s).reduce((sum, c) => sum + (c.elapsed || 0), 0);
+}
+// h/min/s 格式化：<60s 只写 s；<1h 写 XminYs；否则写 XhYmZs
+function formatDuration(totalSec: number): string {
+  const s = Math.round(totalSec);
+  if (s < 60) return `${s}s`;
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return h > 0 ? `${h}h${m}m${sec}s` : `${m}min${sec}s`;
 }
 
 // 全局失败用例摘要：跨设备汇总，供折叠后也能一眼看到哪些用例炸了
 const failedCells = computed(() =>
   M.cells.filter((c) => c.status === "fail" || c.status === "app_defect")
 );
+
+// 「失败重跑」：把失败摘要里这些格子打包成 RerunPlan 交给 Runner——只带上「这条用例具体在哪几台
+// 设备上失败」，不是本轮勾选过的全部设备，好让场景库据此逐格显式分派（而不是重新在全部设备上跑一遍）。
+// 设备是否在线由 Runner 收到后现查，这里只负责把失败当下能拿到的展示名一并带过去，供查到掉线时提示用。
+function emitRerunFailed() {
+  if (!failedCells.value.length) return;
+  const casesSet = new Set(failedCells.value.map((c) => c.caseId));
+  const cases = M.caseIds().filter((cid) => casesSet.has(cid));
+  const serialsByCase: Record<string, string[]> = {};
+  const labels: Record<string, string> = {};
+  for (const c of failedCells.value) {
+    (serialsByCase[c.caseId] ??= []).push(c.serial);
+    labels[c.serial] = deviceLabel(c.serial);
+  }
+  emit("rerun-failed", { cases, serialsByCase, labels });
+}
 
 const overall = computed(() => {
   if (M.running) return M.aborting ? "中止中…" : "运行中";
@@ -68,15 +153,13 @@ function inFilter(s: CellStatus): boolean {
   if (filter.value === "all") return true;
   if (filter.value === "ok") return s === "pass" || s === "healed";
   if (filter.value === "bad") return s === "fail" || s === "app_defect";
-  if (filter.value === "needs") return s === "needs_human";
   return true;
 }
 const counts = computed(() => {
-  const c = { ok: 0, bad: 0, needs: 0 };
+  const c = { ok: 0, bad: 0 };
   for (const cell of M.cells) {
     if (cell.status === "pass" || cell.status === "healed") c.ok++;
-    else if (cell.status === "fail" || cell.status === "app_defect") c.bad++;
-    else if (cell.status === "needs_human") c.needs++;
+    else if (cell.status === "fail" || cell.status === "app_defect" || cell.status === "needs_human") c.bad++;
   }
   return c;
 });
@@ -85,11 +168,12 @@ const counts = computed(() => {
 // 分母用 M.issueTotal（开始登记时就定住的固定值），不再按"目前处理到第几条"动态数——
 // 串行逐条登记时，还没轮到的格子 issue 仍是 "none"，若靠遍历 cells 数分母会出现 1/2→2/3→3/4 的诡异爬升。
 const issueStats = computed(() => {
-  const s = { total: M.issueTotal, registering: 0, registered: 0, manual: 0 };
+  const s = { total: M.issueTotal, registering: 0, registered: 0, manual: 0, skipped: 0 };
   for (const cell of M.cells) {
     if (cell.issue === "registering") s.registering++;
     else if (cell.issue === "registered") s.registered++;
     else if (cell.issue === "manual") s.manual++;
+    else if (cell.issue === "skipped") s.skipped++;
   }
   return s;
 });
@@ -101,21 +185,30 @@ const publishPhase = computed(() => {
   if (M.syncing) return { cls: "run", text: "同步表格中…" };
   if (M.docGenerating) return { cls: "run", text: "刷新报告中…" };
   // 收尾结束：若本轮有失败/需复核用例，把问题清单登记结果留在头部
-  if (issueStats.value.total > 0) {
+  if (issueStats.value.total > 0 || issueStats.value.skipped > 0) {
     const parts = [];
     if (issueStats.value.registered) parts.push(`已登记 ${issueStats.value.registered}`);
     if (issueStats.value.manual) parts.push(`待人工 ${issueStats.value.manual}`);
+    if (issueStats.value.skipped) parts.push(`已跳过 ${issueStats.value.skipped}`);
     return { cls: issueStats.value.manual ? "warn" : "ok", text: `问题清单：${parts.join(" · ")}` };
   }
   return null;
 });
 
-// 右栏「实时过程」：选中某格 → 只看该格日志；否则看全部运行事件
-const shownLines = computed(() =>
-  M.selectedKey
+// 右栏「实时过程」：选中某格 → 只看该格日志；否则看全部运行事件（都过一遍 labelizeText 把行里的原始 serial 换成别名/型号）
+const shownLines = computed(() => {
+  const raw = M.selectedKey
     ? (M.cells.find((c) => M.key(c.serial, c.caseId) === M.selectedKey)?.lines || []).map((t) => ({ text: t, level: "info" as const }))
-    : M.events
-);
+    : M.events;
+  return raw.map((e) => ({ ...e, text: labelizeText(e.text) }));
+});
+// 「格日志：<serial> / <caseId>」子标题——selectedKey 的 serial 段也要走别名/型号，不能露 ip:port
+const selectedKeyLabel = computed(() => {
+  if (!M.selectedKey) return "";
+  const i = M.selectedKey.indexOf("|");
+  if (i < 0) return M.selectedKey;
+  return `${deviceLabel(M.selectedKey.slice(0, i))} / ${M.selectedKey.slice(i + 1)}`;
+});
 
 function pillClass(s: CellStatus) {
   return {
@@ -149,6 +242,41 @@ function scrollToAnchor() {
     if (hlTimer) window.clearTimeout(hlTimer);
     hlTimer = window.setTimeout(() => { highlightIdx.value = -1; }, 2200);
   });
+}
+
+// ── 卡片「↗」：跳到证据页并定位到这一格的第一项证据 ──
+// 轮次：历史快照用它自己记的 runId（可能是已归档的旧轮次），实时源没有这个字段 → 回退到当前批次。
+// 「执行记录」页与「执行台」共用本组件，所以这颗按钮两处都有，只是 runId 取法不同。
+const evidenceRunId = computed(
+  () => props.source?.runId || store.runs.find((r) => r.is_current)?.run_id || ""
+);
+// 从该格日志里抓出「这一次执行」的证据坐标。固化脚本每次采证都会打出证据文件全路径
+// （`[ui] 已保存 …/evidence/<slug>/<ver>/<run_id>/<case>/<serial>/<attempt>/ui/xx.xml`），
+// run_id 和 attempt 两段都在里面 → 加上用例、serial 就是四段全齐，能跟证据页**精确**对上，
+// 不用靠时间戳猜。`lines` 本来就存进执行记录快照，所以历史旧记录也配得准——实测本机 15 条记录
+// 98 格全部精确命中，含 34 格 `meta.runId` 字段加入前存的、光看 meta 根本不知道属于哪一轮的格。
+// 用 caseId + 媒体目录名双锚定，避免误抓日志正文里凑巧出现的六位数字；取最后一条匹配。
+function evidenceRefOf(serial: string, caseId: string): { runId: string; attempt: string } {
+  const lines = M.cell(serial, caseId)?.lines || [];
+  const re = new RegExp(`evidence/[^/]+/[^/]+/([^/]+)/${caseId}/[^/]+/(\\d{6})/(?:screenshots|logs|ui)/`);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const m = re.exec(lines[i]);
+    if (m) return { runId: m[1], attempt: m[2] };
+  }
+  return { runId: "", attempt: "" };
+}
+function jumpToEvidence(serial: string, caseId: string) {
+  const ref = evidenceRefOf(serial, caseId);
+  // 批次优先用日志里抓到的（比 meta.runId 可靠，且覆盖没有那个字段的旧记录）；
+  // attempt 精确定位这一次执行；开跑时刻兜底——脚本刚起来就崩、一条证据都没产出时日志里没有
+  // 路径可抓，那时只能按时间就近配（见 Evidence.matchAttemptIndex）。
+  store.requestEvidence(
+    serial,
+    caseId,
+    ref.runId || evidenceRunId.value,
+    M.cell(serial, caseId)?.startedAt || 0,
+    ref.attempt
+  );
 }
 
 function pickCell(serial: string, caseId: string) {
@@ -185,7 +313,10 @@ watch(
           <span class="muted prog">{{ M.doneCount() }}/{{ M.totalCount() }} 格完成</span>
           <span v-if="publishPhase" class="publish-chip" :class="publishPhase.cls">{{ publishPhase.text }}</span>
         </div>
-        <button class="abort-btn" :disabled="!M.running || M.aborting" @click="M.abort()">
+        <button v-if="isRecord" class="abort-btn rerun-btn" :disabled="!failedCells.length" @click="emitRerunFailed">
+          失败重跑{{ failedCells.length ? `（${failedCells.length}）` : "" }}
+        </button>
+        <button v-else class="abort-btn" :disabled="!M.running || M.aborting" @click="M.abort()">
           {{ M.aborting ? "中止中…" : "中止任务" }}
         </button>
       </div>
@@ -197,57 +328,72 @@ watch(
             <button :class="{ on: filter === 'all' }" @click="filter = 'all'">全部 {{ M.totalCount() }}</button>
             <button :class="{ on: filter === 'ok' }" @click="filter = 'ok'">通过 {{ counts.ok }}</button>
             <button :class="{ on: filter === 'bad' }" @click="filter = 'bad'">失败 {{ counts.bad }}</button>
-            <button :class="{ on: filter === 'needs' }" @click="filter = 'needs'">需人工 {{ counts.needs }}</button>
           </div>
           <div v-if="failedCells.length" class="fail-summary">
             <span class="fail-summary-t">⚠ 失败用例摘要（{{ failedCells.length }}）</span>
-            <button
-              v-for="fc in failedCells"
-              :key="M.key(fc.serial, fc.caseId)"
-              class="fail-chip mono"
-              @click="pickCell(fc.serial, fc.caseId)"
-            >
-              {{ fc.serial }} · {{ fc.caseId }}
-              <span v-if="showIssuePill(fc.issue)" class="issue-pill" :class="fc.issue">{{ issueLabel(fc.issue) }}</span>
-            </button>
+            <span v-for="fc in failedCells" :key="M.key(fc.serial, fc.caseId)" class="fail-chip-wrap">
+              <button class="fail-chip mono" @click="pickCell(fc.serial, fc.caseId)">
+                {{ deviceLabel(fc.serial) }} · {{ fc.caseId }}
+                <span v-if="showIssuePill(fc.issue)" class="issue-pill" :class="fc.issue">{{ issueLabel(fc.issue) }}</span>
+              </button>
+              <button
+                v-if="canToggleSkip(fc.status, fc.issue)"
+                class="skip-toggle"
+                :class="{ off: fc.issueSkip }"
+                :title="fc.issueSkip ? '点击恢复：收尾时正常登记问题清单' : '点击跳过：收尾时不登记问题清单（调试固化脚本时常用）'"
+                @click="M.toggleIssueSkip(fc.serial, fc.caseId)"
+              >{{ fc.issueSkip ? "不登记" : "登记" }}</button>
+            </span>
           </div>
           <div class="devices-scroll">
             <div v-for="s in serials" :key="s" class="device-panel">
               <div class="device-hd" @click="toggleDevice(s)">
                 <span class="chevron">{{ isCollapsed(s) ? "▸" : "▾" }}</span>
-                <span class="mono dev-serial">{{ s }}</span>
-                <span class="muted dev-prog">{{ doneCountOf(s) }}/{{ caseIds.length }} 完成</span>
+                <span class="mono dev-serial" :title="s">{{ deviceLabel(s) }}</span>
+                <!-- 分母 = 该设备在 plan 里实际分到的格数（显式分派下各台不同，不能用全局用例数） -->
+                <span class="muted dev-prog">{{ doneCountOf(s) }}/{{ cellsOf(s).length }} 完成</span>
                 <span v-if="countsOf(s).ok" class="dev-ok">通过 {{ countsOf(s).ok }}</span>
                 <span v-if="countsOf(s).bad" class="dev-bad">失败 {{ countsOf(s).bad }}</span>
-                <span v-if="countsOf(s).needs" class="dev-needs">需人工 {{ countsOf(s).needs }}</span>
-                <button
-                  v-for="cid in caseIds.filter((cid) => M.cell(s, cid) && (M.cell(s, cid)!.status === 'fail' || M.cell(s, cid)!.status === 'app_defect'))"
-                  :key="cid"
-                  class="fail-chip sm mono"
-                  @click.stop="pickCell(s, cid)"
-                >
-                  {{ cid }}
-                </button>
+                <span v-if="totalElapsedOf(s)" class="dev-total-t">总耗时 {{ formatDuration(totalElapsedOf(s)) }}</span>
               </div>
               <div v-show="!isCollapsed(s)" class="device-grid">
                 <template v-for="cid in caseIds" :key="cid">
-                  <button
+                  <div
                     v-if="M.cell(s, cid)"
                     class="case-card"
+                    role="button"
+                    tabindex="0"
                     :class="{
                       dim: !inFilter(M.cell(s, cid)!.status),
                       sel: M.selectedKey === M.key(s, cid),
                     }"
                     @click="pickCell(s, cid)"
+                    @keydown.enter="pickCell(s, cid)"
                   >
-                    <div class="case-id mono">{{ cid }}</div>
+                    <div class="case-top">
+                      <span class="case-id mono">{{ cid }}</span>
+                      <!-- 还没跑过（等待中）必然没有证据，那时不显示这颗按钮 -->
+                      <button
+                        v-if="M.cell(s, cid)!.status !== 'waiting'"
+                        class="evi-jump"
+                        title="去「证据」看这条用例的证据（定位到第一项）"
+                        @click.stop="jumpToEvidence(s, cid)"
+                      >↗</button>
+                    </div>
                     <div class="case-meta">
                       <span class="st-pill" :class="pillClass(M.cell(s, cid)!.status)">{{ labelOf(M.cell(s, cid)!.status) }}</span>
                       <span v-if="M.cell(s, cid)!.issue !== 'none'" class="issue-pill" :class="M.cell(s, cid)!.issue">{{ issueLabel(M.cell(s, cid)!.issue) }}</span>
+                      <button
+                        v-if="canToggleSkip(M.cell(s, cid)!.status, M.cell(s, cid)!.issue)"
+                        class="skip-toggle"
+                        :class="{ off: M.cell(s, cid)!.issueSkip }"
+                        :title="M.cell(s, cid)!.issueSkip ? '点击恢复：收尾时正常登记问题清单' : '点击跳过：收尾时不登记问题清单（调试固化脚本时常用）'"
+                        @click.stop="M.toggleIssueSkip(s, cid)"
+                      >{{ M.cell(s, cid)!.issueSkip ? "不登记" : "登记" }}</button>
                       <span v-if="M.cell(s, cid)!.recording" class="et recording">落库中…</span>
                       <span v-else-if="M.cell(s, cid)!.elapsed" class="et">{{ M.cell(s, cid)!.elapsed }}s</span>
                     </div>
-                  </button>
+                  </div>
                 </template>
               </div>
             </div>
@@ -262,7 +408,7 @@ watch(
             <span class="conn" :class="{ live: M.running }">{{ M.running ? "实时连接正常" : "空闲" }}</span>
           </div>
           <div class="right-sub muted">
-            {{ M.selectedKey ? `格日志：${M.selectedKey.replace("|", " / ")}` : "全部运行事件" }}
+            {{ M.selectedKey ? `格日志：${selectedKeyLabel}` : "全部运行事件" }}
             <button v-if="M.selectedKey" class="link" @click="M.selectedKey = ''">看全部</button>
           </div>
           <div ref="eventsBox" class="events">
@@ -298,6 +444,9 @@ watch(
 .abort-btn { border: 0.5px solid var(--text-danger); color: var(--text-danger); background: transparent; padding: 6px 14px; border-radius: var(--radius); font-size: 13px; }
 .abort-btn:hover:not(:disabled) { background: var(--bg-danger); }
 .abort-btn:disabled { opacity: 0.4; border-color: var(--border); color: var(--text-secondary); }
+/* 「失败重跑」不是危险操作（只是把失败用例带去场景库重新勾选，不会立刻执行），用强调色而非红色 */
+.rerun-btn { border-color: var(--text-accent); color: var(--text-accent); }
+.rerun-btn:hover:not(:disabled) { background: var(--bg-accent); }
 
 .body { display: flex; gap: 12px; flex: 1; min-height: 0; }
 .left { flex: 1; min-width: 0; display: flex; flex-direction: column; }
@@ -309,6 +458,7 @@ watch(
 
 .fail-summary { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 10px 0; padding: 8px 10px; border-radius: var(--radius); background: var(--bg-danger); }
 .fail-summary-t { font-size: 12px; font-weight: 500; color: var(--text-danger); flex-shrink: 0; }
+.fail-chip-wrap { display: inline-flex; align-items: center; gap: 3px; }
 .fail-chip { font-size: 11px; padding: 2px 8px; border-radius: var(--radius); background: var(--surface-2); color: var(--text-danger); border: 0.5px solid var(--border-danger, var(--text-danger)); cursor: pointer; }
 .fail-chip.sm { margin-left: 4px; padding: 1px 7px; }
 
@@ -320,14 +470,19 @@ watch(
 .dev-prog { font-size: 12px; margin-left: auto; }
 .dev-ok { font-size: 12px; color: var(--text-success); }
 .dev-bad { font-size: 12px; color: var(--text-danger); }
-.dev-needs { font-size: 12px; color: var(--text-warning); }
+.dev-total-t { font-size: 12px; color: var(--text-muted); }
 
 .device-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; padding: 4px 12px 12px; border-top: 0.5px solid var(--border); }
 .case-card { text-align: left; border: 0.5px solid var(--border); border-radius: var(--radius); padding: 8px 10px; background: var(--surface-1); cursor: pointer; }
 .case-card:hover { border-color: var(--border-strong); }
 .case-card.dim { opacity: 0.25; }
 .case-card.sel { outline: 2px solid var(--text-accent); outline-offset: 1px; }
+.case-top { display: flex; align-items: center; gap: 6px; }
 .case-id { font-size: 12px; }
+/* 「↗」去证据：常态低对比，悬到卡片上才显眼，别跟状态徽标抢注意力 */
+.evi-jump { margin-left: auto; flex-shrink: 0; width: 20px; height: 20px; padding: 0; display: flex; align-items: center; justify-content: center; font-size: 13px; line-height: 1; border: none; border-radius: 5px; background: transparent; color: var(--text-muted); cursor: pointer; }
+.case-card:hover .evi-jump { color: var(--text-accent); background: var(--bg-accent); }
+.evi-jump:hover { color: var(--text-accent); background: var(--bg-accent); filter: brightness(0.96); }
 .case-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; margin-top: 6px; }
 .case-meta .et { font-size: 11px; color: var(--text-muted); margin-left: auto; }
 .case-meta .et.recording { color: var(--text-accent); }
@@ -343,6 +498,12 @@ watch(
 .issue-pill.registering { background: var(--bg-accent); color: var(--text-accent); }
 .issue-pill.registered { background: var(--bg-accent); color: var(--text-accent); }
 .issue-pill.manual { background: rgba(255,179,0,.16); color: #9a6700; }
+.issue-pill.skipped { background: var(--surface-2); color: var(--text-secondary); }
+/* 「本条要不要登记问题清单」切换按钮——收尾流程跑到这一格前都可以点，调试固化脚本时用来
+   取消不值得登记的失败。默认（登记）用中性描边；已切到「不登记」用醒目一点的灰底提醒别忘了改回来。 */
+.skip-toggle { font-size: 10px; padding: 1px 6px; border-radius: 999px; border: 0.5px solid var(--border); background: transparent; color: var(--text-secondary); cursor: pointer; }
+.skip-toggle:hover { background: var(--surface-2); }
+.skip-toggle.off { background: var(--surface-2); color: var(--text-primary); border-color: var(--border-strong); text-decoration: line-through; }
 .foot { padding: 8px 10px; font-size: 11px; border-top: 0.5px solid var(--border); flex-shrink: 0; }
 
 .right-hd { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 0.5px solid var(--border); font-size: 13px; font-weight: 500; }

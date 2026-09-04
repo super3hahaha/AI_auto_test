@@ -1,7 +1,9 @@
 mod commands;
+mod updater;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    commands::fix_gui_app_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
@@ -18,9 +20,13 @@ pub fn run() {
             commands::read_text_file,
             commands::list_flows,
             commands::list_devices,
+            commands::recorder_cmd,
+            commands::recorder_session_start,
+            commands::recorder_session_stop,
             commands::read_device_aliases,
-            commands::set_target_serial,
+            commands::read_device_model_cache,
             commands::set_target_scope,
+            commands::set_target_dump_backend,
             commands::upsert_device_alias,
             commands::delete_device_alias,
             commands::export_device_aliases,
@@ -53,9 +59,21 @@ pub fn run() {
             commands::register_app,
             commands::list_apk_versions,
             commands::save_apk_version,
+            commands::delete_apk_version,
             commands::scan_cleanup,
             commands::move_to_trash,
+            updater::check_update,
+            updater::download_update,
+            updater::apply_update,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|_app_handle, event| {
+            // 覆盖 Cmd+Q/系统关闭请求等一切退出路径，不止「停止执行」按钮：兜底把还挂着的
+            // run 进程组一起收掉，避免 python/auto_repair/claude 变成孤儿进程留在后台。
+            if let tauri::RunEvent::Exit = event {
+                commands::kill_all_run_pgids_blocking();
+                commands::kill_all_rec_sessions_blocking(); // 录制 daemon（含其 scrcpy 子进程）也不留孤儿
+            }
+        });
 }

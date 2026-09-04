@@ -21,7 +21,7 @@
 """
 import csv, json, sys, pathlib, time
 
-from _appctx import REPO, LEDGER as APP_LEDGER, load_cfg  # 多 App 路径解析
+from _appctx import REPO, LEDGER as APP_LEDGER, load_cfg, ledger_lock  # 多 App 路径解析
 ROOT = REPO
 LEDGER = APP_LEDGER                 # apps/<slug>/ledger（per-app）
 CFG = load_cfg()                    # apps/<slug>/target.json（per-app）
@@ -271,7 +271,8 @@ def main():
         csv_path = LEDGER / f"{stem}.csv"
         if not csv_path.exists():
             continue
-        rows = list(csv.reader(open(csv_path, encoding="utf-8")))
+        with ledger_lock():  # 有 CLI 手动并行执行还在跑时，别读到写了一半的表
+            rows = list(csv.reader(open(csv_path, encoding="utf-8")))
         if stem in SCOPED_TABS and rows and "用例ID" in rows[0]:
             ci = rows[0].index("用例ID")
             rows = [rows[0]] + [r for r in rows[1:] if len(r) > ci and r[ci] in board_ids]

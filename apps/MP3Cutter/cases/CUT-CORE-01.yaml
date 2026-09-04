@@ -37,4 +37,8 @@
     2026-07-23 发现 AAC 转存场景（见 CUT-EDGE-02/BUG-CUT-EDGE-02）即便读 stream 级 bit_rate，
     真实值相对目标值仍有 ~20+kbps 的正常编码器波动，8kbps 过紧会把正常波动误判为缺陷，
     故放宽回 32kbps（全格式统一，见 docs/decisions.md）。
+    2026-07-29：清数据后首次进「选择音频」列表前的文件访问/通知/音频权限弹窗，部分设备节奏
+    更慢或分更多轮弹出，原来单轮 sweep+8s 等待偶发不够、会直接超时（真机复现）；固化脚本已
+    改成多轮兜底（最多 3 轮，每轮补点一次文件访问按钮+sweep+短等），这是设备时序差异，不是
+    步骤变了，也不是缺陷。
   frozen_script: apps/MP3Cutter/flows/flow_cut_save.sh

@@ -54,6 +54,15 @@ AI 当测试工程师、用 ADB 驱动安卓设备的自动化测试框架。核
 
 > ⚠️ Google Sheet 是**只读展示视图**（从 YAML 渲染）。要增删/改用例请在对话里说，由 Claude 改 `apps/<slug>/cases/*.yaml`；**别在表里手改**，会被下次同步覆盖。详见 `docs/decisions.md`。
 
+## 桌面壳：下载安装 / 更新
+
+日常回归的同事不需要装 Node/Rust 工具链，直接下载打包好的桌面壳：
+
+- 前往 [Releases](../../releases) 页面，下载对应系统的安装包：macOS 下载 `.dmg`、Windows 下载 `.exe`。
+- 安装包未签名：macOS 首次打开需右键"打开"（或"仍要打开"）；Windows 会有 SmartScreen 蓝色警告，点"更多信息 → 仍要运行"。
+- App 内「设置」页底部有「版本」区块，点「检测更新」可查是否有新版本，确认后一键下载并静默安装重启，不需要手动重新下载安装包。
+- 打新版本：打 `git tag vX.Y.Z && git push --tags` 触发 `.github/workflows/release.yml`（`tauri-action` 构建 mac universal dmg + windows nsis exe，自动发布到 Releases）。
+
 ## 数据流：从生成用例到执行
 
 全量真值 `queue.csv` 经 `scope` 投影出本轮清单 `board.csv`；执行大脑对着本轮范围干活，判定后状态**回写 `queue.csv`**（真值），看板/报告只读本轮 `board`。

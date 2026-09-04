@@ -2312,3 +2312,79 @@ fi
 可能不遵守 IEEE754，写"防御性检查"时不能只测过一种实现就当通用结论。以后新脚本只要消费
 `tools/audio_envelope.py`（或任何会打 `NaN` 类哨兵值的工具）的输出做数值比较，都要照抄这个
 "先扫 NaN 再比较"的模式。
+
+## 剪辑器选区时间字段进页 1-3 秒后单向消失、不是收敛类时序坑——2.3.6.3 编辑器新旧布局切换（2026-09-04，`flow_cut_save.sh` moto g5 真机复现）
+
+**背景**：排查另一个"结果页事后广告二次盖住导致 `<NOTFOUND>`"的问题时，用户在同一次真机验证里
+顺手发现了一个完全不同位置的类似现象：`flow_cut_save.sh` 刚进剪辑器、**还没做任何保存/导出操作**
+的第一次字段读取（`start_time_text`/`end_time_text`/`progress_time_text`，用来算预期裁剪时长跟
+后面 MediaStore 产物交叉核对）三个字段全部读成 `<NOTFOUND>`，导致 `EXPECT_MS` 算成 0，
+`output-check` 报"实际38400ms vs 预期0ms"、必然误判失败——现场用真机反复验证确认是**稳定复现**，
+不是单次运气差。
+
+**根因**：2.3.6.3 这个版本把剪辑器（`AudioCutterNewActivity`，类名带"New"，印证了确实是重做过的
+页面）改成了两段式渲染：刚进页时先短暂挂一份带 `layout_cut_time_bar` 容器的旧版数字时间条布局
+（`start_time_text`/`end_time_text`/`progress_time_text` + `start_time_add`/`end_time_reduce`
+等步进按钮都在这份布局里），大约 1-2 秒内**单向**替换成新版可拖拽波形布局（`cut_scroll_view`
+容器）——新布局的时间文案是直接 Canvas 画的，完全不进 `uiautomator` 可访问树（真机验证：切换后
+dump 全树搜不到任何 `\d{2}:\d{2}` 格式的 text 节点，画面上明明有个"00:20.2"在动）。这不是
+"数值还没收敛到最终默认选区"（那是 2026-09-01 `CUT-PARAM-02` flac 那条的性质，值不对但字段还在），
+而是**承载这三个字段的整棵旧布局子树被整体拆掉**，切换完成后这三个 id 在那次编辑器会话里永久
+读不到，等多久重试都没用。原脚本进编辑器后要先做「新手引导遮罩」循环（最多5次）+ `play_btn`
+暂停点击（合计 1-3 秒）才读字段，天然稳定撞在切换完成之后。
+
+**验证方法**：把读字段的时机挪到 `waitfor id take_save` 成功后**立刻**做（早于新手引导循环、
+早于 `play_btn`），真机连续两次都读到 `00:10.8`/`00:49.2`——跟这份固定素材历史记录的默认选区
+完全一致，算出 `EXPECT_MS=38400ms`；继续走完保存流程后用 `output-check --expect-duration-ms`
+核对，真实产物 `duration=38400ms`，跟提前读到的预期值**差 0ms**，实锤验证了"越早读越准，不是
+读少了要重试，是读晚了就没了"。
+
+**修**：`flow_cut_save.sh` 把 `field_of`/`mmss_to_ms` 读字段这一段整体挪到
+`waitfor id take_save --cache editor` 之后、新手引导遮罩循环之前；截图（`shot 03-editor`）仍
+留在新手引导+`play_btn`暂停之后拍（画面更干净、更符合"确认已关新手引导"的断言意图），截图
+文案复用提前读到的 `START`/`END`/`TOTAL` 变量即可——`--used-dump` 语义上只要求该用例 `ui/`
+目录下存在任意 dump 文件，不要求跟截图同一时刻（见 `adbkit.py cmd_shot` 里 `--used-dump` 的
+检查逻辑），提前读字段不影响这条声明的有效性。另外补了一层兜底：读到的三个字段只要有一个仍是
+`<NOTFOUND>`，立即打印"严重异常"根因日志并置位 `FAILED=1`（`EXPECT_MS` 退化为 0，跳过
+`mmss_to_ms` 避免 awk 因非数字输入报错崩脚本），不再指望靠后面 `output-check` 的"时长不一致"
+这种间接、易误导的报错去暴露真正原因。
+
+**教训（跟 2026-09-01 那条的区别，别混着排查）**：同样是"进编辑器立刻读字段可能读不到/读不对"
+的问题族，但**病因分两种，药方相反**——(1) 字段还在、值是瞬时默认值没收敛完（`CUT-PARAM-02`
+flac 那条）：药方是**晚一点读**（`sleep 1.5` 等收敛）；(2) 承载字段的整棵旧布局会被新布局
+**单向替换掉**（这条）：药方是**尽量早读**，晚了字段所在的整个子树都不存在了，不是等出来的。
+遇到新固化脚本"进编辑器读字段" NOTFOUND/异常，先用 `ui <step>` 在不同时间点连续多 dump 几次
+对比树的变化，判断是哪一种病因（字段还在但值变 vs 字段所在子树消失），别不假思索套用另一条的
+药方。**影响面**：这次只验证了 `flow_cut_save.sh`（`CUT-CORE-01`），但凡是"进 2.3.6.3+ 版本的
+`AudioCutterNewActivity` 剪辑器后要读 `start_time_text`/`end_time_text`/`progress_time_text`"
+的脚本理论上都会撞上同一个坑（如果存在同类脚本），排查时可以直接用 `grep -rl
+'start_time_text\|end_time_text\|progress_time_text' apps/*/flows/*.sh` 定位。
+
+## AdMob 插屏点击后可能深链到 Google Play 商店透明覆盖页，旧的 `ad-admob-close` 规则 scope 卡死在 `AdActivity` 摸不到（2026-09-04，moto g5 真机复现）
+
+**现象**：真机跑 `CUT-CORE-01` 时卡在首页断言，反复看到`广告页把 App 弹出，重新拉起`但怎么都
+清不掉；截图显示屏幕是一张完整的 Google Play 商店应用详情卡片（"Google Play"+搜索/关闭图标+
+应用名+"安装"按钮），`sweep` 规则库现有的 `ad-admob-close`（scope=`AdActivity`）完全没有触发过。
+
+**根因**：`adbkit.py focus` 现查这一刻的真实前台组件是
+`com.android.vending/com.google.android.finsky.transparentmainactivity.HsdpAlias`——AdMob
+插屏创意里的"安装"按钮点击后不一定停在 `AdActivity` 里展示商店预览卡片，也可能直接把 Google
+Play 商店 App 自己的一个**透明覆盖 Activity**（`HsdpAlias`，专门给广告 SDK 用来提升"点击→安装"
+转化率、显示原生商店卡片外观的壳）拉到前台。`sweep` 的 `scope` 是子串匹配 `focus` 这一行，
+`ad-admob-close` 的 `scope="AdActivity"` 跟 `com.android.vending/...HsdpAlias` 完全不沾边，
+规则从一开始就没资格触发，不是"关闭"文案没识别到。`dump` 这个覆盖页的树也证实了它比想象的更
+棘手：树里**只有一个 `navigationBarBackground` 节点**，可见的"关闭"文案/图标压根不进
+`uiautomator` 树（Play 商店卡片的可见内容由广告 SDK 的 WebView 渲染），`corner-tr` 结构化兜底
+也摸不到候选 box（唯一节点在屏幕底部而非右上角）。真机验证：按一次系统 `BACK` 键就能干净退回
+App 首页（连底下残留的 `AdActivity` 一并带走），没有误触发 Play 商店自己的任何按钮。
+
+**修**：`config/ad_rules.json` 新增 `ad-vending-overlay-close` 规则，`scope` 精确卡在
+`finsky.transparentmainactivity` 这个子串（不用更宽的 `com.android.vending`，因为完整版
+Play 商店主界面用的是另一个 activity `com.google.android.finsky.activities.MainActivity`——
+如果 App 以后真有"去评分"这类主动跳转完整 Play 商店的合法场景，那个 activity 不会被这条规则
+误伤而被立刻按返回键退出），`match` 列表保留 `text=关闭/Close` 兜底（万一某次广告创意确实暴露了
+可访问节点）+ `corner-tr`（万一这次不是"只有一个节点"）+ `keyevent-back`（终极兜底，已验证有效）。
+**教训**：`scope` 设计的隐含假设是"一种广告 SDK 全屏创意对应一种前台 Activity 组件"，但点击广告
+创意可能**跳出广告 SDK 自己的 Activity、直接进另一个 App（这里是 Google Play 商店）的页面**，
+这种情况下旧 scope 不会覆盖到，新增规则时要按**真机 `adbkit.py focus` 现查到的真实组件名**来定
+scope，不能想当然假设还在原来的广告 Activity 里。

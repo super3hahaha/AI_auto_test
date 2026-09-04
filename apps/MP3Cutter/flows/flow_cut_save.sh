@@ -140,22 +140,23 @@ $AK text "$SRC_NAME" --assert-typed >/dev/null
 $AK tapid tv_name --timeout 8 >/dev/null
 $AK waitfor id take_save --timeout 8 --cache editor >/dev/null
 
-# 清数据后首次进剪辑器会弹 5 步新手引导遮罩，挡住保存按钮；连点遮罩把它关掉（最多5次，
-# 提前消失就跳出循环，不是每次进编辑器都会弹，找不到就说明已经关完/本来没有）
-for i in 1 2 3 4 5; do
-  $AK tapid guide_mask_view --timeout 2 >/dev/null 2>&1 || break
-done
-
-# 选中音频进编辑器会自动开始播放——dump 撞上播放中控件重绘的瞬间可能拿到不稳定/
-# 半更新的文本，先点暂停停下来再 dump（best-effort，找不到 play_btn 就跳过，不阻断）。
-$AK tapid play_btn --timeout 3 >/dev/null 2>&1 || true
-
-# 断言不能只说"进了剪辑器"——裁没裁对，得看选区的精确起止/总时长，这是后面结果页/
-# MediaStore 三方交叉核对的基准值。数值来自 ui dump 里 start_time_text/end_time_text/
-# progress_time_text 三个控件的可访问文本（真实读出来的，不是识图猜的），--used-dump
-# 声明这条断言引用了 dump 数据（见 decisions.md #22）。
+# 2026-09-04 moto g5 真机复现（BUG级时序坑，非偶发）：start_time_text/end_time_text/
+# progress_time_text 这三个字段只在刚进编辑器那一瞬间的旧版数字时间条布局（layout_cut_time_bar）
+# 里可读——2.3.6.3 这个版本的编辑器（AudioCutterNewActivity）进页后会在约1-2秒内单向切换成
+# 新版波形拖拽布局（cut_scroll_view），新布局的时间文案是 Canvas 直接画的，完全不进
+# uiautomator 可访问树，切换完这三个字段永久 <NOTFOUND>，不是"等久一点/重试就能等到"的收敛类
+# 时序问题（跟 2026-09-01 CUT-PARAM-02 那条"读到瞬时默认值,再等一下会收敛"的坑不是一回事，
+# 那次是值不对、这次是节点直接消失）。原脚本在 guide_mask_view 循环 + play_btn 暂停（合计
+# 1-3秒）之后才读字段，稳定撞在切换完成之后，三个字段全 NOTFOUND，EXPECT_MS 算成 0，后面
+# output-check 报"实际38400ms vs 预期0ms"、必然误判失败——真机验证：把读字段挪到
+# waitfor id take_save 成功后立刻做（旧布局还在，早于 guide_mask/play_btn 那 1-3 秒），读到
+# 00:10.8/00:49.2（跟历史同素材默认选区完全一致），EXPECT_MS=38400ms，跟保存后真实产物
+# duration=38400ms 完全对上（0ms差）。截图仍放在 guide_mask/play_btn 之后拍（画面更干净），
+# 只是把"读字段"这个动作单独提前，截图文案复用提前读到的 START/END/TOTAL 即可，
+# --used-dump 语义上只要求 ui_dir 下存在任意 dump 文件，不要求跟截图同一时刻（见 adbkit.py
+# cmd_shot 对 --used-dump 的检查逻辑），提前读不影响这条声明的有效性。
 # 取值走 adbkit `ui --field`（Python 端 ET.parse 直接抠 text 属性打印 FIELD:name=value），
-# 不再用 bash grep/sed 处理整份 XML 文本——2026-07-03 实测踩过：播放中重绘偶发导致这条 shell
+# 不用 bash grep/sed 处理整份 XML 文本——2026-07-03 实测踩过：播放中重绘偶发导致这条 shell
 # 字节处理链路产出非法 UTF-8，传到下个 python 进程的 argv 变成 lone surrogate，写 evidence.csv
 # 时 UnicodeEncodeError 直接崩脚本，见 gotchas.md。
 field_of() { grep -o "^FIELD:${1}=.*" <<< "$2" | cut -d= -f2-; }
@@ -164,7 +165,24 @@ FIELDS=$($AK --case "$CASE" ui 03-editor --field start_time_text --field end_tim
 START=$(field_of start_time_text "$FIELDS")
 END=$(field_of end_time_text "$FIELDS")
 TOTAL=$(field_of progress_time_text "$FIELDS")
-EXPECT_MS=$(( $(mmss_to_ms "$END") - $(mmss_to_ms "$START") ))
+if [ "$START" = "<NOTFOUND>" ] || [ "$END" = "<NOTFOUND>" ] || [ "$TOTAL" = "<NOTFOUND>" ]; then
+  log "严重异常：进编辑器后立即读选区字段仍 NOTFOUND（起=$START 止=$END 总=$TOTAL），旧版时间条布局可能又变了，需要重新真机探路"
+  EXPECT_MS=0
+  FAILED=1
+else
+  EXPECT_MS=$(( $(mmss_to_ms "$END") - $(mmss_to_ms "$START") ))
+fi
+
+# 清数据后首次进剪辑器会弹 5 步新手引导遮罩，挡住保存按钮；连点遮罩把它关掉（最多5次，
+# 提前消失就跳出循环，不是每次进编辑器都会弹，找不到就说明已经关完/本来没有）
+for i in 1 2 3 4 5; do
+  $AK tapid guide_mask_view --timeout 2 >/dev/null 2>&1 || break
+done
+
+# 选中音频进编辑器会自动开始播放——先点暂停停下来再截图（best-effort，找不到 play_btn 就跳过，
+# 不阻断）；此刻布局多半已经切到新版波形拖拽 UI，不能再指望这一步之后还能读到上面那三个字段。
+$AK tapid play_btn --timeout 3 >/dev/null 2>&1 || true
+
 $AK --case "$CASE" shot 03-editor "进入剪辑器，新手引导已关、保留默认选区（起 $START / 止 $END / $TOTAL）" --used-dump >/dev/null
 log "剪辑器：选区 $START-$END（$TOTAL，预期时长 ${EXPECT_MS}ms）"
 

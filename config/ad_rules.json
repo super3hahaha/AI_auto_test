@@ -23,6 +23,18 @@
       ]
     },
     {
+      "id": "ad-vending-overlay-close",
+      "_note": "AdMob 插屏点击后可能直接深链到 Google Play 商店的透明覆盖页（真机实测组件名 com.android.vending/com.google.android.finsky.transparentmainactivity.HsdpAlias，'安装'按钮伪装成广告创意的一部分，实际是点击命中率转化用）——这不是用户主动去 Play 商店，是广告 SDK 的深链跳转，scope 卡在这个透明覆盖 Activity 特有的 transparentmainactivity 子串，不用更宽的 'com.android.vending'，避免误伤 App 里如果将来真有'去评分'跳转完整 Play 商店主界面（com.google.android.finsky.activities.MainActivity，另一个 activity）的合法场景。2026-09-04 CUT-CORE-01 moto g5 真机复现：这个覆盖页的 dump 树里只有一个 navigationBarBackground 节点，没有任何'关闭'文案/id 节点可选（Play 商店卡片本身的可见内容由广告 SDK 的 WebView 渲染，不在这个透明 Activity 自己的可访问树里），corner-tr 也摸不到候选 box（唯一节点在屏幕底部而非右上角）——text/corner-tr 兜底基本不会命中，keyevent-back 是唯一真正生效的关闭手段，真机验证过按一次 BACK 就能干净退回 App 首页（连底下残留的 AdActivity 一并带走），不会误触发 Play 商店自己的任何按钮。",
+      "scope": "finsky.transparentmainactivity",
+      "action": "tap_matched",
+      "match": [
+        {"by": "text", "value": "关闭", "partial": true},
+        {"by": "text", "value": "Close", "partial": true},
+        {"by": "corner-tr"},
+        {"by": "keyevent-back"}
+      ]
+    },
+    {
       "id": "ad-applovin-close",
       "scope": "AppLovinFullscreen",
       "action": "tap_matched",

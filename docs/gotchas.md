@@ -2378,13 +2378,22 @@ Play 商店 App 自己的一个**透明覆盖 Activity**（`HsdpAlias`，专门�
 也摸不到候选 box（唯一节点在屏幕底部而非右上角）。真机验证：按一次系统 `BACK` 键就能干净退回
 App 首页（连底下残留的 `AdActivity` 一并带走），没有误触发 Play 商店自己的任何按钮。
 
-**修**：`config/ad_rules.json` 新增 `ad-vending-overlay-close` 规则，`scope` 精确卡在
-`finsky.transparentmainactivity` 这个子串（不用更宽的 `com.android.vending`，因为完整版
-Play 商店主界面用的是另一个 activity `com.google.android.finsky.activities.MainActivity`——
-如果 App 以后真有"去评分"这类主动跳转完整 Play 商店的合法场景，那个 activity 不会被这条规则
-误伤而被立刻按返回键退出），`match` 列表保留 `text=关闭/Close` 兜底（万一某次广告创意确实暴露了
-可访问节点）+ `corner-tr`（万一这次不是"只有一个节点"）+ `keyevent-back`（终极兜底，已验证有效）。
+**修**：本地一度加过 `ad-vending-overlay-close` 规则（`scope` 精确卡在
+`finsky.transparentmainactivity` 子串，`match` 用 `text=关闭/Close` + `corner-tr` +
+`keyevent-back` 兜底），真机验证过有效。但同一天 main 分支上另一次真机排查（三星 A05s，
+`CUT-PARAM-01`）挖到了更完整的同族问题——插屏点击不仅会跳到这种"透明覆盖页"，还可能真把
+用户带进 Google Play 商店本体的首页/分类页（`AssetBrowserActivity`，有自己完整的内部返回栈，
+连按几次 `keyevent-back` 都只是在商店内部翻页、翻不出去），main 分支的修法是给 `sweep`
+新增 `force-stop` 选择器类型（直接 `am force-stop com.android.vending` 杀掉整个进程，
+不管返回栈多深，一步到位）、`scope` 放宽到整个 `com.android.vending` 包名（框架的测试流程里
+vending 出现即代表被广告带偏，从未是真实测试目标，不存在"误伤合法去评分场景"的顾虑），
+新规则 `ad-playstore-redirect-close` 同时覆盖了这条记录里的场景和"带进商店本体翻不出来"
+两种形态，是本条问题的父集修法——`ad-vending-overlay-close` 因此撤掉，改依赖
+`ad-playstore-redirect-close`（分支合并后自动生效），避免两条规则并存造成 `scope` 重叠、
+后续维护要同时改两处。
 **教训**：`scope` 设计的隐含假设是"一种广告 SDK 全屏创意对应一种前台 Activity 组件"，但点击广告
 创意可能**跳出广告 SDK 自己的 Activity、直接进另一个 App（这里是 Google Play 商店）的页面**，
 这种情况下旧 scope 不会覆盖到，新增规则时要按**真机 `adbkit.py focus` 现查到的真实组件名**来定
-scope，不能想当然假设还在原来的广告 Activity 里。
+scope，不能想当然假设还在原来的广告 Activity 里；另外同一天分头排查同一类问题时，先看
+`git -C <主仓库> diff`/`log` 有没有别的分支已经在更全面地处理，避免重复造轮子（这条记录本身
+就是先例）。

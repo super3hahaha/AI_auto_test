@@ -3,12 +3,16 @@ import { ref, computed } from "vue";
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { api } from "../api";
 import { store } from "../store";
-import { makeRecordSource, type MonitorSource, type RunRecordMeta } from "../runStore";
+import { makeRecordSource, type MonitorSource, type RunRecordMeta, type RerunPlan } from "../runStore";
 import RunMonitor from "./RunMonitor.vue";
 
 // 执行记录页：持久化保存的「完整执行完毕」的执行台快照。布局与执行台一致（内嵌 RunMonitor），
 // 区别是数据源是一份保存下来的记录（有内容），可按 run 记录 id 切换。中止的轮次不落记录。
 defineOptions({ name: "RunHistory" });
+
+// 「失败重跑」是 RunMonitor 内部按钮发起的，本组件跟 Runner（拥有场景库勾选状态）隔着一层，
+// 原样转发上去，不在这里处理。
+const emit = defineEmits<{ (e: "rerun-failed", plan: RerunPlan): void }>();
 
 const records = ref<RunRecordMeta[]>([]);
 const selectedId = ref("");
@@ -143,7 +147,7 @@ defineExpose({ reload });
     <!-- 记录内容：复用执行台（RunMonitor）布局，数据源为保存的快照。切 id 用 key 重挂，本地选中态归零。
          switching 期间调暗——这里还是上一条选中的内容（新记录还没读盘完），别让人当成已经切好了 -->
     <div v-else-if="source" class="monitor-wrap" :class="{ dim: switching }">
-      <RunMonitor :key="selectedId" :source="source" />
+      <RunMonitor :key="selectedId" :source="source" @rerun-failed="(p) => emit('rerun-failed', p)" />
     </div>
   </div>
 </template>

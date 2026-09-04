@@ -401,6 +401,47 @@ CUT-CORE-01/MIX-CORE-01/SPLIT-CORE-01 都有重命名收尾这一步，新模块
     实现（哪怕当时是分别手写的），就该趁手上这次改动把它提炼成新的 `_lib_*.sh`，别继续复制
     第三份；只出现过一次、还看不出会被复用的逻辑，留在脚本自己身上就好，不必提前抽象。
 
+16. **点保存/转换/合并/混音这类会触发插屏广告的操作之后，`waitfor <成功文案/id>` 判定点命中
+    和紧接着的 `ui --field` dump 结果页字段之间，必须插一句 `settle_result_page` 再确认，
+    不能判定一通过就立刻去 dump**（2026-09-04 真机 moto g5 在 `SPLIT-CORE-02`/`VOICE-CORE-01`
+    两条用例上复现，随后排查全仓库同款写法都补了这一步，详见 `docs/gotchas.md` 同日条目）。
+    **根因**：App 点保存后常常不止弹一次插屏广告——`btn_convert`/`take_save` 后紧跟的那轮
+    `sweep --rounds N` 只清得掉"处理过程中"弹的那次，真正跳到结果页之后可能**再弹一次
+    "事后广告"**，恰好插进"`waitfor` 判定通过"和"真去 `ui` dump"之间那几个 adb 往返的窗口期，
+    把结果页整个盖住。dump 到的是广告自己的节点树，业务字段全部读成 adbkit 的 `<NOTFOUND>`
+    哨兵值，被误判成"产物名不对/效果没生效/时长核对不通过"——但 `output-check`（走
+    MediaStore，不依赖 UI dump）同一轮查到的产物其实完全正常，纯粹是脚本读结果页的时机
+    撞上了广告，不是 App 的缺陷。**`SPLIT-CORE-02` 那次更严重**：`<NOTFOUND>` 被喂进一行
+    没有 `if`/`&&`/`||` 保护的顶层裸命令替换赋值（`grep -oE '正则' <<< "$INFO"` 抠时长，
+    正则在 `<NOTFOUND>` 上无匹配、`grep` 退出码为 1），脚本头部的 `set -e` 当场把整个脚本
+    杀死，比"读到假值判假失败"还严重——连这一步的截图和 `FAILED` 标记都没留下，只剩一张
+    兜底截图，看起来像脚本诡异地整个跑挂了。**标准写法（照抄，别重新写一遍循环）**：
+    ```bash
+    # 脚本靠前位置 source（跟 lang_helper.sh/flow_media.sh 同样的姿势）：
+    source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)/tools/flow_result_settle.sh"
+    ...
+    if $AK waitfor text "$(t 音频已保存)" --timeout 15 >/dev/null 2>&1; then
+      # dump 前再确认几轮（防事后插屏广告二次盖住结果页），确认不掉也不阻塞，
+      # 带着广告截图往下走，交给后面的字段校验如实判失败。
+      settle_result_page text "$(t 音频已保存)"
+      INFO=$(field_of info "$($AK --case "$CASE" ui 05-result --field info)")
+      ...
+    ```
+    `settle_result_page <text|id> <等待值>` 用调用方本来就在用的同一个判定点、`--timeout 2`
+    短超时最多重确认 3 轮，不在就 `sweep` 清一轮再复查；3 轮后仍确认不掉也不阻塞，直接把
+    控制权还给调用方——**这一步是降低假失败概率，不是保证100%不撞上广告**，所以调用方自己
+    的字段校验仍要正常处理"读到 `<NOTFOUND>`/空值"的情况（`[ -z "$xxx" ]` 判空、别用没保护的
+    裸命令去处理可能是哨兵值的字段），两层缺一不可。判断"该不该加"的标准很简单：这一步
+    `ui --field`/`ui 2>/dev/null` dump 的目标是不是**紧跟在某个会触发广告的操作
+    （保存/转换/合并/混音/导出）之后的第一次结果页读取**——是就必须加，纯导航页/操作前的
+    读值（如另存为对话框默认值）不受这个问题影响，不用加。**排查现有脚本是否中招**：
+    ```bash
+    grep -A1 'waitfor text "\$(t 音频已保存)"\|waitfor id set_as' apps/*/flows/flow_*.sh \
+      | grep -B1 -- '--field\|ui .*2>/dev/null'
+    ```
+    命中的看紧邻 `waitfor` 和 `ui`/`ui --field` 之间有没有 `settle_result_page` 调用，没有
+    就照上面范例补。
+
 ## 失败判定标准（硬规则，2026-07-22 起）
 
 **背景**：曾发现固化脚本里对已知缺陷（如 BUG-CUT-EDGE-03，ffprobe 真实时长与 MediaStore

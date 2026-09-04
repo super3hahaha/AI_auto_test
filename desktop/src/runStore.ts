@@ -109,6 +109,16 @@ export interface RunCaseSpec {
   module: string;
 }
 
+// 「执行记录」页「失败重跑」→ 场景库的一次性传参：只把失败用例、以及各用例具体在哪些设备上
+// 失败（而不是本轮勾选过的全部设备）带过去，场景库据此做逐格显式分派。labels 是失败重跑那一刻
+// 算好的设备展示名（别名优先，见 RunMonitor.deviceLabel），供 Runner 校验设备是否在线时提示用——
+// 那些设备当时可能已经不在「设备」栏的在线列表里，Runner 自己的 baseLabel() 查不到。
+export interface RerunPlan {
+  cases: string[]; // 失败用例 case_id，按用例库（queue.csv）原始顺序
+  serialsByCase: Record<string, string[]>; // caseId → 该用例失败所在的设备 serial 列表
+  labels: Record<string, string>; // serial → 展示名（别名/型号优先，取不到才是 serial 原文）
+}
+
 function classify(code: number, brain: boolean, aborted: boolean): CellStatus {
   if (aborted) return "aborted";
   if (code === 0) return "pass"; // healed 由日志另判（见下）
@@ -414,28 +424,41 @@ export const runStore = reactive({
     // runId：跑这轮时 store.runs 里当前批次的 run_id（新建看板会在 start() 里先 loadRuns 落定它）——
     // 落到执行记录的 meta 里，才能跟看板/证据/总览页的「轮次」概念对上，不然两套 id 各跑各的对不上号。
     const runId = store.runs.find((r) => r.is_current)?.run_id || "";
-    const snap = { slug: this.slug, title: this.title, brain: this.brain, startedAt: this.startedAt, runId };
+    // finishedAt 在这里（编排循环刚走完那一刻）定住，不要在 saveRecord 里各自现取 Date.now()——
+    // 否则收尾跑完后补存的最终版会把 finishedAt 錯记成"收尾完成的时间"，比真实跑完时间晚了
+    // 好几分钟（登记问题清单/同步表格/刷新Doc 的耗时），两版记录的 finishedAt 也会对不上。
+    const finishedAt = Date.now();
+    const snap = { slug: this.slug, title: this.title, brain: this.brain, startedAt: this.startedAt, finishedAt, runId };
     const cellsRef = this.cells;
     const eventsRef = this.events;
     this.completed = false;
+    // 全部格子跑完（completed 为真）就立刻存一份执行记录快照，不等收尾——登记问题清单
+    // （issue_register 可能调 claude，慢）→ 同步表格 → 刷新 Doc 报告这条链子跑下来常常要好几分钟，
+    // 执行记录本来就是给人看"这轮跑得怎么样"的，没道理让用户为了让快照带上最终登记状态而干等。
+    // cellsRef/eventsRef 是 reactive 数组的引用，收尾阶段的 mutate（issue 字段流转、追加日志）
+    // 会反映在同一份引用上，所以收尾跑完后用同一个 id 再存一次、把最终登记状态补全（覆盖写，
+    // 不会产生重复记录，见 save_run_record 按 id 覆盖文件）。
+    if (completed) void this.saveRecord(snap, cellsRef, eventsRef, false);
     // 执行台收尾：无论成功/失败/中止，都把本地 ledger 推回线上表格 + 刷新 Doc 图文报告。
     // 桌面端跑的结果否则只留本地、报告也不会带上最新判定。fire-and-forget：在后台流式跑，
     // 日志进事件面板；失败只提示、不阻塞（不重跑，避免收尾阶段无限重试）。
-    // 存执行记录排在 publish 之后 —— 让快照带上收尾阶段落定的问题清单登记状态（issue 字段）。
-    // publishing 全程占用（登记问题清单→同步→刷新Doc→存执行记录），start() 据此拒绝在这之前开新一轮
+    // publishing 全程占用（登记问题清单→同步→刷新Doc→补存执行记录），start() 据此拒绝在这之前开新一轮
     // ——避免上一轮仍在流式 push 的收尾日志串进下一轮已经清空重建的 events 数组。
     this.publishing = true;
     void this.publish()
-      .then(() => (completed ? this.saveRecord(snap, cellsRef, eventsRef) : undefined))
+      .then(() => (completed ? this.saveRecord(snap, cellsRef, eventsRef, true) : undefined))
       .finally(() => { this.publishing = false; });
   },
 
-  // 把「完整跑完」的这一轮执行台落成一份持久化快照（apps/<slug>/ledger/run_records/<id>.json）。
+  // 把这一轮执行台落成一份持久化快照（apps/<slug>/ledger/run_records/<id>.json）。
   // 只在 finish() 里、且 completed 为真时调；中止/早退失败的轮次不会走到这里。
+  // final=false：全部格子跑完那一刻立刻存的第一版（issue 字段多半还是 "none"，收尾还没登记到它们）；
+  // final=true：收尾（登记问题清单→同步→刷新Doc）跑完后补存的最终版，同一个 id 覆盖第一版。
   async saveRecord(
-    snap: { slug: string; title: string; brain: boolean; startedAt: number; runId: string },
+    snap: { slug: string; title: string; brain: boolean; startedAt: number; finishedAt: number; runId: string },
     cells: RunCell[],
-    events: RunEvent[]
+    events: RunEvent[],
+    final: boolean
   ) {
     if (!snap.slug || !cells.length) return;
     const counts = { ok: 0, bad: 0, needs: 0 };
@@ -452,7 +475,7 @@ export const runStore = reactive({
         title: snap.title,
         brain: snap.brain,
         startedAt: snap.startedAt,
-        finishedAt: Date.now(),
+        finishedAt: snap.finishedAt,
         ok: counts.ok,
         bad: counts.bad,
         needs: counts.needs,
@@ -466,7 +489,11 @@ export const runStore = reactive({
     };
     try {
       await api.saveRunRecord(snap.slug, record);
-      this.pushEvent(`🗄 本轮已存入执行记录（id ${record.meta.id}）——去「执行记录」子 tab 可回看`);
+      this.pushEvent(
+        final
+          ? `🗄 执行记录已补全登记结果（id ${record.meta.id}）`
+          : `🗄 本轮已存入执行记录（id ${record.meta.id}）——去「执行记录」子 tab 可回看；问题清单登记/同步表格/刷新Doc完成后会自动补全登记结果`
+      );
     } catch (e: any) {
       this.pushEvent(`⚠ 执行记录保存失败：${e}`, "error");
     }
@@ -507,17 +534,17 @@ export const runStore = reactive({
       (c) => c.status === "fail" || c.status === "app_defect" || c.status === "needs_human"
     );
     if (!targets.length) return;
-    // 用户已勾「跳过」的格子直接定型为 skipped，不占登记分母、不调用 issue_register
-    const toSkip = targets.filter((c) => c.issueSkip);
-    const toRegister = targets.filter((c) => !c.issueSkip);
-    for (const cell of toSkip) cell.issue = "skipped";
-    if (toSkip.length) {
-      this.pushEvent(`⏭ 已跳过登记 ${toSkip.length} 条用例（手动取消，不写入问题清单）`);
-    }
-    if (!toRegister.length) return;
-    this.issueTotal = toRegister.length; // 开始登记时就定住分母，串行逐条处理不再让分母跟着涨
-    this.pushEvent(`自动登记问题清单：${toRegister.length} 条失败/需复核用例（issue_register）…`);
-    for (const cell of toRegister) {
+    this.issueTotal = targets.length; // 开始登记时就定住分母，串行逐条处理不再让分母跟着涨
+    this.pushEvent(`自动登记问题清单：最多 ${targets.length} 条失败/需复核用例（issue_register）…`);
+    // issueSkip 在真正轮到这一格、即将调用 issue_register 前才读取，而不是在循环开始前一次性
+    // 分组——串行处理耗时较长，登记过程中用户随时点「不登记」都要能拦下还没轮到的格子，
+    // 不能因为已经被早前的快照分进「待登记」名单就无视后续的取消操作。
+    for (const cell of targets) {
+      if (cell.issueSkip) {
+        cell.issue = "skipped";
+        this.pushEvent(`⏭ ${cell.serial}/${cell.caseId} 已跳过登记（手动取消，不写入问题清单）`);
+        continue;
+      }
       // fail/app_defect→BUG-、needs_human→RISK-（前缀由 issue_register 按 status 确定性映射，这里只透传）
       const status = cell.status as "fail" | "app_defect" | "needs_human";
       cell.issue = "registering";

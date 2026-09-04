@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, nextTick, onMounted } from "vue";
-import { runStore, labelOf, type CellStatus, type IssueState, type MonitorSource } from "../runStore";
+import { runStore, labelOf, type CellStatus, type IssueState, type MonitorSource, type RerunPlan } from "../runStore";
 import { api } from "../api";
 import { store } from "../store";
 
@@ -10,6 +10,10 @@ defineOptions({ name: "RunMonitor" });
 // running/aborting/syncing/docGenerating 在快照里恒 false → 头部显示「已完成/空闲」、中止按钮禁用。
 const props = defineProps<{ source?: MonitorSource | null }>();
 const M = props.source ?? runStore;
+// 传了 source（历史快照）才是「执行记录」页——头部把中止按钮换成「失败重跑」（中止按钮对已完成的
+// 历史记录本就永远禁用，留着没意义）；实时执行台（不传 source）保留原来的中止按钮。
+const isRecord = computed(() => !!props.source);
+const emit = defineEmits<{ (e: "rerun-failed", plan: RerunPlan): void }>();
 
 // 问题清单自动登记状态的中文短标（收尾阶段流转）
 function issueLabel(s: IssueState): string {
@@ -121,6 +125,22 @@ function formatDuration(totalSec: number): string {
 const failedCells = computed(() =>
   M.cells.filter((c) => c.status === "fail" || c.status === "app_defect")
 );
+
+// 「失败重跑」：把失败摘要里这些格子打包成 RerunPlan 交给 Runner——只带上「这条用例具体在哪几台
+// 设备上失败」，不是本轮勾选过的全部设备，好让场景库据此逐格显式分派（而不是重新在全部设备上跑一遍）。
+// 设备是否在线由 Runner 收到后现查，这里只负责把失败当下能拿到的展示名一并带过去，供查到掉线时提示用。
+function emitRerunFailed() {
+  if (!failedCells.value.length) return;
+  const casesSet = new Set(failedCells.value.map((c) => c.caseId));
+  const cases = M.caseIds().filter((cid) => casesSet.has(cid));
+  const serialsByCase: Record<string, string[]> = {};
+  const labels: Record<string, string> = {};
+  for (const c of failedCells.value) {
+    (serialsByCase[c.caseId] ??= []).push(c.serial);
+    labels[c.serial] = deviceLabel(c.serial);
+  }
+  emit("rerun-failed", { cases, serialsByCase, labels });
+}
 
 const overall = computed(() => {
   if (M.running) return M.aborting ? "中止中…" : "运行中";
@@ -293,7 +313,10 @@ watch(
           <span class="muted prog">{{ M.doneCount() }}/{{ M.totalCount() }} 格完成</span>
           <span v-if="publishPhase" class="publish-chip" :class="publishPhase.cls">{{ publishPhase.text }}</span>
         </div>
-        <button class="abort-btn" :disabled="!M.running || M.aborting" @click="M.abort()">
+        <button v-if="isRecord" class="abort-btn rerun-btn" :disabled="!failedCells.length" @click="emitRerunFailed">
+          失败重跑{{ failedCells.length ? `（${failedCells.length}）` : "" }}
+        </button>
+        <button v-else class="abort-btn" :disabled="!M.running || M.aborting" @click="M.abort()">
           {{ M.aborting ? "中止中…" : "中止任务" }}
         </button>
       </div>
@@ -421,6 +444,9 @@ watch(
 .abort-btn { border: 0.5px solid var(--text-danger); color: var(--text-danger); background: transparent; padding: 6px 14px; border-radius: var(--radius); font-size: 13px; }
 .abort-btn:hover:not(:disabled) { background: var(--bg-danger); }
 .abort-btn:disabled { opacity: 0.4; border-color: var(--border); color: var(--text-secondary); }
+/* 「失败重跑」不是危险操作（只是把失败用例带去场景库重新勾选，不会立刻执行），用强调色而非红色 */
+.rerun-btn { border-color: var(--text-accent); color: var(--text-accent); }
+.rerun-btn:hover:not(:disabled) { background: var(--bg-accent); }
 
 .body { display: flex; gap: 12px; flex: 1; min-height: 0; }
 .left { flex: 1; min-width: 0; display: flex; flex-direction: column; }

@@ -333,9 +333,13 @@ export const runStore = reactive({
 
   finish() {
     this.running = false;
+    // 必须在重置 this.aborting 之前拍下快照——registerIssues() 要靠这份快照判断「这一轮是不是
+    // 中止的」，如果直接用活的 this.aborting，读到时已经被下面这行重置成 false，判断永远失效
+    // （踩过的坑：中止的轮次照样把失败格自动登记进了 issues.csv）。
+    const aborted = this.aborting;
     this.aborting = false;
     // 先把本轮快照抓成局部引用（新一轮 start() 会另建新数组，这些引用仍指向本轮，不被后续 mutate）。
-    // completed 决定要不要存执行记录：中止（this.aborting 曾为真）/早退失败的轮次 completed 一直是 false。
+    // completed 决定要不要存执行记录：中止（aborted 为真）/早退失败的轮次 completed 一直是 false。
     const completed = this.completed;
     const snap = { slug: this.slug, title: this.title, brain: this.brain, startedAt: this.startedAt };
     const cellsRef = this.cells;
@@ -345,7 +349,7 @@ export const runStore = reactive({
     // 桌面端跑的结果否则只留本地、报告也不会带上最新判定。fire-and-forget：在后台流式跑，
     // 日志进事件面板；失败只提示、不阻塞（不重跑，避免收尾阶段无限重试）。
     // 存执行记录排在 publish 之后 —— 让快照带上收尾阶段落定的问题清单登记状态（issue 字段）。
-    void this.publish().then(() => {
+    void this.publish(aborted).then(() => {
       if (completed) void this.saveRecord(snap, cellsRef, eventsRef);
     });
   },
@@ -393,8 +397,8 @@ export const runStore = reactive({
   // 收尾发布：先同步表格，再刷新 Doc 报告——doc_report 内部会重新按 queue.csv 当前状态投影，
   // 所以必须放在本轮所有 judge_result 落库之后，且顺序在 syncSheets 之后（各自独立、互不依赖，
   // 但都读同一份本地 ledger，串行跑避免并发写同一份 CSV）。
-  async publish() {
-    await this.registerIssues();
+  async publish(aborted = false) {
+    await this.registerIssues(aborted);
     await this.syncSheets();
     await this.genDocReport();
   },
@@ -403,9 +407,10 @@ export const runStore = reactive({
   // 必须排在 syncSheets/genDocReport 之前——那两个要读 issues.csv 才能把问题带进「问题清单」tab
   // 和 Doc 的失败详情。串行逐格调：headless claude 会写同一份 issues.csv，并发会撞车。
   // 中止的这一轮不登记（aborted 不是判定结果，且证据可能不完整）。fire-and-forget 风格：
-  // 单格失败只提示、不中断整个收尾。
-  async registerIssues() {
-    if (!this.slug || this.aborting) return;
+  // 单格失败只提示、不中断整个收尾。aborted 由 finish() 在重置 this.aborting 前拍下传入，
+  // 不能读活的 this.aborting——finish() 早就把它清成 false 了。
+  async registerIssues(aborted = false) {
+    if (!this.slug || aborted) return;
     const targets = this.cells.filter(
       (c) => c.status === "fail" || c.status === "app_defect" || c.status === "needs_human"
     );

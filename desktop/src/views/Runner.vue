@@ -153,6 +153,11 @@ const confirmNewBoard = ref(false);
 
 const frozen = computed(() => flows.value.filter((f) => f.has_flow && matchesPriority(f)));
 const nonFrozen = computed(() => flows.value.filter((f) => !f.has_flow && matchesPriority(f)));
+// 不受优先级筛选影响的固化用例全集——pickedCases 是跨筛选状态持续勾选的，筛掉某档只是让它
+// 暂时不可见，不代表用户取消了勾选；剪枝勾选、以及真正拿去执行的用例列表都必须对着这份全集算，
+// 否则「勾了 P1 全选后切到 P2 筛选」会让 P1 那些不可见但仍勾着的用例在执行/loadFlows 剪枝时被
+// 静默丢弃（真实复现：先全选 P1 三台设备，再切 P2 选 1 条 1 台设备点执行，执行台里只剩 P2 那条）。
+const allFrozen = computed(() => flows.value.filter((f) => f.has_flow));
 
 // 优先级配色：P0(danger) > P1(warning) > P2(accent，浅蓝区分于 P3) > P3(muted)
 function priorityPill(p: string) {
@@ -258,8 +263,9 @@ const tipStyle = computed(() => {
 async function loadFlows() {
   if (!store.activeSlug) { flows.value = []; return; }
   flows.value = await api.listFlows(store.activeSlug);
-  // 剔除已不存在的勾选
-  const ids = new Set(frozen.value.map((f) => f.case_id));
+  // 剔除已不存在的勾选（对全集剪枝，不能用当前优先级筛选后的 frozen——否则筛掉的那档会被当成
+  // "已不存在"一并清空）
+  const ids = new Set(allFrozen.value.map((f) => f.case_id));
   pickedCases.value = pickedCases.value.filter((c) => ids.has(c));
 }
 
@@ -299,7 +305,7 @@ function runSelected() {
   // 再挡一层（防住「新建看板」二次确认弹窗直接调 launch() 绕过这里的情况）。
   if (runStore.running || runStore.publishing) return;
   if (!store.activeSlug) { err.value = "请先在左栏选一个 App"; return; }
-  const cases = frozen.value.filter((f) => pickedCases.value.includes(f.case_id));
+  const cases = allFrozen.value.filter((f) => pickedCases.value.includes(f.case_id));
   if (!cases.length) { err.value = "中栏请至少勾选一个固化用例"; return; }
   if (!pickedSerials.value.length) { err.value = "右栏请至少勾选一台设备"; return; }
   // 逐格分派校验：每个勾选用例至少落一台设备（把设备 chips 全点掉的行拦下来）
@@ -312,7 +318,7 @@ function runSelected() {
 
 async function launch(newBoard: boolean) {
   confirmNewBoard.value = false;
-  const cases = frozen.value
+  const cases = allFrozen.value
     .filter((f) => pickedCases.value.includes(f.case_id))
     .map((f) => ({ case_id: f.case_id, script: f.script, module: f.module }));
   // 执行计划：整行全铺 = 矩阵；有行做过 chips 取舍 = 显式分派。两者同一条编排路径。

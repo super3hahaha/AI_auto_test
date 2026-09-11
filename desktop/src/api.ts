@@ -243,6 +243,10 @@ export const api = {
     invoke<{ dir: string; rec: string; flow: string; steps: number; shots: number }>("recorder_cmd", {
       appSlug: slug, sub: "export", serial, payload: JSON.stringify({ case: caseId, steps }),
     }),
+  // 用例 ID 变化时清掉 recordings/<caseId>/shots/ 里的旧截图，防止跨轮次复用同一 ID 时孤儿
+  // 文件堆积、把导出统计的截图数带偏（见 src-tauri/commands.rs recorder_clear_shots 头注）
+  recClearShots: (slug: string, caseId: string) =>
+    invoke<void>("recorder_clear_shots", { appSlug: slug, case: caseId }),
 
   // 序列号→别名映射（纯读 config/device_aliases.json，不依赖设备在线）；证据按设备分组显示友好名用
   readDeviceAliases: () => invoke<KV[]>("read_device_aliases"),

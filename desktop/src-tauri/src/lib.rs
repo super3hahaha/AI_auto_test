@@ -21,6 +21,7 @@ pub fn run() {
             commands::list_flows,
             commands::list_devices,
             commands::recorder_cmd,
+            commands::recorder_clear_shots,
             commands::recorder_session_start,
             commands::recorder_session_stop,
             commands::read_device_aliases,

@@ -6,7 +6,7 @@ import type { RecScreen, RecStep } from "../api";
 export type DaemonMsg =
   | { t: "hello"; serial: string; app: string; pkg: string; backend: string | null; video: boolean }
   // w/h 是编码器输出的视频尺寸（有对齐，仅供参考）；device 才是画框基准（设备逻辑分辨率）
-  | { t: "videoMeta"; codec: string; w: number; h: number; device: { w: number; h: number } }
+  | { t: "videoMeta"; codec: string; w: number; h: number; device: { w: number; h: number } | null }
   | { t: "hierarchy"; seq: number; hash: string; cause: "act" | "refresh" | "poll"; screen: RecScreen }
   | { t: "step"; step: RecStep }
   | { t: "stepDiff"; n: number; diff: { appeared: string[]; disappeared: string[] }; auto_swept: number }

@@ -71,6 +71,11 @@ const wsMode = ref(false);
 const stale = ref(false);
 const connState = ref(""); // ""=未连 / "ws"=V2 / "legacy"=降级（界面上要让用户知道现在是哪条链路）
 let lastShotSeq = 0;
+// pending：已收到但**还没上屏**的新树。静图模式下 hierarchy 先到、shot 后到（截图异步，
+// 无线 ~1.2s），扣在这里等同 seq 的图，凑齐了框和图一起换——保证屏幕上的框永远描述的是
+// 屏幕上这张图。shownSeq = 当前上屏这一对的 seq（自检横幅里显示，方便一眼看出是否配对）。
+let pending: { screen: RecScreen; seq: number } | null = null;
+const shownSeq = ref(0);
 
 // ── 视频流（scrcpy → WebCodecs → canvas）────────────────────────────────────
 // videoActive 只在**第一帧真的画出来**后才置 true（daemon 声称有视频 ≠ 解码成功），在那之前
@@ -180,8 +185,9 @@ sess.onVideoPacket = (flags, pts, payload) => ensurePipe()?.push(flags, pts, pay
 // ~1s，重发 config+IDR），把这个启动竞态抹平。
 watch(videoCanvas, (el, old) => {
   if (!el || old || !wsMode.value) return;
-  // canvas 是被 videoMeta 带来的 deviceWH 挂上的：pipe 这时才建得出来，尺寸得补设一次
-  if (deviceWH.value) ensurePipe()?.setDeviceSize(deviceWH.value[0], deviceWH.value[1]);
+  // canvas 是被 videoMeta 带来的 deviceWH 挂上的：pipe 这时才建得出来，先建好等关键帧
+  //（canvas 像素尺寸由 pipe 按帧尺寸自己定，不在这里设——见 videoPipe.ts 头注）
+  ensurePipe();
   sess.send({ t: "requestKeyframe" });
 });
 
@@ -198,24 +204,52 @@ function teardownVideo() {
 
 function onDaemonMsg(m: DaemonMsg) {
   if (m.t === "videoMeta") {
-    deviceWH.value = [m.device.w, m.device.h];
-    ensurePipe()?.setDeviceSize(m.device.w, m.device.h);
+    // device 只用作控件框的百分比基准（bounds 是设备坐标系）；canvas 像素尺寸由 VideoPipe 按
+    // 帧尺寸自己定——编码器降尺寸时视频≠设备尺寸（可差 1.5 倍），两者不能混用，见 videoPipe.ts 头注
+    // device 为 null = daemon 取不到设备尺寸（它不会拿视频尺寸顶，见 recorder_daemon.py）：
+    // 置空让 base 退回截图像素基准；宁可暂时不画框也不能按错误基准画
+    deviceWH.value = m.device ? [m.device.w, m.device.h] : null;
     if (!videoActive.value) armVideoWatchdog();
   } else if (m.t === "hierarchy") {
-    // 图先不动（新图由紧随的 shot 消息带来）：bounds 是设备坐标，同一朝向下基准不变，
-    // 新框叠旧图的空窗被 stale 压暗明示，不冒充"已同步"
-    const prev = screen.value;
-    screen.value = { ...m.screen, png: prev?.png ?? "", png_err: prev?.png_err ?? "",
-                     shot_w: prev?.shot_w ?? 0, shot_h: prev?.shot_h ?? 0 };
-    stale.value = false;
+    if (videoActive.value) {
+      // 视频模式：画面是实时流，树到了就该立刻生效（框失效窗口由 motionStale 单独把关）
+      const prev = screen.value;
+      screen.value = { ...m.screen, png: prev?.png ?? "", png_err: prev?.png_err ?? "",
+                       shot_w: prev?.shot_w ?? 0, shot_h: prev?.shot_h ?? 0 };
+      pending = null;
+      stale.value = false;
+    } else if (!screen.value) {
+      screen.value = { ...m.screen, png: "", png_err: "", shot_w: 0, shot_h: 0 }; // 首屏：没图也要先把树立起来
+      pending = { screen: m.screen, seq: m.seq };
+    } else {
+      // 静图模式的核心约束：**框和图必须是同一 seq**。截图是异步拍的（无线 ~1.2s，见
+      // recorder_daemon.py refresh()），新树先到、新图后到；这里把新树扣在 pending 里不上屏，
+      // 等同 seq 的 shot 到了再和图一起换上。直接上屏就是"新框叠旧图"，画面稍有变化框就
+      // 整体对不上（2026-09-09 真机排查：bounds/基准/CSS 全部验证无误，唯一错的就是这个配对）。
+      pending = { screen: m.screen, seq: m.seq };
+      stale.value = true; // 已知当前框过期：压暗+禁点，防照着旧框点错
+    }
     if (m.screen.auto_swept) showToast(`已自动清障 ${m.screen.auto_swept} 次（广告全屏页）`);
   } else if (m.t === "shot") {
     if (m.seq < lastShotSeq) return; // 乱序旧图丢弃（截图异步，可能晚于下一轮 hierarchy）
     lastShotSeq = m.seq;
-    if (screen.value) {
+    if (pending) {
+      // 严格同 seq 才配对。比 pending 更旧的图属于已被取代的那一轮，直接丢——它对应的树
+      // 早就不在屏上了，贴上去又是一次错配；pending 那一轮的图随后必然会到（静图模式下
+      // daemon 广播 hierarchy 与拍照的条件完全相同，每棵树都有自己的图）。
+      if (m.seq < pending.seq) return;
+      screen.value = { ...pending.screen, png: m.png, png_err: m.png_err,
+                       shot_w: m.shot_w, shot_h: m.shot_h };
+      pending = null;
+    } else if (screen.value) {
+      // 没有待换的树：这张图就是当前这棵树那一轮的（补发/重发），只换图
       screen.value = { ...screen.value, png: m.png, png_err: m.png_err,
                        shot_w: m.shot_w, shot_h: m.shot_h };
+    } else {
+      return;
     }
+    shownSeq.value = m.seq;
+    stale.value = false;
   } else if (m.t === "step") {
     steps.value.push(m.step);
     busy.value = "";
@@ -274,6 +308,8 @@ function stopSession() {
   connState.value = "";
   stale.value = false;
   lastShotSeq = 0;
+  pending = null;
+  shownSeq.value = 0;
   teardownVideo();
 }
 
@@ -286,6 +322,19 @@ function defaultCase() {
   const d = new Date();
   const p = (n: number) => String(n).padStart(2, "0");
   return `REC-${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
+}
+
+// caseId 只在首挂载/手动改输入框时变化，而截图文件名只按步骤序号编号（01.png…）：同一 caseId
+// 被跨轮次复用时，上一轮多出来的步骤号会留在 shots/ 里当孤儿文件，导出统计的截图数会把它们也
+// 算进去（见 docs/decisions.md）。caseId 一变就清一次目标目录，从源头保证不堆积。失败不阻断
+// 录制——顶多这轮截图计数不准，不该因为清理失败让人没法开始录。
+function clearShotsFor(c: string) {
+  const id = c.trim();
+  if (!id) return;
+  api.recClearShots(store.activeSlug, id).catch(() => {});
+}
+function onCaseIdChange() {
+  clearShotsFor(caseId.value);
 }
 
 // 无线连接的 serial 形如 192.168.x.x:5555；USB 是纯序列号
@@ -319,8 +368,8 @@ function devLabel(d: DeviceRow) {
 // 前台是对话框时只有 1013x1373，而截图始终是整屏 1080x2280，误用它会把所有框整体放大 1.66 倍、
 // 糊成盖住半屏的一块（真机踩过，桌面壳里复现、浏览器版没事，因为那边直接读的 naturalWidth）。
 const base = computed<[number, number] | null>(() => {
-  // 视频模式：canvas 的像素尺寸恒等于设备逻辑分辨率（videoPipe.setDeviceSize 保证），
-  // bounds 也是设备坐标系——基准天然统一
+  // 视频模式：基准 = 设备逻辑分辨率（bounds 的坐标系）。canvas 像素尺寸是视频帧尺寸，可能比
+  // 设备小（编码器降尺寸），但框用百分比定位、scrcpy 降尺寸保持宽高比，所以基准不必等于 canvas
   if (videoActive.value && deviceWH.value) return deviceWH.value;
   const sc = screen.value;
   if (sc?.shot_w && sc.shot_h) return [sc.shot_w, sc.shot_h]; // 后端从 PNG IHDR 读的权威值
@@ -394,7 +443,11 @@ watch([boxes, () => screen.value?.png, videoActive], async () => {
   const ok = Math.abs(dx) < 2 && Math.abs(dy) < 2 && Math.abs(ro.height - ri.height) < 1;
   align.value = {
     ok,
+    // ⚠️ 这个自检只验证 CSS 几何（框画的位置 == bounds 换算出来的位置），**验证不了框和图
+    // 是不是同一时刻的**——两者错配时它照样报"已对齐"（真机踩过：横幅显示 ✓，肉眼明显错位）。
+    // 所以把配对状态一并显示：seq = 当前上屏的这对框+图；基准 = 百分比换算用的分母。
     text: (ok ? "✓ 控件框已对齐" : `⚠︎ 控件框未对齐，偏差 (${dx.toFixed(1)}, ${dy.toFixed(1)}) 设备像素`) +
+      ` · 基准 ${b[0]}×${b[1]} · seq ${shownSeq.value}` +
       ` · overlay ${ro.width.toFixed(1)}×${ro.height.toFixed(1)} / img ${ri.width.toFixed(1)}×${ri.height.toFixed(1)}` +
       ` · ${navigator.userAgent.includes("Chrome") ? "Chromium" : "WebKit"}`,
   };
@@ -424,6 +477,14 @@ const HINTS: Record<string, string> = {
 function onImgLoad() {
   const el = shot.value;
   if (el?.naturalWidth) nat.value = [el.naturalWidth, el.naturalHeight];
+  // WKWebView 有时候只换了 data: URI 的 src、内部也解出了新位图，却不把它刷到屏幕上——画面
+  // 停在上一帧，框（走 CSS 百分比，跟位图无关）已经是新的，看着就是"框对不上图"；鼠标移进
+  // 框触发 :hover 重绘后画面立刻跳成新的，坐标其实一直没错（真机复现：静置画面持续错位，
+  // hover 任意一个框立刻恢复）。这里用一次不可感知的透明度扰动强制这一帧重绘，不碰布局。
+  if (el) {
+    el.style.opacity = "0.999";
+    requestAnimationFrame(() => { el.style.opacity = ""; });
+  }
 }
 
 async function call<T>(what: string, fn: () => Promise<T>): Promise<T | null> {
@@ -667,6 +728,7 @@ onActivated(() => {
 
 onMounted(async () => {
   caseId.value = defaultCase();
+  clearShotsFor(caseId.value);
   await loadDevices();
 });
 
@@ -683,7 +745,7 @@ onMounted(async () => {
           {{ devLabel(d) }}{{ busySerials.has(d.serial) ? "（回归执行中）" : "" }}
         </option>
       </select>
-      <input v-model="caseId" class="mono case" placeholder="用例 ID" />
+      <input v-model="caseId" class="mono case" placeholder="用例 ID" @change="onCaseIdChange" />
       <button @click="probe" :disabled="!serial || !!busy || busySerials.has(serial)"
               :title="busySerials.has(serial) ? '该设备正在跑回归，暂不能录制' : ''">
         {{ screen ? "重新探屏" : "开始（探当前屏）" }}
@@ -933,8 +995,9 @@ h2 { margin: 0; font-weight: 500; }
    之前这里没有高度上限，1080x2280 的截图在 400px 宽下要撑到 843px 高，笔记本视口经常放不下，
    只能整页滚动。 */
 .stage img { display: block; max-width: 100%; max-height: calc(100vh - 180px); width: auto; height: auto; }
-/* 视频 canvas 与 img 同一套缩放规则（canvas 的 width/height 属性= 设备像素 = intrinsic 尺寸，
-   现代引擎会按属性比例等比缩放，与 img 行为一致），.frame/.overlay 的对齐机制原样成立 */
+/* 视频 canvas 与 img 同一套缩放规则（canvas 的 width/height 属性 = 视频帧像素 = intrinsic 尺寸，
+   引擎按属性比例等比缩放，与 img 行为一致），.frame/.overlay 的对齐机制原样成立。帧尺寸可能小于
+   设备分辨率（编码器降尺寸），但宽高比一致，不影响百分比定位 */
 .stage canvas.vshot { display: block; max-width: 100%; max-height: calc(100vh - 180px); width: auto; height: auto; }
 /* 用 outline 而不是 border 画框：outline 不进盒模型、走的渲染路径也不同，能绕开 WKWebView 下
    「半透明 dashed border 的盒子被填上底色 + 冒出圆角」那个怪象（Chromium 里同样代码 computed

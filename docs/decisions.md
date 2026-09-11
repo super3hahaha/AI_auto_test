@@ -782,3 +782,24 @@
   卡住原因跟当时怀疑的完全不是一回事），第三轮改用「后台 `while` 循环每秒调一次 `adbkit.py
   focus` 写日志 + 前台同时跑脚本」这套零成本土办法，才把真实时序线还原出来。以后遇到"卡住了但
   不确定卡在哪"这类真机问题，与其反复读静态证据猜测，不如先花两分钟搭这套轻量观测。
+
+## 68. 录制器 caseId 变化时清空对应 `recordings/<caseId>/shots/` 目录（2026-09-09）
+
+- **问题**：`Recorder.vue` 的 `caseId`（形如 `REC-0907-1551`）只在组件首挂载时生成一次（`onMounted`
+  调 `defaultCase()`），之后 keep-alive 保活、切页不重生成，用户也能手动编辑输入框。而截图
+  文件名只按步骤序号编号（`shots/01.png`、`02.png`…，见 `recorder.py act_once` / `recorder_daemon.py`），
+  不带时间戳。一旦同一个 caseId 目录被跨轮次复用（同一天内多次进录制器恰好落在同一分钟、或
+  手动把输入框改回一个旧 ID 继续录），上一轮多出来的步骤号文件（比如上一轮录了 32 步生成
+  01~32.png，这一轮只录 3 步只覆盖 01~03.png）会作为孤儿文件永远留在目录里。导出时
+  `recorder_core.py export()` 现场 `glob(shots/*.png)` 全量计数，就会把这些历史文件也算进
+  「已导出 N 步 / M 张截图」的 M，跟本轮实际步骤数对不上（真实症状：界面显示"3 步 / 32 张截图"）。
+- **决定**：新增 Tauri 命令 `recorder_clear_shots(app_slug, case)`（`src-tauri/commands.rs`），
+  直接 `fs::remove_dir_all` 掉 `apps/<slug>/recordings/<case>/shots/`（校验路径不含 `../` 逃出
+  `recordings/` 目录，因为 case 是用户可编辑的输入框内容）。前端 `Recorder.vue` 在两处触发：
+  `onMounted` 生成默认 caseId 后立即清一次；输入框加 `@change`（失焦/回车才触发，不随每次
+  按键触发，避免打字过程中反复删除）用户手动改完 ID 后清一次。不走 python/`recorder.py`——
+  这是纯文件系统操作，不涉及设备，没必要多起一个子进程。失败静默吞掉（`.catch(() => {})`）：
+  清理失败顶多这轮截图计数不准，不该因此挡住用户开始录制。
+- **权衡/已知代价**：只在 caseId **变化**那一刻清，不管"同一 caseId 内、清空步骤后又录一轮"
+  这种子场景（`clearSteps()` 只清内存 `steps` 数组，不清磁盘）——如果需要更彻底的方案，
+  下一步可以是 `clearSteps()` 也顺带清 `shots/`，但目前没做，遇到再加。

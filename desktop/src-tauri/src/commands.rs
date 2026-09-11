@@ -1825,6 +1825,27 @@ pub async fn recorder_cmd(
     .map_err(|e| e.to_string())?
 }
 
+/// 清空某个录制用例目录下的 shots/（截图）。用例 ID 只在录制器首次挂载/用户改输入框时变化，
+/// 而截图文件名只按步骤序号编号（01.png、02.png…）——同一 caseId 被跨轮次复用（比如同一分钟内
+/// 重开一次、或手动改回一个旧 ID）时，上一轮多出来的步骤号会作为"孤儿文件"永远留在目录里，
+/// 导出时 `export()` 现场 glob 整个目录计数，就会把这些历史文件也算进"已导出 N 步 / M 张截图"，
+/// 跟本轮实际步骤数对不上（见 docs/decisions.md 对应条目）。前端在 caseId 变化时调这个命令，
+/// 从源头保证一个 caseId 目录里的截图只对应最新一轮。
+#[tauri::command]
+pub fn recorder_clear_shots(app: AppHandle, app_slug: String, case: String) -> Result<(), String> {
+    let root = root_of(&app)?;
+    let recordings_dir = app_root(&root, &app_slug).join("recordings");
+    let shots = recordings_dir.join(&case).join("shots");
+    // 防止 case 里带 ../ 逃出 recordings/ 目录（case 是用户可编辑的输入框内容，不可信）
+    if !shots.starts_with(&recordings_dir) {
+        return Err("非法用例 ID".into());
+    }
+    if shots.exists() {
+        fs::remove_dir_all(&shots).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // 录制器 V2：常驻 daemon 会话（tools/recorder_daemon.py，每设备一进程）
 // ---------------------------------------------------------------------------

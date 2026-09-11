@@ -131,13 +131,20 @@ class ScrcpySupervisor:
                               capture_output=True, text=True, timeout=30)
 
     def _device_size_sync(self):
-        """设备逻辑分辨率（**随旋转变化**）：dumpsys window displays 的 `cur=WxH`。
-        不能用 `wm size`——它报的是配置尺寸，横屏了照样输出竖屏的 1008x2244（真机踩过：
+        """设备逻辑分辨率（**随旋转变化**）：dumpsys window displays 里 **mDisplayId=0 那一块**的
+        `cur=WxH`。不能用 `wm size`——它报的是配置尺寸，横屏了照样输出竖屏的 1008x2244（真机踩过：
         旋转后 session meta 是 2244x1008，基准却还是竖屏值，画面被硬塞进竖 canvas 压扁）。
-        退路才是 wm size 的 Override/Physical（免刘海误差，gotchas 2026-07-20）。"""
+        退路才是 wm size 的 Override/Physical（免刘海误差，gotchas 2026-07-20）。
+
+        **必须锚定 mDisplayId=0**：scrcpy 在编码器不支持全分辨率而降档时（Android 14+），会为镜像
+        建一块**虚拟显示屏**，尺寸就是降档后的视频尺寸（三星 A05s 实测 864x1920），它同样出现在
+        dumpsys 输出里。原来全文取第一个 `cur=`，正好被这块虚拟屏截胡——基准变成视频尺寸，控件框
+        整体放大 1.25×/1.5×（gotchas 2026-09-10）。而这个函数恰恰只在 scrcpy 起流后被调用。"""
         import re as _re
         out = self._adb("shell", "dumpsys", "window", "displays").stdout or ""
-        m = _re.search(r"\bcur=(\d+)x(\d+)", out)
+        # 切出 mDisplayId=0 到下一个 Display: 之间的块，只在这一块里找 cur=
+        blk = _re.search(r"Display: mDisplayId=0\b(.*?)(?=\n\s*Display: mDisplayId=|\Z)", out, _re.S)
+        m = _re.search(r"\bcur=(\d+)x(\d+)", blk.group(1) if blk else out)
         if m:
             return int(m.group(1)), int(m.group(2))
         out = self._adb("shell", "wm", "size").stdout or ""
@@ -235,10 +242,26 @@ class ScrcpySupervisor:
                     # 变化再发。视频宽高有编码器对齐（≠设备逻辑分辨率），画框基准必须用后者
                     # （wm size 现查）——差最多 7px（"w/h 是包围盒"老坑的新形态，见 gotchas）。
                     vw, vh = int.from_bytes(head[4:8], "big"), int.from_bytes(head[8:12], "big")
-                    self.device_wh = await asyncio.to_thread(self._device_size_sync) or (vw, vh)
+                    # 设备尺寸拿不到时**绝不能**拿视频尺寸顶——两者可差 1.5 倍（编码器降档），那会让
+                    # 控件框整体放大；退而用上一次 screencap 的真实像素（与 bounds 同坐标系），再没有
+                    # 就沿用上次的值。仍然空就报 None，让前端退回截图基准，宁可暂时不画框也别画错。
+                    dev = await asyncio.to_thread(self._device_size_sync)
+                    if not dev:
+                        dev = d.last_shot_wh or self.device_wh
+                        print(f"[scrcpy] 取设备尺寸失败，退用 {dev}（视频 {vw}x{vh}）", file=sys.stderr, flush=True)
+                    self.device_wh = dev
                     self.alive = True
+                    # 视频尺寸 ≠ 设备尺寸不只是 8 对齐：编码器不支持全分辨率时 scrcpy 会沿
+                    # 2560→1920→1600… 阶梯降档（三星 A05s 实测 1080x2400 → 864x1920）。打出来，
+                    # 排"控件框整体放大"这类问题时一眼可见（gotchas 2026-09-10）。
+                    dw, dh = self.device_wh or (0, 0)
+                    if (vw, vh) != (dw, dh):
+                        print(f"[scrcpy] 视频 {vw}x{vh} / 设备 {dw}x{dh}"
+                              f"{'（编码器降尺寸）' if vw * 8 < dw * 7 else '（8 对齐）'}",
+                              file=sys.stderr, flush=True)
                     await d._broadcast({"t": "videoMeta", "codec": "h264", "w": vw, "h": vh,
-                                        "device": {"w": self.device_wh[0], "h": self.device_wh[1]}})
+                                        "device": ({"w": self.device_wh[0], "h": self.device_wh[1]}
+                                                   if self.device_wh else None)})
                     continue
                 pf = int.from_bytes(head[:8], "big")
                 size = int.from_bytes(head[8:12], "big")
@@ -275,6 +298,7 @@ class Daemon:
         # daemon 立刻恢复 screencap 供图——否则就是"daemon 不拍图 + 前端没画面"的双黑洞（真踩过：
         # 探屏成功但取屏区一片黑、0 个可点框，因为控件框的定位基准来自图）。
         self.video_on = True
+        self.last_shot_wh = None      # 最近一次 screencap 的真实像素（PNG IHDR），videoMeta 取不到设备尺寸时的退路
 
     # ---------- 设备层（全部跑在 to_thread 里，不挡事件循环） ----------
 
@@ -481,6 +505,8 @@ class Daemon:
                     (d / f"{step_ctx['n']:02d}.png").write_bytes(png)
                 await asyncio.to_thread(_save)
             w, hh = legacy_recorder.png_size(png or b"")
+            if w and hh:
+                self.last_shot_wh = (w, hh)
             await self._broadcast({"t": "shot", "seq": seq_now,
                                    "n": (step_ctx or {}).get("n", 0),
                                    "png": base64.b64encode(png).decode() if png else "",

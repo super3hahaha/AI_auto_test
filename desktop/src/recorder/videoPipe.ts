@@ -5,9 +5,15 @@
 // 4 字节大端长度前缀（AVCC）→ EncodedVideoChunk 喂 decode。scrcpy 无限 GOP：解码器出错时
 // 唯一正确的恢复是让 daemon 重启取流（onNeedKeyframe → {t:"requestKeyframe"}）。
 //
-// canvas 尺寸恒等于**设备逻辑分辨率**（videoMeta.device），帧画上去时拉伸对齐——视频尺寸有
-// 编码器对齐（≠设备尺寸，差最多 7px），控件框 bounds 是设备坐标系，基准必须统一到设备尺寸
-// （"w/h 是包围盒不是屏幕尺寸"老坑的新形态）。拉伸量 ≤7px，肉眼不可见。
+// canvas 像素尺寸**跟随视频帧**（frame.displayWidth/Height），帧 1:1 画上去，不做任何拉伸。
+// 曾经的做法是 canvas 固定成设备逻辑分辨率、drawImage 拉伸到满——假设"视频尺寸≈设备尺寸，只差
+// 8 对齐的几个像素"。这个假设在编码器不支持全分辨率的机器上不成立：scrcpy 遇到 MediaCodec 报错会
+// 沿 2560→1920→1600→… 阶梯自动降尺寸（三星 A05s/Android 15 真机：1080x2400 降到 720x1600，
+// 差 1.5 倍），而 WKWebView 上 drawImage(VideoFrame, 0,0,w,h) 的拉伸并未按 w/h 生效，帧只占了
+// canvas 左上角 2/3——控件框按整个 canvas 的百分比定位，看上去就是"框整体放大了 1.5 倍"，且随
+// 阶梯档位变化（1.25×/1.5×）。canvas 尺寸等于帧尺寸后，帧必然铺满，与引擎的拉伸实现无关。
+// 控件框的基准仍是设备坐标系（Recorder.vue 的 base = videoMeta.device），框用百分比定位，与
+// canvas 像素尺寸无关；scrcpy 降尺寸保持宽高比（8 对齐误差 ≤0.5%），百分比换算依然成立。
 
 export class VideoPipe {
   private decoder: VideoDecoder | null = null;
@@ -15,7 +21,6 @@ export class VideoPipe {
   private errCount = 0;
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
-  private deviceW = 0;
 
   /** 解码器连续出错（或不可恢复）时回调：外层发 requestKeyframe / 连挂 3 次降级 still */
   onNeedKeyframe: () => void = () => {};
@@ -30,14 +35,6 @@ export class VideoPipe {
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
-  }
-
-  setDeviceSize(w: number, h: number) {
-    this.deviceW = w;
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
-    }
   }
 
   /** 从 session.ts 的 0x01 二进制帧进来：flags bit0=config, bit1=keyframe */
@@ -65,9 +62,14 @@ export class VideoPipe {
     this.decoder = new VideoDecoder({
       output: (frame) => {
         this.errCount = 0;
-        // 拉到设备逻辑分辨率（基准统一，见文件头注）；device 尺寸未知时按帧尺寸兜底
-        if (!this.deviceW) this.setDeviceSize(frame.displayWidth, frame.displayHeight);
-        this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+        // canvas 像素尺寸 = 帧尺寸（见文件头注）。编码器中途降尺寸时 scrcpy 会重发 config，
+        // 帧尺寸随之变化，这里每帧核对一次；改 width/height 会清空画布，紧接着就画所以无感。
+        const w = frame.displayWidth, h = frame.displayHeight;
+        if (this.canvas.width !== w || this.canvas.height !== h) {
+          this.canvas.width = w;
+          this.canvas.height = h;
+        }
+        this.ctx.drawImage(frame, 0, 0);
         frame.close();
         this.onFrame();
       },

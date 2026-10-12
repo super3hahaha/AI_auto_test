@@ -54,7 +54,7 @@ AI_auto_test/
 │           ├── log.csv       # 状态变更日志：只追加；行尾「执行设备」列
 │           ├── .ledger.lock  # 账本进程间锁文件（flock；多设备并行写保护，见 _appctx.ledger_lock）
 │           ├── archive/<run_id>/  # 开新一轮时上一轮 log/evidence/issues/executions 整份归档
-│           └── run_records/  # 桌面壳执行记录：完整跑完(未中止)的一轮执行台快照 <id>.json（{meta,cells,events}）；gitignore；「执行记录」子tab按 id 回看
+│           └── run_records/  # 桌面壳执行记录：完整跑完(未中止)的一轮执行台快照 <id>.json（{meta,cells,events}）；gitignore；「执行记录」子tab按 id 回看；失败重跑格可带 rerun 来源（原失败设备/来源记录），cell.serial 始终是真实执行设备
 ├── tools/               # 跨 App 通用框架工具（共享）
 │   ├── _appctx.py       # ★ 多 App 上下文：解析活跃 App → 各路径（所有工具都 import 它）；
 │   │                    #   含 ledger_lock() 账本进程间锁（可重入 flock，所有账本 CSV 写点必须包它）
@@ -114,6 +114,7 @@ AI_auto_test/
 │   └── migrate_to_multiapp.py # 一次性：单 App 布局 → apps/<slug>/（幂等）
 ├── .claude/skills/adb-testcase-gen/  # skill：一句话目标→真机探查→YAML 用例
 ├── .claude/skills/flow-freeze/       # skill：探通路径→固化 flow_*.sh + 失败判定标准
+├── .codex/skills/flow-freeze/        # 上述 flow-freeze 的 Codex 项目级适配副本（frontmatter 遵循 Codex 校验约束）；正文修改时必须同步
 ├── desktop/             # ★ Tauri2+Vue3 桌面壳（可视化：设置/设备/执行/证据/看板）
 │   ├── src/views/            # 一个 tab 一个文件，App.vue 用 active 字符串切换（keep-alive 只保活 Runner+Recorder：
 │   │                           #   执行状态/录制进度切走不能丢；保活视图内禁用全局 querySelector、初始化走 onActivated）
@@ -126,13 +127,15 @@ AI_auto_test/
 │   │   │                      #   video→still（WebCodecs 不可用，异步截图推送）→legacy（daemon 起不来，走旧 recorder_cmd）。
 │   │   │                      #   步骤列表仍在前端持有；stale 态（动作后新树未到）压暗+禁点防照旧框点错。
 │   │                      #   被 keep-alive 保活（切走不丢步骤），故量 DOM 用模板 ref + onActivated 重量
-│   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38；多设备时用例行尾设备chips逐格分派，见decisions #39)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
+│   │   ├── Runner.vue         # 3 个子tab：场景库(选App/用例/设备/语言LANG_CODE，见decisions #38；多设备时用例行尾设备chips逐格分派，见decisions #39；失败重跑原设备优先、离线手动替代，见decisions #71)/执行台(内嵌RunMonitor)/执行记录(内嵌RunHistory)；资源库已提升为侧栏一级入口
 │   │   ├── RunMonitor.vue     # Runner 内嵌的运行监控子组件（流式日志/状态，不单独作为 tab）；数据源可为实时 runStore 或传入的 source 快照（执行记录复用）；用例卡片右上「↗」跳证据页定位到该格第一项（store.requestEvidence，见 decisions #47）
 │   │   ├── RunHistory.vue     # 「执行记录」子tab：列出保存的执行台快照(run_records/)、按 id 切换、用 RunMonitor 只读渲染（makeRecordSource 包快照）
 │   │   ├── Evidence.vue       # 证据查看器（截图/ui dump/日志），MVP-1 首个落地面；左栏按 设备(可收起)→用例→attempt 三层分组(不同设备跑的用例不同)，设备名走 read_device_aliases 映射；文本证据逐行渲染+关键行标红/定位(与 run_flow.KEY_LINE_RE 同口径)；消费 store.evidenceJump 定位到执行台指定的那一格，落空/文件已被清理都有提示（decisions #47）
 │   │   ├── Boards.vue         # 看板视图，点条目可跳到 Evidence
 │   │   └── Cleanup.vue        # 「清理」：扫描随使用堆积的历史文件(证据/APK/记录归档/缓存回收站/构建缓存五类)，按类别结构化列出(名称/大小/时间/受保护)，勾选后移进系统废纸篓(非硬删除)。后端 scan_cleanup + move_to_trash(trash crate)；开发构建缓存在只装打包 app 的机器上扫不到(if p.exists)天然隐身
-│   ├── src/{api.ts,store.ts,runStore.ts}  # Tauri invoke 封装 / 全局状态 / 执行态状态
+│   ├── src/components/RerunDeviceDialog.vue # 失败重跑离线设备映射弹窗；临时选择态，确认前不碰场景库勾选
+│   ├── src/rerunPlan.ts       # 失败重跑纯计划层：原设备优先、离线替代、同 case+目标设备去重并合并来源
+│   ├── src/{api.ts,store.ts,runStore.ts}  # Tauri invoke 封装 / 全局状态 / 执行态状态（runStore 只接收最终 plan，rerun 来源为可选元数据）
 │   ├── src/recorder/         # 录制器 V2 前端支撑：session.ts（WS 客户端/二进制帧解析/0x11 shot 上传）、
 │   │                         #   videoPipe.ts（SPS→avcC→VideoDecoder→canvas，路线A已在 WKWebView 真机码流验证）、
 │   │                         #   types.ts（WS 协议 TS 类型，与 recorder_daemon 契约一一对应）

@@ -2,7 +2,7 @@
 name: flow-freeze
 description: >
   把 AI 主循环探通的路径固化成 apps/<slug>/flows/flow_<模块>.sh 纯选择器 bash 回归脚本（回归提速），
-  并规定固化脚本的失败判定标准（FAILED 标记 + exit 码绑定，不豁免已知缺陷）。当用户说"固化这条
+  并规定固化脚本的多语言接入硬门禁、失败判定标准（FAILED 标记 + exit 码绑定，不豁免已知缺陷）。当用户说"固化这条
   用例/流程"、"把这条路径存成脚本"、"写个 flow 脚本"、"生成固化脚本"，或需要新建/修改
   `apps/<slug>/flows/flow_*.sh`、审查固化脚本该怎么判失败时触发。仅用于本项目（AI_auto_test），
   不是通用 shell 脚本规范。
@@ -94,6 +94,25 @@ $AK tapid take_save --timeout 8 --from-cache editor       # 直接读缓存算�
 这些选择器/判定点直接找不到，报"没找到...界面可能已变"（其实是语言变了，不是 UI 结构变了，
 但表现上跟 UI 变更报错一样，容易误判）。
 
+### 多语言接入是交付硬门禁（新建、生成或修改脚本都必须遵守）
+
+1. **所有新建、AI 生成、录制器导出后转正，或被修改的 `apps/<slug>/flows/flow_*.sh`，交付前都必须
+   完成多语言接入审计；没有完成就不算固化完成。** 不能因为当前设备语言固定、这次只跑中文/英文，
+   或旧脚本原本就写死了文案而跳过。
+2. 脚本只要在选择器、等待点、截图断言或自定义 dump 解析中依赖**被测 App 自有的** `text`/
+   `content-desc`，就必须 `source tools/lang_helper.sh`，并通过带资源 key 的 `t "源文案" "resource_key"`
+   取得运行语言文案。禁止在 `taptext`、`tapdesc`、`waitfor text`、`shot --assert-text`/
+   `--assert-gone` 或自定义 `grep` 判定中直接写死 App 业务文案。
+3. 全程只使用稳定 `resource-id`，或文案是从当前 UI dump 动态读取后原样复用的脚本，可以不
+   `source lang_helper.sh`；但必须在脚本头注写明“无 App 自有语言常量”及原因。系统组件、广告 SDK、
+   服务端下发内容等不在被测 App `strings.xml` 里的外部文案也可以不走 `t()`，但每处都要注释文案
+   来源和无法查 App 语言表的原因，不能用“查不到 key”当作无说明硬编码的借口。
+4. 修改遗留脚本时，至少要把本次触达路径上的语言相关常量一并整改；若审计发现同一脚本其他路径
+   仍有 App 自有文案硬编码，必须明确登记为未完成项，不能把脚本描述为“已完成多语言接入”。
+5. 交付前至少完成：检查上述命令/断言是否残留 App 文案常量、确认每个 `t()` 的资源 key、用脚本
+   固化时的源语言跑通；首次引入某个目标语言时，还必须按下方规则切到该语言真机跑通。任一项失败，
+   都不得以“当前语言能跑”为由放行。
+
 **表不用你建，也不用问用户要翻译包**：`tools/lang_table.py ensure` 会按「该设备此刻实装的
 versionCode」从设备上的 apk 现拉现建（`pm path` → `adb pull base.apk` → `aapt2 dump`），
 缓存在 `apps/<slug>/lang/tables/<versionCode>.json`，命中约 0.2s、冷路径约 6s，每个版本每台
@@ -110,10 +129,11 @@ $AK waitfor text "$(t 选择音频 select_audio)" --timeout 8 --cache picker
 LANG_CODE=ja bash apps/<slug>/flows/flow_cut_save.sh <serial>
 ```
 
-- **第二个参数（资源 key）建议每次都带上**。带 key 时跳过"按原文反查"，于是既不怕 App 出新版后
+- **第二个参数（资源 key）对被测 App 自有文案是必填项**。带 key 时跳过"按原文反查"，于是既不怕 App 出新版后
   原文撞车成多个 key（换表时真撞过，见 decisions #54），也不怕 `SRC_LANG` 没设对。查 key 的办法：
   `python3 tools/lang_table.py resolve <表> "<原文>" --from <源语言> --to en`，撞车时报错会列出全部候选，
-  再对照真机 dump 的控件 `resource-id` 定哪个才是。
+  再对照真机 dump 的控件 `resource-id` 定哪个才是。只有上面硬门禁第3条列出的外部文案可以不用 key，
+  且必须就地写明来源和豁免原因。
 - **源语言以脚本实际固化时 App 显示的语言为准，不是设备系统语言**。有些 App（如 MP3Cutter）有独立的
   应用内语言设置，系统是中文而 UI 是英文——这种脚本要 `export SRC_LANG=en`（放在 `source` 之前）。
 - `t()` 找不到 `--from`（`SRC_LANG`，默认 `zh-rCN`）语言下这段文案对应的 key，会非0退出报错——
@@ -142,16 +162,12 @@ LANG_CODE=ja bash apps/<slug>/flows/flow_cut_save.sh <serial>
   子串匹配用；模板类（如"%d个要合并的文件"）存的是带 `%d` 的完整句子，`t()` 查出模板后
   用 `printf` 现填数字才能精确匹配、喂给 `waitfor text`。搞反了要么 `waitfor` 精确匹配不上，
   要么白白多做一层不必要的字符串拼接。
-- **现状（2026-08-19）**：`apps/MP3Cutter/flows/` 下全部 32 个固化脚本已接入
-  `LANG_CODE`/`t()` 机制（选择器文案统一查表，`tapid`/resource-id 类步骤本就语言无关不用改）。
-  其中 22 个（CUT/CONV/MERGE/MIX/SPLIT/RING/DL 等）固化时 App 显示中文，`SRC_LANG` 用默认
-  `zh-rCN`；10 个 `UNLOCK-*`（广告解锁类，2026-08-19 补齐）固化时 App 实测显示英文，
-  显式 `export SRC_LANG=en`。`config/ad_rules.json` 的 `consent-agree` 规则也补了英文兜底。
-  **但只做到了"查表能正确换算出目标语言文案"这一层**，尚未逐条在真机上切换到非中文语言
-  完整跑通验证（韩语环境下只验证过首页入口按钮/隐私同意弹窗这两个点；`UNLOCK-*` 这批用
-  俄语真机实测过部分字符串精确匹配，但完整流程被两个跟语言无关的既有缺陷卡住，未拿到
-  完整通过，见 gotchas.md「UNLOCK-* 真机验证」条），后续真要跑某个语言的完整回归，仍需
-  按上面「新语言第一次接入必须真机验证过」这条纪律走一遍。
+- **审计现状（2026-09-30；只记录遗留债务，不构成豁免）**：`apps/MP3Cutter/flows/` 现有 50 个
+  `flow_*.sh`，其中 47 个已加载 `lang_helper.sh`。未加载的 3 个里：`flow_ad_banner.sh` 全程以
+  resource-id 为主，唯一固定 desc 来自广告 SDK，脚本头注已说明外部来源，符合上面第3条；
+  `flow_cut_mark.sh` 仍有 `Got it` 常量，来源尚未确认，在完成来源注释或改接 `t()` 前不能宣称完全
+  合规；`flow_merge_crossfade.sh` 写死了多处 App 英文业务文案，明确不合规，必须整改后才能作为
+  多语言固化脚本交付。旧版“全部32个脚本已接入”的说法已失效，不能再作为验收依据。
 - **`UNLOCK-*` 这批有 3 类文案本来就查不到、也不该硬翻**：广告解锁弹窗/按钮都是 App 自己的
   `strings.xml`（已接），但（1）在线铃声目录名（如「Top Ringtones 2026」「Most Downloaded」）
   是服务端下发的目录内容，不在 apk 里；（2）系统相册选图器（Photos/Just once/CROP 等）和

@@ -2706,3 +2706,33 @@ notes。
 紧邻都需要——只有"点开会触发一个新弹出层（菜单/对话框/气泡）"这一类才有入场动画的风险，
 跳转到全新 Activity/Fragment 页面的点击不受此影响（页面级转场本身有系统级过渡，`waitfor`
 的轮询天然覆盖，不会踩这个坑）。
+
+## 分割编辑页的按钮 resource-id 会随版本改名，且 `tv_split` 可能与首页入口同名（2026-09-30，Split 固化脚本）
+
+旧版分割编辑页使用 `split`/`delete`，最新界面已改为 `tv_split`/`tv_delete`。只替换成新 ID 会反过来
+让旧版本 App 无法执行，因此三条固化脚本统一通过 `tapid_compat` 优先尝试新版 ID、未命中再回退旧版 ID；
+正常态先对两套 ID 各做一次单 dump 探测，若恰逢页面重绘均未命中，再分别给完整重试窗口。`tv_split`
+还可能同时是首页「音频分割」入口的 resource-id，不能仅凭 ID 名字推断控件用途；当前
+`flow_split_core01.sh`、`flow_split_core02.sh`、`flow_split_ui01.sh` 都是在确认进入编辑页后才调用兼容点击，
+因此不会误点首页入口。App 升级后如果 Split 流程突然卡在按钮点击处，先从最新 UI dump/录制诊断核对
+这两组 ID，再同步修改三条脚本和对应 cases 说明，保留仍需支持的旧 ID 回退。
+
+## 华为 Android 8 会把所有原生 FLAC 的 MediaStore MIME 错标成 `audio/quicktime`（2026-09-30，`CUT-FMT-01`）
+
+EVA-AL10 / Android 8.0.0 上，系统预装 `.flac`、推送的测试源文件和 MP3Cutter 裁剪产物在
+MediaStore 中全部是 `mime_type=audio/quicktime`；但产物文件头为 `fLaC`，宿主机 `file` 识别为
+FLAC audio bitstream，`ffprobe` 给出 `format_name=flac`、`codec_name=flac`，确认只是 ROM 媒体库
+元数据错标，不是 App 转码错误。标准原生 FLAC MIME 是 `audio/flac`，历史别名 `audio/x-flac`。
+**不要**把 `quicktime` 直接塞进 `FORMAT_MIME_HINTS["FLAC"]`：那会全局接受真实 QuickTime 内容。
+`output-check --expect-format` 现在遇到 MIME 不匹配会自动 pull 文件，用 ffprobe 的真实容器/编码兜底；
+只有明确核验一致才通过，ffprobe 不可用/解析失败/格式仍不一致都继续判失败。
+
+## 失败重跑确认后刷新设备，不能复用普通选择态的“掉线剪枝 + 空时补第一台”（2026-10-12）
+
+普通场景库为了防“隐形勾选”，`loadDevices()` 会删掉离线 serial，并在选择为空时自动勾第一台在线设备；
+`rowDevs()` 在只勾一台时又会忽略历史逐行覆盖、让所有用例跟随这一台。这两个行为单独看都合理，但若直接
+用于已确认的失败重跑，会形成静默改派：目标设备掉线 → 被剪掉 → 第一台在线设备补进来 → 单设备兜底把
+原目标的用例全部转过去。修法不是删除普通态兜底，而是把重跑态分开：刷新仅更新设备列表、保留确认计划，
+`rowDevs()` 对重跑行始终尊重显式分配，启动前再用在线集合校验最终 plan，掉线则重新要求用户确认。
+**通用教训**：任何“列表刷新会顺手修正选择”的 UX 逻辑，一旦选择已具有审计/授权含义，就必须改成
+只读刷新 + 显式重新确认；不能把普通浏览态的便利默认继续套用。

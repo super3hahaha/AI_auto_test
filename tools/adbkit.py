@@ -1496,10 +1496,11 @@ FORMAT_MIME_HINTS = {
 }
 
 
-def _ffprobe_cross_check(row, mediastore_dur_s, args):
-    """pull row对应的_data到本地临时文件，用宿主机ffprobe解出真实音频流的 duration/bit_rate/
-    sample_rate，与MediaStore的duration字段、以及可选的 --expect-bitrate-kbps/--expect-sample-rate/
-    --expect-suffix 交叉核对。返回 (extra文案, fail_msg或None)；宿主机没装ffprobe/_data取不到/
+def _ffprobe_cross_check(row, mediastore_dur_s, args, verify_format=False):
+    """pull row对应的_data到本地临时文件，用宿主机ffprobe解出真实格式、duration/bit_rate/
+    sample_rate，与MediaStore的duration字段、以及可选的 --expect-format/--expect-bitrate-kbps/
+    --expect-sample-rate/--expect-suffix 交叉核对。返回
+    (extra文案, fail_msg或None, format_ok或None)；宿主机没装ffprobe/_data取不到/
     pull失败时打印警告并返回None（不让整条output-check因本地依赖缺失而失败）。
     MediaStore 本身没有比特率/采样率字段（BITRATE 列 API 30+才有且不一定准），只能靠这里的
     ffprobe 交叉核对——用于「另存为」弹窗里比特率/格式可由用户选择的场景（裁剪/转换模块），
@@ -1519,7 +1520,7 @@ def _ffprobe_cross_check(row, mediastore_dur_s, args):
             return None
         p = subprocess.run(
             ["ffprobe", "-v", "error", "-select_streams", "a:0",
-             "-show_entries", "format=duration:stream=sample_rate,bit_rate",
+             "-show_entries", "format=format_name,duration:stream=codec_name,sample_rate,bit_rate",
              "-of", "default=noprint_wrappers=1", str(tmp)],
             capture_output=True, text=True)
         out = (p.stdout or "").strip()
@@ -1532,7 +1533,29 @@ def _ffprobe_cross_check(row, mediastore_dur_s, args):
                 k, v = line.split("=", 1)
                 vals.setdefault(k.strip(), v.strip())
 
-        note, fail = "", None
+        note, fail, format_ok = "", None, None
+
+        # MediaStore 的 mime_type 并不总可信：华为 EVA-AL10 / Android 8.0 会把设备上所有
+        # 原生 FLAC（包括系统预装音乐）登记成 audio/quicktime。--expect-format 在 MIME
+        # 不匹配时会自动走到这里，以文件实体的容器/音频编码作为兜底判据；不能把
+        # audio/quicktime 直接加入 FLAC 的 MIME 白名单，否则真 QuickTime 伪装成 .flac
+        # 也会被放过。对现有 MP3/AAC/FLAC/WAV/OGG，预期格式名都能在 format_name 或
+        # codec_name 里命中（AAC-in-MP4 也会由 codec_name=aac 命中）。
+        if verify_format and getattr(args, "expect_format", None):
+            expected = args.expect_format.lower()
+            format_name = (vals.get("format_name") or "").lower()
+            codec_name = (vals.get("codec_name") or "").lower()
+            actual = f"format_name={format_name or '空'}, codec_name={codec_name or '空'}"
+            format_ok = bool(format_name or codec_name) and (
+                expected in format_name or expected in codec_name)
+            verdict = "一致" if format_ok else "不一致"
+            note += (f"；ffprobe真实格式{verdict}（预期={args.expect_format!r}，{actual}）")
+            print(f"[output-check] {'✓' if format_ok else '✗'} ffprobe真实格式{verdict}："
+                  f"预期={args.expect_format!r}，{actual}")
+            if not format_ok:
+                fail = fail or (
+                    f"[output-check] ✗ 产物真实格式与预期不一致："
+                    f"预期={args.expect_format!r}，{actual}")
 
         real_s = vals.get("duration")
         if real_s and real_s != "N/A":
@@ -1603,7 +1626,7 @@ def _ffprobe_cross_check(row, mediastore_dur_s, args):
                     f"[output-check] ✗ 产物文件后缀与预期不一致："
                     f"实际=.{real_suffix} vs 预期=.{expect_suffix}")
 
-        return (note, fail)
+        return (note, fail, format_ok)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -1618,8 +1641,9 @@ def cmd_output_check(args):
     --expect-duration-ms <N>：进一步跟另一个独立来源量到的时长（比如编辑器选区、结果页显示）做
     交叉核对，|实际-预期|<=--tolerance-ms（默认100ms，容忍编码取整误差）才算一致，结论直接写进
     这行证据的断言里——不然"完整性通过"这种话只证明"文件不是空壳"，证明不了"时长对不对"。
-    --expect-format <格式名>：跟另存为弹窗里读到的格式（如 format_text="MP3"）交叉核对 mime_type，
-    防止"保存框显示MP3，落盘却是别的格式"这类静默错位测不出来。
+    --expect-format <格式名>：先跟另存为弹窗里读到的格式（如 format_text="MP3"）交叉核对
+    mime_type；若 MediaStore MIME 不匹配，自动 pull 产物并以 ffprobe 的真实容器/编码兜底，
+    防止厂商 ROM 错标 MIME 造成误判，同时仍能抓住"保存框显示MP3，落盘却是别的格式"。
     --ffprobe：pull 最新产物到本地，用宿主机 ffprobe 解出真实音频流 duration，跟 MediaStore 的
     duration 字段交叉核对（容忍 --tolerance-ms）。MediaStore 完整性检查只能测"是不是空壳"
     （_size>0/duration非空），测不出"_size>0 但 MediaStore 记录的时长本身就是错的"这类静默
@@ -1643,7 +1667,7 @@ def cmd_output_check(args):
     for l in top:
         print(" ", l[:160])
 
-    extra, fail_msg = "", None
+    extra, fail_msg, ffprobe_used = "", None, False
     if args.expect:
         newest = rows[0]
         if args.expect not in newest:
@@ -1670,31 +1694,48 @@ def cmd_output_check(args):
                         print(f"[output-check] {'✓' if ok else '✗'} 时长对比{verdict}：实际{actual_ms}ms vs 预期{args.expect_duration_ms}ms（差{diff}ms）")
                         if not ok:
                             fail_msg = fail_msg or f"[output-check] ✗ 时长与预期不一致：实际{actual_ms}ms vs 预期{args.expect_duration_ms}ms（差{diff}ms，容忍{args.tolerance_ms}ms）"
+                    mime_format_error = None
                     if args.expect_format:
                         mime = (_field(newest, "mime_type") or "").lower()
                         hint = FORMAT_MIME_HINTS.get(args.expect_format.upper(), args.expect_format.lower())
                         hints = (hint,) if isinstance(hint, str) else hint
                         ok = any(h in mime for h in hints)
-                        verdict = "一致" if ok else "不一致"
-                        extra += f"；与预期格式{args.expect_format!r}对比{verdict}（实际mime_type={mime or '空'}）"
-                        print(f"[output-check] {'✓' if ok else '✗'} 格式对比{verdict}：预期{args.expect_format!r} vs 实际mime_type={mime or '空'}")
-                        if not ok:
-                            fail_msg = fail_msg or f"[output-check] ✗ 格式与预期不一致：预期{args.expect_format!r} vs 实际mime_type={mime or '空'}"
+                        if ok:
+                            extra += f"；与预期格式{args.expect_format!r}对比一致（实际mime_type={mime or '空'}）"
+                            print(f"[output-check] ✓ 格式对比一致：预期{args.expect_format!r} vs 实际mime_type={mime or '空'}")
+                        else:
+                            mime_format_error = (f"[output-check] ✗ MediaStore MIME与预期格式不一致："
+                                                 f"预期{args.expect_format!r} vs 实际mime_type={mime or '空'}")
+                            extra += (f"；MediaStore MIME异常（预期={args.expect_format!r}，"
+                                      f"实际={mime or '空'}），转ffprobe核验实体格式")
+                            print(f"[output-check] ⚠ MediaStore MIME与预期格式不一致："
+                                  f"预期{args.expect_format!r} vs 实际mime_type={mime or '空'}；"
+                                  "转用ffprobe核验真实容器/编码")
 
                     needs_ffprobe = (args.ffprobe or args.expect_bitrate_kbps is not None
-                                      or args.expect_sample_rate is not None or args.expect_suffix)
+                                      or args.expect_sample_rate is not None or args.expect_suffix
+                                      or mime_format_error is not None)
                     if needs_ffprobe:
-                        ffprobe_note = _ffprobe_cross_check(newest, dur_s, args)
+                        ffprobe_note = _ffprobe_cross_check(
+                            newest, dur_s, args, verify_format=mime_format_error is not None)
                         if ffprobe_note:
+                            ffprobe_used = True
                             extra += ffprobe_note[0]
                             if ffprobe_note[1]:
                                 fail_msg = fail_msg or ffprobe_note[1]
+                            # MIME 异常只有在 ffprobe 明确确认真实格式一致时才豁免；ffprobe
+                            # 缺字段/判不一致都不能靠文件后缀蒙混过关。
+                            if mime_format_error and ffprobe_note[2] is not True:
+                                fail_msg = fail_msg or mime_format_error
+                        elif mime_format_error:
+                            fail_msg = fail_msg or (mime_format_error + "；ffprobe未能完成真实格式兜底核验")
 
     if args.case:
         oc_out = evid_dir(args.case, "logs") / "output-check.txt"
         oc_out.write_text("\n".join(rows[: args.n]))
         evid_type = "MediaStore+ffprobe" if (args.ffprobe or args.expect_bitrate_kbps is not None
-                                              or args.expect_sample_rate is not None or args.expect_suffix) else "MediaStore"
+                                              or args.expect_sample_rate is not None or args.expect_suffix
+                                              or ffprobe_used) else "MediaStore"
         _append_evidence(args.case, "output-check", evid_type, oc_out,
                          assertion=(f"最新产物: {rows[0][:160]}{extra}" if rows else ""),
                          result="失败" if fail_msg else "通过")
@@ -1909,7 +1950,8 @@ def build_parser():
     s.add_argument("--tolerance-ms", type=int, default=100, dest="tolerance_ms",
                     help="上面那项的容忍误差(ms)，默认100（容忍编码取整误差）")
     s.add_argument("--expect-format", dest="expect_format", default=None,
-                    help="预期格式(如 MP3/WAV/AAC，通常来自另存为弹窗 format_text)，跟 mime_type 交叉核对")
+                    help="预期格式(如 MP3/WAV/AAC，通常来自另存为弹窗 format_text)；先核对 mime_type，"
+                         "MIME异常时自动用ffprobe真实容器/编码兜底")
     s.add_argument("--ffprobe", action="store_true",
                     help="pull最新产物到本地，用宿主机ffprobe解出真实音频流duration，与MediaStore的"
                          "duration字段交叉核对（容忍--tolerance-ms）。测MediaStore完整性检查测不出的"

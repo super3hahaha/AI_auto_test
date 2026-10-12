@@ -6,6 +6,8 @@
 import { reactive } from "vue";
 import { api } from "./api";
 import { store } from "./store";
+import type { RerunFailureSource, ResolvedRerunPlan } from "./rerunPlan";
+export type { RerunPlan } from "./rerunPlan";
 
 // 语言选择器的「自动」哨兵值：不是一个真的 LANG_CODE，选它表示「执行前逐台设备现查系统当前
 // 语言、换算成该 App 语言表里的代号再注入」，而不是场景库里固定选好的一个值。
@@ -39,6 +41,12 @@ export interface RunCell {
   issueSkip: boolean; // 用户手动勾掉「本条不登记问题清单」——常见于调试固化脚本时，失败是脚本没写好，
                        // 不是真 App 缺陷，不值得占用 issues.csv。只在 issue 还是 "none"（还没开始登记）
                        // 时可切换，一旦收尾流程跑到这一格就定型，不能反悔（撤销已登记不在这个口子里）。
+  rerun?: {
+    sourceRecordId?: string;
+    sourceRunId?: string;
+    sources: RerunFailureSource[]; // 原失败设备；cell.serial 始终是本次实际执行设备
+    manual?: boolean;
+  };
 }
 
 // 问题清单自动登记状态（issue_register.py）：none=不适用（通过格）/未开始；registering=收尾登记中；
@@ -88,6 +96,7 @@ export interface MonitorSource {
   // 实时源不带——实时就是当前轮次，由消费方回退到 store.runs 里 is_current 那条。
   // 用于用例卡片「↗」跳证据时把证据页的批次锚点切到对的那一轮（含已归档的旧轮次）。
   runId?: string;
+  recordId?: string; // 历史快照 id；实时源没有
   issueTotal: number;
   cells: RunCell[];
   events: RunEvent[];
@@ -107,16 +116,6 @@ export interface RunCaseSpec {
   case_id: string;
   script: string;
   module: string;
-}
-
-// 「执行记录」页「失败重跑」→ 场景库的一次性传参：只把失败用例、以及各用例具体在哪些设备上
-// 失败（而不是本轮勾选过的全部设备）带过去，场景库据此做逐格显式分派。labels 是失败重跑那一刻
-// 算好的设备展示名（别名优先，见 RunMonitor.deviceLabel），供 Runner 校验设备是否在线时提示用——
-// 那些设备当时可能已经不在「设备」栏的在线列表里，Runner 自己的 baseLabel() 查不到。
-export interface RerunPlan {
-  cases: string[]; // 失败用例 case_id，按用例库（queue.csv）原始顺序
-  serialsByCase: Record<string, string[]>; // caseId → 该用例失败所在的设备 serial 列表
-  labels: Record<string, string>; // serial → 展示名（别名/型号优先，取不到才是 serial 原文）
 }
 
 function classify(code: number, brain: boolean, aborted: boolean): CellStatus {
@@ -199,6 +198,7 @@ export const runStore = reactive({
     langCode?: string; // 场景库显式选的目标语言代号（如 ko）；不传=不切语言，走脚本固化时的原文
     followDevice?: boolean; // 场景库选了「跟随设备」：不装机，直接用设备上已装的 App 回归；
     // 证据版本段现查设备真实安装版本（run_flow.py/adbkit.py 无条件现查，不止跟随设备模式）
+    rerun?: ResolvedRerunPlan; // 可选失败重跑来源；执行器仍只消费 plan，来源仅随执行格/快照留痕
   }) {
     if (this.running || this.publishing) return;
     const specById = new Map(opts.cases.map((c) => [c.case_id, c]));
@@ -215,10 +215,14 @@ export const runStore = reactive({
     this.cells = [];
     this.issueTotal = 0;
     this.completed = false;
+    const rerunByCell = new Map(
+      (opts.rerun?.assignments ?? []).map((a) => [`${a.targetSerial}|${a.caseId}`, a] as const)
+    );
     for (const s of serials) {
       for (const cid of opts.plan[s]) {
         const c = specById.get(cid);
         if (!c) continue; // plan 里引用了不存在的用例（理论上不会，防御）
+        const rerunAssignment = rerunByCell.get(`${s}|${cid}`);
         this.cells.push({
           serial: s,
           caseId: c.case_id,
@@ -231,6 +235,14 @@ export const runStore = reactive({
           recording: false,
           issue: "none",
           issueSkip: opts.noRegister ?? false,
+          rerun: rerunAssignment
+            ? {
+                sourceRecordId: opts.rerun?.sourceRecordId,
+                sourceRunId: opts.rerun?.sourceRunId,
+                sources: rerunAssignment.sources.map((source) => ({ ...source })),
+                manual: rerunAssignment.manual,
+              }
+            : undefined,
         });
       }
     }
@@ -249,6 +261,26 @@ export const runStore = reactive({
     );
     if (opts.noRegister) {
       this.pushEvent("已勾选「失败不登记」：本轮失败/需复核格收尾时不写入问题清单（可在执行台逐格反悔），收尾也不同步表格/刷新Doc，只存本地执行记录。");
+    }
+    if (opts.rerun) {
+      const from = opts.rerun.sourceRecordId ? `执行记录 ${opts.rerun.sourceRecordId}` : "历史失败记录";
+      this.pushEvent(`失败重跑：来源 ${from}，保留原失败设备，本轮按确认后的实际设备执行。`);
+      for (const assignment of opts.rerun.assignments) {
+        const sourceLabels = assignment.sources.map((source) => source.label).join("、");
+        const replaced = assignment.sources.some((source) => source.serial !== assignment.targetSerial);
+        this.pushEvent(
+          assignment.manual
+            ? `↪ ${assignment.caseId}：场景库手动调整，失败来源 ${sourceLabels} → ${assignment.targetSerial}`
+            : replaced
+            ? `↪ ${assignment.caseId}：${sourceLabels} → ${assignment.targetSerial}`
+            : `↪ ${assignment.caseId}：继续使用原设备 ${sourceLabels}`
+        );
+      }
+      if (opts.rerun.mergedCount > 0) {
+        this.pushEvent(
+          `已将 ${opts.rerun.failureCount} 个失败格合并为 ${opts.rerun.executionCount} 次实际执行（同一用例 × 同一设备只执行一次，来源完整保留）。`
+        );
+      }
     }
     const caseCount = new Set(this.cells.map((c) => c.caseId)).size;
     this.pushEvent(
@@ -664,6 +696,7 @@ export function makeRecordSource(record: RunRecord): MonitorSource {
     // 卡片「↗」跳证据时要按这一轮去读 evidence.csv（可能已归档）；runId 字段加入前存的旧记录是
     // undefined，消费方回退到当前批次并在找不到时提示，不静默错读别的轮次。
     runId: record.meta.runId,
+    recordId: record.meta.id,
     // 问题清单摘要分母：终态记录里 issue 非 none 的格数（= 已登记 + 待人工），驱动头部 publishPhase 摘要
     issueTotal: record.cells.filter((c) => c.issue !== "none").length,
     cells: record.cells,

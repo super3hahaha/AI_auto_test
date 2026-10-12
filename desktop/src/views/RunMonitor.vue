@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, reactive, computed, watch, nextTick, onMounted } from "vue";
-import { runStore, labelOf, type CellStatus, type IssueState, type MonitorSource, type RerunPlan } from "../runStore";
+import { runStore, labelOf, type CellStatus, type IssueState, type MonitorSource, type RerunPlan, type RunCell } from "../runStore";
 import { api } from "../api";
 import { store } from "../store";
 
@@ -139,7 +139,31 @@ function emitRerunFailed() {
     (serialsByCase[c.caseId] ??= []).push(c.serial);
     labels[c.serial] = deviceLabel(c.serial);
   }
-  emit("rerun-failed", { cases, serialsByCase, labels });
+  emit("rerun-failed", {
+    cases,
+    serialsByCase,
+    labels,
+    sourceRecordId: props.source?.recordId,
+    sourceRunId: props.source?.runId,
+  });
+}
+
+function rerunSourceText(cell: RunCell): string {
+  if (!cell.rerun?.sources.length) return "";
+  const sources = cell.rerun.sources.map((source) => source.label).join("、");
+  const replaced = cell.rerun.sources.some((source) => source.serial !== cell.serial);
+  const merged = cell.rerun.sources.length > 1 ? `（${cell.rerun.sources.length} 个失败来源）` : "";
+  if (cell.rerun.manual) return `失败重跑（场景库调整）：${sources} → ${deviceLabel(cell.serial)}${merged}`;
+  return replaced
+    ? `替代重跑：${sources} → ${deviceLabel(cell.serial)}${merged}`
+    : `失败重跑：沿用原设备 ${sources}${merged}`;
+}
+
+function rerunSourceTitle(cell: RunCell): string {
+  const parts: string[] = [];
+  if (cell.rerun?.sourceRecordId) parts.push(`来源执行记录 ${cell.rerun.sourceRecordId}`);
+  if (cell.rerun?.sourceRunId) parts.push(`来源轮次 ${cell.rerun.sourceRunId}`);
+  return parts.join(" · ") || "来源历史失败记录";
 }
 
 const overall = computed(() => {
@@ -393,6 +417,13 @@ watch(
                       <span v-if="M.cell(s, cid)!.recording" class="et recording">落库中…</span>
                       <span v-else-if="M.cell(s, cid)!.elapsed" class="et">{{ M.cell(s, cid)!.elapsed }}s</span>
                     </div>
+                    <div
+                      v-if="M.cell(s, cid)!.rerun"
+                      class="rerun-source"
+                      :title="rerunSourceTitle(M.cell(s, cid)!)"
+                    >
+                      {{ rerunSourceText(M.cell(s, cid)!) }}
+                    </div>
                   </div>
                 </template>
               </div>
@@ -427,6 +458,7 @@ watch(
 .monitor { display: flex; flex-direction: column; height: 100%; min-height: 0; }
 .empty { padding: 40px 24px; text-align: center; }
 .empty-t { font-size: 15px; font-weight: 500; margin-bottom: 8px; }
+.rerun-source { margin-top: 7px; padding-top: 6px; border-top: 0.5px dashed var(--border); color: var(--text-accent); font-size: 10px; line-height: 1.4; }
 
 .hd { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
 .hd-l { display: flex; align-items: center; gap: 10px; }

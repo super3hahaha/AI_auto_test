@@ -4,6 +4,12 @@ import { confirm, message } from "@tauri-apps/plugin-dialog";
 import { api, type FlowRow, type DeviceRow, type ApkInfo, type ApkVersionInfo } from "../api";
 import { store } from "../store";
 import { runStore, AUTO_LANG, type RerunPlan } from "../runStore";
+import {
+  missingRerunSerials,
+  resolveRerunPlan,
+  type ResolvedRerunPlan,
+} from "../rerunPlan";
+import RerunDeviceDialog from "../components/RerunDeviceDialog.vue";
 import RunMonitor from "./RunMonitor.vue";
 import RunHistory from "./RunHistory.vue";
 
@@ -68,6 +74,11 @@ async function loadLangLocales() {
 // ── 右栏：设备 + 看板 + 执行 ──
 const devices = ref<DeviceRow[]>([]);
 const pickedSerials = ref<string[]>([]);
+type ActiveRerunContext = { source: RerunPlan; resolved: ResolvedRerunPlan };
+const activeRerun = ref<ActiveRerunContext | null>(null);
+const rerunDialogPlan = ref<RerunPlan | null>(null);
+const rerunDialogRefreshing = ref(false);
+const rerunDialogInitialReplacements = ref<Record<string, string>>({});
 
 // ── 「用例 × 设备」逐格分派（docs/handoff-parallel-multidevice.md §5.4）──
 // 默认语义不变：勾了的用例在所有勾选设备上跑（=矩阵，整行铺满）。勾选 >1 台设备时，
@@ -75,6 +86,11 @@ const pickedSerials = ref<string[]>([]);
 // rowSerials[caseId] 存该行的显式覆盖；没有条目 = 跟随 pickedSerials 全铺（含后勾的新设备）。
 const rowSerials = reactive<Record<string, string[]>>({});
 function rowDevs(caseId: string): string[] {
+  // 失败重跑确认后的逐用例分配要冻结：即使只剩一台已选设备，也必须尊重显式 rowSerials。
+  // 否则 A 在线、B 掉线后 pickedSerials 只剩 A，B 对应的用例会被单设备兜底静默转给 A。
+  if (activeRerun.value && Object.prototype.hasOwnProperty.call(rowSerials, caseId)) {
+    return rowSerials[caseId].filter((s) => pickedSerials.value.includes(s));
+  }
   // 只勾 1 台设备时 chips 不出现（见下方模板 v-if），此时不存在"分派"这回事——必须无条件跟随
   // pickedSerials，不能套用之前多设备时留下的覆盖（哪怕它是空数组）。否则「之前勾 2 台时把某
   // 几条用例的 chips 全点掉」这个历史状态，会在退回单设备后变成"看不见 chips 却分派不到任何
@@ -269,21 +285,35 @@ async function loadFlows() {
   pickedCases.value = pickedCases.value.filter((c) => ids.has(c));
 }
 
-async function loadDevices() {
+async function refreshDeviceList(reconcileSelection: boolean) {
   devices.value = await api.listDevices(store.activeSlug || "");
-  // 剔除已掉线/未授权的勾选：设备卡片只渲染当前在线设备，若不同步剪枝，
-  // 已勾但掉线的 serial 会残留在 pickedSerials 里（UI 看不到却仍参与执行），导致“选 1 台却跑 N 台”。
-  const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
-  pickedSerials.value = pickedSerials.value.filter((s) => online.has(s));
-  if (!pickedSerials.value.length) {
-    const first = devices.value.find((d) => d.state === "device");
-    if (first) pickedSerials.value = [first.serial];
+  if (reconcileSelection) {
+    // 普通选择态仍保持原有不变量：剔除已掉线/未授权的隐形勾选，空时默认第一台在线设备。
+    // 已确认的失败重跑分配则不走这里——掉线目标必须保留到启动复查并要求用户重新确认，不能
+    // 因刷新动作静默改成第一台在线设备。
+    const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
+    pickedSerials.value = pickedSerials.value.filter((s) => online.has(s));
+    if (!pickedSerials.value.length) {
+      const first = devices.value.find((d) => d.state === "device");
+      if (first) pickedSerials.value = [first.serial];
+    }
   }
   // list_devices 刚查到的型号已经落盘（config/device_info_cache.json），但执行台看板（RunMonitor）
   // 靠 v-show 常驻挂载，自己的别名/型号缓存只在首次挂载时读过一次——这里主动催它重读，不然场景库
   // 这边刷新出了型号，看板标题栏还停在挂载那一刻的旧值（无线设备表现为一直露 ip:port）。
   await monitorRef.value?.reload();
 }
+
+async function loadDevices() {
+  await refreshDeviceList(!activeRerun.value);
+}
+
+const offlineRerunTargets = computed(() => {
+  if (!activeRerun.value) return [];
+  const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
+  return [...new Set(activeRerun.value.resolved.assignments.map((a) => a.targetSerial))]
+    .filter((serial) => !online.has(serial));
+});
 
 async function loadAll() {
   err.value = "";
@@ -321,6 +351,31 @@ async function launch(newBoard: boolean) {
   const cases = allFrozen.value
     .filter((f) => pickedCases.value.includes(f.case_id))
     .map((f) => ({ case_id: f.case_id, script: f.script, module: f.module }));
+  // 失败重跑在真正启动前再次现查目标设备。确认后到点执行之间设备仍可能掉线；此时重开映射弹窗，
+  // 不让 loadDevices 的默认首台逻辑接管，也不把任务交给已经离线的 serial。
+  if (activeRerun.value) {
+    try {
+      await refreshDeviceList(false);
+    } catch (e: any) {
+      err.value = `刷新设备失败：${e}`;
+      return;
+    }
+    const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
+    const pendingPlan = buildPlan(cases);
+    const disconnected = Object.keys(pendingPlan).filter((serial) => !online.has(serial));
+    if (disconnected.length) {
+      const replacements: Record<string, string> = {};
+      for (const assignment of activeRerun.value.resolved.assignments) {
+        for (const source of assignment.sources) {
+          if (source.serial !== assignment.targetSerial) replacements[source.serial] = assignment.targetSerial;
+        }
+      }
+      rerunDialogInitialReplacements.value = replacements;
+      rerunDialogPlan.value = activeRerun.value.source;
+      err.value = `本次重跑目标设备已掉线：${disconnected.map(baseLabel).join("、")}。请重新确认设备分配。`;
+      return;
+    }
+  }
   // 执行计划：整行全铺 = 矩阵；有行做过 chips 取舍 = 显式分派。两者同一条编排路径。
   const plan = buildPlan(cases);
   const planSerials = Object.keys(plan);
@@ -335,6 +390,39 @@ async function launch(newBoard: boolean) {
   const ver = selectedVersion[slug];
   const apkPath = ver && ver !== FOLLOW_DEVICE ? appVersions[slug]?.find((v) => v.version === ver)?.path : undefined;
   const pkg = store.activeApp()?.package;
+  const rerun = activeRerun.value
+    ? (() => {
+        const context = activeRerun.value!;
+        const resolvedByCell = new Map(
+          context.resolved.assignments.map((a) => [`${a.targetSerial}|${a.caseId}`, a] as const)
+        );
+        const assignments = Object.entries(plan).flatMap(([targetSerial, caseIds]) =>
+          caseIds.flatMap((caseId) => {
+            const exact = resolvedByCell.get(`${targetSerial}|${caseId}`);
+            if (exact) return [exact];
+            // 用户在返回场景库后可继续用 chips 微调。新加的目标格无法再反推出某个来源设备与它的
+            // 一一对应关系，因此按该用例的全部原失败来源留痕，并明确标记为场景库手动调整。
+            const sources = [...new Set(context.source.serialsByCase[caseId] ?? [])]
+              .map((serial) => ({ serial, label: context.source.labels[serial] || serial }));
+            return sources.length ? [{ caseId, targetSerial, sources, manual: true }] : [];
+          })
+        );
+        const sourceKeys = new Set(
+          assignments.flatMap((a) => a.sources.map((source) => `${a.caseId}|${source.serial}`))
+        );
+        const failureCount = sourceKeys.size;
+        return assignments.length
+          ? {
+              ...context.resolved,
+              assignments,
+              failureCount,
+              executionCount: assignments.length,
+              mergedCount: Math.max(0, failureCount - assignments.length),
+            }
+          : undefined;
+      })()
+    : undefined;
+  activeRerun.value = null;
   runStore
     .start({
       slug,
@@ -348,28 +436,65 @@ async function launch(newBoard: boolean) {
       langCode: langCode.value || undefined,
       followDevice: ver === FOLLOW_DEVICE,
       noRegister: noRegister.value,
+      rerun,
     })
     .then(() => loadFlows()); // 跑完刷新用例列表拿最新 last_result
 }
 
-// 「执行记录」页点「失败重跑」→ 跳回场景库，只勾失败用例，且逐格显式分派回它们各自失败的设备
-// （而不是本轮跑过的全部设备）。先现查一遍在线设备——失败当时在线的设备，此刻未必还连着。
+function applyRerunPlan(source: RerunPlan, resolved: ResolvedRerunPlan) {
+  const targets = [...new Set(resolved.assignments.map((a) => a.targetSerial))];
+  boardMode.value = "current"; // 重跑失败用例是续用当前批次，不应该顺手开新一轮
+  pickedCases.value = [...resolved.cases];
+  pickedSerials.value = targets;
+  Object.keys(rowSerials).forEach((k) => delete rowSerials[k]);
+  for (const caseId of resolved.cases) rowSerials[caseId] = [...(resolved.serialsByCase[caseId] ?? [])];
+  activeRerun.value = { source, resolved };
+  rerunDialogPlan.value = null;
+  rerunDialogInitialReplacements.value = {};
+  err.value = resolved.mergedCount > 0
+    ? `已将 ${resolved.failureCount} 个失败格合并为 ${resolved.executionCount} 次实际执行；失败来源会随执行记录保留。`
+    : "";
+  subTab.value = "library";
+}
+
+function confirmRerunDevices(replacements: Record<string, string>) {
+  const source = rerunDialogPlan.value;
+  if (!source) return;
+  const online = devices.value.filter((d) => d.state === "device").map((d) => d.serial);
+  try {
+    applyRerunPlan(source, resolveRerunPlan(source, online, replacements));
+  } catch (e: any) {
+    err.value = String(e);
+  }
+}
+
+async function refreshRerunDialog() {
+  rerunDialogRefreshing.value = true;
+  try {
+    await refreshDeviceList(false);
+  } catch (e: any) {
+    err.value = `刷新设备失败：${e}`;
+  } finally {
+    rerunDialogRefreshing.value = false;
+  }
+}
+
+// 「执行记录」页点「失败重跑」：在线原设备直接回填；有离线原设备时只打开临时映射弹窗，
+// 用户确认前完全不改场景库现有勾选，取消也不会覆盖原选择。
 async function onRerunFailed(plan: RerunPlan) {
-  await loadDevices(); // 刷新右栏设备列表，避免刚插上的设备还没出现在勾选框里（见 loadDevices 内注释）
-  const online = new Set(devices.value.filter((d) => d.state === "device").map((d) => d.serial));
-  const required = [...new Set(Object.values(plan.serialsByCase).flat())];
-  const missing = required.filter((s) => !online.has(s));
-  if (missing.length) {
-    const names = missing.map((s) => plan.labels[s] || s).join("、");
-    await message(`${names} 设备当前没有连接，请连接后再试。`, { title: "失败重跑", kind: "warning" });
+  try {
+    await refreshDeviceList(false);
+  } catch (e: any) {
+    err.value = `刷新设备失败：${e}`;
     return;
   }
-  boardMode.value = "current"; // 重跑失败用例是续用当前批次，不应该顺手开新一轮
-  pickedCases.value = [...plan.cases];
-  pickedSerials.value = required;
-  Object.keys(rowSerials).forEach((k) => delete rowSerials[k]);
-  for (const cid of plan.cases) rowSerials[cid] = plan.serialsByCase[cid] ?? required;
-  subTab.value = "library";
+  const online = devices.value.filter((d) => d.state === "device").map((d) => d.serial);
+  if (missingRerunSerials(plan, online).length) {
+    rerunDialogInitialReplacements.value = {};
+    rerunDialogPlan.value = plan;
+    return;
+  }
+  applyRerunPlan(plan, resolveRerunPlan(plan, online, {}));
 }
 
 // ── 左栏顶部：上传 APK（本地解析 → 装机 → 注册）──
@@ -450,6 +575,8 @@ async function doUpload() {
 
 function selectApp(slug: string) {
   if (slug === store.activeSlug) return;
+  activeRerun.value = null;
+  rerunDialogPlan.value = null;
   store.setActive(slug).then(loadAll);
 }
 
@@ -766,6 +893,9 @@ onActivated(() => { if (!runStore.running) loadAll(); });
               <span class="mono">{{ d.serial }}</span>
               <span class="muted">{{ d.model || d.state }}</span>
             </label>
+            <div v-if="offlineRerunTargets.length" class="rerun-target-warning">
+              已确认的重跑目标设备掉线：{{ offlineRerunTargets.join("、") }}。点击执行时会要求重新选择，不会自动换机。
+            </div>
           </div>
         </div>
 
@@ -830,6 +960,17 @@ onActivated(() => { if (!runStore.running) loadAll(); });
     <div v-show="subTab === 'history'" class="monitor-wrap">
       <RunHistory ref="historyRef" @rerun-failed="onRerunFailed" />
     </div>
+
+    <RerunDeviceDialog
+      v-if="rerunDialogPlan"
+      :plan="rerunDialogPlan"
+      :devices="devices"
+      :refreshing="rerunDialogRefreshing"
+      :initial-replacements="rerunDialogInitialReplacements"
+      @cancel="rerunDialogPlan = null"
+      @refresh="refreshRerunDialog"
+      @confirm="confirmRerunDevices"
+    />
 
     <!-- 新建看板二次确认 -->
     <div v-if="confirmNewBoard" class="overlay">
@@ -912,6 +1053,7 @@ h2 { margin: 0; font-weight: 500; }
 .monitor-wrap { flex: 1; min-height: 0; display: flex; }
 .monitor-wrap :deep(.monitor) { flex: 1; min-width: 0; }
 .err { color: var(--text-danger); background: var(--bg-danger); padding: 8px 12px; border-radius: var(--radius); margin: 6px 0; font-size: 13px; }
+.rerun-target-warning { margin-top: 8px; padding: 7px 9px; border-radius: var(--radius); color: var(--text-danger); background: var(--bg-danger); font-size: 11px; line-height: 1.5; }
 
 .cols { display: flex; gap: 12px; flex: 1; min-height: 0; }
 .col { display: flex; flex-direction: column; min-height: 0; }

@@ -1,39 +1,43 @@
 #!/usr/bin/env python3
-"""auto_repair —— 「Claude」固化脚本自愈闭环。
+"""auto_repair —— 本机 AI CLI（Claude Code / Codex）固化脚本自愈闭环。
 
 固化脚本天生脆(硬编码控件文案/坐标/等待、App 会弹新广告/改文案/加引导)。这个工具在
-执行台勾选「Claude」时替代 run_flow.py 被调用:跑固化脚本,若异常退出就把失败上下文
-(脚本 + 本次日志 + 本 attempt 证据)喂给本机 claude CLI,让它诊断根因并二选一处置,循环至多 3 次。
+执行台勾选「脚本自愈」时替代 run_flow.py 被调用:跑固化脚本,若异常退出就把失败上下文
+(脚本 + 本次日志 + 本 attempt 证据)喂给设置页选中的本机 AI CLI,让它诊断根因并二选一处置,
+循环至多 3 次。
 
 【最关键的边界——不可洗绿】失败分两类,处置完全不同:
-  A 脚本/环境脆(弹窗没兜住、文案变了、等待不够、坐标错) → 只允许 claude 改固化脚本的
+  A 脚本/环境脆(弹窗没兜住、文案变了、等待不够、坐标错) → 只允许 AI 改固化脚本的
     「导航与健壮性」,断言/关键值核对/output-check 判定逻辑一律不许动 → 改完重跑。
   B 被测 App 真缺陷(功能真失败、崩溃、关键校验到真实不符) → 什么都不改,这是一条测试发现;
-    立即停,往 log.csv 记一行「需人工介入·疑似App缺陷」,正式判定/登记 issues 仍回 Claude Code 做。
+    立即停,往 log.csv 记一行「需人工介入·疑似App缺陷」,正式判定/登记 issues 仍交人工复核。
 把真 bug 洗成绿灯是本框架最严重的错误——系统提示里把这条按死了。
 
-重试循环(确定性)留在本工具;claude 每次只做「诊断 + 改脚本」一件事,不自己开重试循环。
+重试循环(确定性)留在本工具;AI 每次只做「诊断 + 改脚本」一件事,不自己开重试循环。
 每次重跑仍经 run_flow.py → 账本照常配对记时,不漏记(见 memory: 每次执行都要登记)。
 
 用法:
   python3 tools/auto_repair.py <用例ID> <flow脚本路径> <serial>
   (桌面壳 spawn 时设 AITEST_APP=<slug>;serial 必传,多设备并行下没有"默认设备"可退回)
 
-退出码:0=最终通过;2=判定App缺陷已停;3=判定脚本脆但claude未产生改动;
-        4=claude无法判定/调用失败;5=自愈3次仍未通过;>0 其余为 run_flow 透传。
+退出码:0=最终通过;2=判定App缺陷已停;3=判定脚本脆但AI未产生改动;
+        4=AI无法判定/调用失败;5=自愈3次仍未通过;>0 其余为 run_flow 透传。
 """
 import csv, os, re, sys, subprocess, shutil, datetime, difflib, argparse, fcntl
 from pathlib import Path
 from contextlib import contextmanager
 
 from _appctx import REPO, LEDGER, load_cfg, ledger_lock, probe_installed_version  # 多 App 路径解析
+from ai_cli import display_name, find_cli, model_from_env, provider_from_env, run_headless
 import exec_ledger
 
 MAX_ATTEMPTS = 3
-CLAUDE_TIMEOUT = 360  # 单次诊断上限(秒),超时按无法判定处理
-# 自愈用哪个模型:默认 sonnet5(诊断够用又比 opus 省);设 AUTO_REPAIR_MODEL 环境变量可覆盖,
-# 传空串(AUTO_REPAIR_MODEL="")则不加 --model,退回 claude CLI 自身默认模型。
-AUTO_REPAIR_MODEL = os.environ.get("AUTO_REPAIR_MODEL", "claude-sonnet-5")
+AI_TIMEOUT = 360  # 单次诊断上限(秒),超时按无法判定处理
+AI_PROVIDER = provider_from_env()
+# 设置页会显式注入当前引擎的模型；直接从命令行跑时，Claude 默认 sonnet5、Codex 默认 5.6 Sol。
+# 传空串(AUTO_REPAIR_MODEL="")则不加 --model,退回所选 CLI 自身默认模型。
+AUTO_REPAIR_MODEL = model_from_env("AUTO_REPAIR_MODEL", AI_PROVIDER)
+AI_NAME = display_name(AI_PROVIDER)
 LOG = LEDGER / "log.csv"
 
 SYSTEM_PROMPT = """你是 AI_auto_test 自动化测试框架的「自愈助手」。一个固化测试脚本(bash,驱动 adb 操作\
@@ -57,7 +61,7 @@ B. 被测 App 真实缺陷——App 本身出了问题。典型:
   绝对禁止:删除或跳过校验步骤;绝对禁止:把失败吞掉(||true / 改 set -e / catch)让脚本假装通过。
   把真 bug 洗成绿灯是本框架最严重的错误。改动要小而准,只针对本次失败那一步。
 - 判定为 B(App缺陷):什么都不要改,一个字节都不要动。这是一条测试发现,不是要你修掉的东西。
-  只输出诊断结论,交人工 / Claude Code 做正式判定与登记。
+  只输出诊断结论,交人工做正式判定与登记。
 - 拿不准:当作 B 处理(不改任何文件),输出 UNKNOWN。
 
 【先看证据再决定】必须先 Read 固化脚本、本次运行日志已在提示里、并 Read 本次 attempt 证据目录里的
@@ -73,7 +77,7 @@ AUTOREPAIR_VERDICT: UNKNOWN"""
 @contextmanager
 def script_lock(script_abs):
     """固化脚本文件锁——多设备并行对同一用例触发自愈时，同一份 flow_*.sh 同一时刻只允许一个
-    claude 在改，避免三台设备各自诊断/写入互相覆盖(lost update)。跟 ledger_lock 是两把独立的
+    AI 在改，避免三台设备各自诊断/写入互相覆盖(lost update)。跟 ledger_lock 是两把独立的
     锁(那把只护账本 CSV)。阻塞式独占；进程退出/关闭 fd 自动释放。"""
     lock_path = script_abs.with_suffix(script_abs.suffix + ".lock")
     fh = open(lock_path, "w")
@@ -85,20 +89,6 @@ def script_lock(script_abs):
         fh.close()
 
 
-def find_claude():
-    """定位 claude 可执行文件:GUI/子进程 PATH 常不含用户 shell 目录,先查常见位置再 which 兜底。"""
-    home = os.environ.get("HOME", "")
-    cands = [
-        Path(home) / ".local/bin/claude",
-        Path("/opt/homebrew/bin/claude"),
-        Path("/usr/local/bin/claude"),
-    ]
-    for c in cands:
-        if c.exists():
-            return str(c)
-    return shutil.which("claude")
-
-
 def append_log(case, action, old_status, new_status, note, serial=""):
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     with ledger_lock():  # 多设备并行写账本必须持锁；「执行设备」列在行尾
@@ -108,7 +98,7 @@ def append_log(case, action, old_status, new_status, note, serial=""):
 
 
 def run_flow_once(python, case, script, serial):
-    """跑一次 run_flow.py,逐行透传到本进程 stdout(桌面壳实时看),同时留一份合并输出喂给 claude。"""
+    """跑一次 run_flow.py,逐行透传到本进程 stdout(桌面壳实时看),同时留一份合并输出喂给 AI。"""
     proc = subprocess.Popen(
         [python, "tools/run_flow.py", case, script, serial],
         cwd=str(REPO), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -171,30 +161,20 @@ def build_user_prompt(case, serial, attempt, script, log_text, base, attempt_dir
 请先 Read 固化脚本与上面相关证据,再判定类别并处置,最后按格式输出 AUTOREPAIR_VERDICT 标记。"""
 
 
-def run_claude(claude_bin, python, prompt, script):
-    """调 claude 一次性诊断+(必要时)改脚本。返回 (verdict, 完整文本)。超时/失败返回 (None, 说明)。"""
+def run_ai(cli_bin, prompt, script):
+    """调所选 AI CLI 一次性诊断+(必要时)改脚本。超时/失败返回 (None, 说明)。"""
     sys_prompt = SYSTEM_PROMPT.replace("<SCRIPT_PATH>", script)
-    cmd = [
-        claude_bin, "-p", prompt,
-        "--append-system-prompt", sys_prompt,
-        "--allowedTools", "Read", "Edit", "Glob", "Grep",
-        "--permission-mode", "acceptEdits",
-        "--add-dir", str(REPO),
-        "--max-turns", "40",
-        "--output-format", "text",
-    ]
-    if AUTO_REPAIR_MODEL:
-        cmd += ["--model", AUTO_REPAIR_MODEL]
     try:
-        r = subprocess.run(
-            cmd, cwd=str(REPO), text=True, stdin=subprocess.DEVNULL,
-            capture_output=True, timeout=CLAUDE_TIMEOUT, env=os.environ.copy(),
+        returncode, out = run_headless(
+            AI_PROVIDER, cli_bin, REPO, AUTO_REPAIR_MODEL, "repair",
+            prompt, sys_prompt, AI_TIMEOUT,
         )
     except subprocess.TimeoutExpired:
-        return None, f"claude 诊断超时(>{CLAUDE_TIMEOUT}s)"
+        return None, f"{AI_NAME} 诊断超时(>{AI_TIMEOUT}s)"
     except Exception as e:
-        return None, f"claude 调用失败:{e}"
-    out = (r.stdout or "") + (("\n" + r.stderr) if r.returncode != 0 and r.stderr else "")
+        return None, f"{AI_NAME} 调用失败:{e}"
+    if returncode != 0:
+        return None, f"{AI_NAME} CLI exit {returncode}: {out}"
     verdict = None
     for line in out.splitlines():
         s = line.strip()
@@ -206,7 +186,7 @@ def run_claude(claude_bin, python, prompt, script):
 
 
 def diag_oneline(text):
-    """把 claude 诊断压成一行(去掉标记行),供写进 log.csv 备注。"""
+    """把 AI 诊断压成一行(去掉标记行),供写进 log.csv 备注。"""
     lines = [l.strip() for l in text.splitlines()
              if l.strip() and not l.strip().startswith("AUTOREPAIR_VERDICT:")]
     return " / ".join(lines)[:300]
@@ -226,17 +206,17 @@ def main():
         sys.exit(f"固化脚本不存在:{script_abs}")
 
     python = sys.executable or "python3"
-    claude_bin = find_claude()
-    if not claude_bin:
-        print("[auto_repair] ⚠️ 本机找不到 claude CLI,Claude 不可用——退回普通执行(跑一次不自愈)。")
+    cli_bin = find_cli(AI_PROVIDER)
+    if not cli_bin:
+        print(f"[auto_repair] ⚠️ 本机找不到 {AI_NAME} CLI,{AI_NAME} 不可用——退回普通执行(跑一次不自愈)。")
         code, _ = run_flow_once(python, a.case, a.script, serial)
         sys.exit(code)
 
-    _model_note = AUTO_REPAIR_MODEL or "claude CLI 默认"
-    print(f"[auto_repair] Claude 已启用(claude={claude_bin};模型={_model_note});最多自愈 {MAX_ATTEMPTS} 次。")
+    _model_note = AUTO_REPAIR_MODEL or f"{AI_NAME} CLI 默认"
+    print(f"[auto_repair] {AI_NAME} 已启用({AI_PROVIDER}={cli_bin};模型={_model_note});最多自愈 {MAX_ATTEMPTS} 次。")
 
     # 本设备失败时的脚本版本快照——用来识别脚本是否已被别的设备的自愈进程改过，
-    # 避免多设备同一用例并行自愈时重复调 claude、或用自己手里的旧内容覆盖别人的修复。
+    # 避免多设备同一用例并行自愈时重复调 AI、或用自己手里的旧内容覆盖别人的修复。
     initial_snapshot = script_abs.read_text(encoding="utf-8")
 
     for attempt in range(1, MAX_ATTEMPTS + 1):
@@ -245,8 +225,8 @@ def main():
 
         if code == 0:
             if attempt > 1:
-                append_log(a.case, "Claude自愈", "执行中", "已完成/需复核",
-                           f"Claude自愈成功(第{attempt}次通过),前序已 patch 固化脚本的导航/健壮性;"
+                append_log(a.case, f"{AI_NAME}自愈", "执行中", "已完成/需复核",
+                           f"{AI_NAME}自愈成功(第{attempt}次通过),前序已 patch 固化脚本的导航/健壮性;"
                            f"通过判定仍需人工跑 output-check/logscan 确认", serial)
                 # 稳定机器标记打到 stdout（append_log 只落 CSV，桌面壳读不到）：
                 # 前端 runStore.ts 靠这行识别「自愈通过」，别改这个 token。
@@ -255,22 +235,22 @@ def main():
             sys.exit(0)
 
         # —— 异常退出:先看固化脚本是否已被其他设备的自愈进程改过 ——
-        # 三台设备并行跑同一用例都失败时,大概率只需要一台真正调 claude,其余复用它的修复即可。
+        # 三台设备并行跑同一用例都失败时,大概率只需要一台真正调 AI,其余复用它的修复即可。
         current = script_abs.read_text(encoding="utf-8")
         if current != initial_snapshot:
-            print("[auto_repair] 检测到固化脚本已被其他设备的自愈进程更新,先用新版本重跑一次,不重复调用 Claude。")
+            print(f"[auto_repair] 检测到固化脚本已被其他设备的自愈进程更新,先用新版本重跑一次,不重复调用 {AI_NAME}。")
             initial_snapshot = current
             continue
 
         print(f"\n[auto_repair] ✖ 第 {attempt} 次异常退出(exit={code})。"
-              f"Claude 接管诊断中(可能 1-2 分钟,请稍候)…")
+              f"{AI_NAME} 接管诊断中(可能 1-2 分钟,请稍候)…")
         base, attempt_dir = newest_attempt_dir(cfg, a.case, serial)
         prompt = build_user_prompt(a.case, serial, attempt, a.script, out, base, attempt_dir)
 
-        # 同一份固化脚本同一时刻只允许一个设备的自愈在改——避免三台设备的 claude 并发
+        # 同一份固化脚本同一时刻只允许一个设备的自愈在改——避免三台设备的 AI 并发
         # Read+Edit 同一个文件导致互相覆盖(lost update)。
         with script_lock(script_abs):
-            # 拿锁期间也可能被另一台设备的自愈进程改过，重新核对一次再决定要不要真调 claude
+            # 拿锁期间也可能被另一台设备的自愈进程改过，重新核对一次再决定要不要真调 AI
             before = script_abs.read_text(encoding="utf-8")
             if before != initial_snapshot:
                 print("[auto_repair] 等锁期间固化脚本已被其他设备的自愈进程更新,先用新版本重跑一次。")
@@ -280,44 +260,44 @@ def main():
             # 改脚本前先备份当前版本(只留最近一次),便于事后 review / 手动回滚
             shutil.copyfile(script_abs, script_abs.with_suffix(script_abs.suffix + ".bak"))
 
-            verdict, diag = run_claude(claude_bin, python, prompt, a.script)
-            print("\n[auto_repair] ── Claude诊断 ──")
+            verdict, diag = run_ai(cli_bin, prompt, a.script)
+            print(f"\n[auto_repair] ── {AI_NAME}诊断 ──")
             print(diag or "(无输出)")
             print("[auto_repair] ──────────────")
 
             if verdict == "APP_DEFECT":
-                note = f"疑似App缺陷(Claude诊断,未改任何文件):{diag_oneline(diag)};正式判定/登记issues请回 Claude Code"
-                append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
+                note = f"疑似App缺陷({AI_NAME}诊断,未改任何文件):{diag_oneline(diag)};正式判定/登记issues请人工复核"
+                append_log(a.case, f"{AI_NAME}接管", "执行中", "需人工介入", note, serial)
                 print(f"\n[auto_repair] 🛑 判定为被测 App 缺陷——已停,不重试、不改脚本。已记 log.csv「需人工介入」。")
                 sys.exit(2)
 
             if verdict == "SCRIPT_FIX":
                 after = script_abs.read_text(encoding="utf-8")
                 if before == after:
-                    note = f"Claude判脚本脆但未产生实际改动,无法自愈:{diag_oneline(diag)}"
-                    append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
+                    note = f"{AI_NAME}判脚本脆但未产生实际改动,无法自愈:{diag_oneline(diag)}"
+                    append_log(a.case, f"{AI_NAME}接管", "执行中", "需人工介入", note, serial)
                     print("\n[auto_repair] ⚠️ 判为脚本脆却没改动脚本——停,记「需人工介入」。")
                     sys.exit(3)
                 diff = "".join(difflib.unified_diff(
                     before.splitlines(keepends=True), after.splitlines(keepends=True),
                     fromfile=a.script + " (before)", tofile=a.script + " (after)"))
-                print("\n[auto_repair] 📝 Claude改动固化脚本(导航/健壮性):")
+                print(f"\n[auto_repair] 📝 {AI_NAME}改动固化脚本(导航/健壮性):")
                 print(diff)
                 print(f"[auto_repair] (原版本已备份到 {a.script}.bak)")
-                append_log(a.case, "Claude自愈", "执行中", "执行中",
-                           f"第{attempt}次失败后Claude patch固化脚本(导航/健壮性):{diag_oneline(diag)}", serial)
+                append_log(a.case, f"{AI_NAME}自愈", "执行中", "执行中",
+                           f"第{attempt}次失败后{AI_NAME} patch固化脚本(导航/健壮性):{diag_oneline(diag)}", serial)
                 initial_snapshot = after
                 continue  # 回到循环重跑
 
             # verdict is None / UNKNOWN
-            note = f"Claude无法判定失败根因(保守不改脚本):{diag_oneline(diag)}"
-            append_log(a.case, "Claude接管", "执行中", "需人工介入", note, serial)
-            print("\n[auto_repair] ❓ Claude无法判定——保守停,记「需人工介入」。")
+            note = f"{AI_NAME}无法判定失败根因(保守不改脚本):{diag_oneline(diag)}"
+            append_log(a.case, f"{AI_NAME}接管", "执行中", "需人工介入", note, serial)
+            print(f"\n[auto_repair] ❓ {AI_NAME}无法判定——保守停,记「需人工介入」。")
             sys.exit(4)
 
     # —— 三次仍未通过 ——
-    append_log(a.case, "Claude接管", "执行中", "需人工介入",
-               f"Claude自愈 {MAX_ATTEMPTS} 次仍未通过,需人工介入", serial)
+    append_log(a.case, f"{AI_NAME}接管", "执行中", "需人工介入",
+               f"{AI_NAME}自愈 {MAX_ATTEMPTS} 次仍未通过,需人工介入", serial)
     print(f"\n[auto_repair] 🛑 自愈 {MAX_ATTEMPTS} 次仍未通过——停,记「需人工介入」,请人工排查。")
     sys.exit(5)
 

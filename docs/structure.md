@@ -104,10 +104,12 @@ AI_auto_test/
 │   ├── compile_cases.py # cases/*.yaml → ledger/queue.csv（幂等，保留运行时状态）
 │   ├── case_result.py   # 一条用例收工回写（executions.csv + queue.csv + log.csv + evidence.csv 一次性落；--serial 定位设备行）
 │   ├── case_issue.py    # 结构化登记一条问题到 issues.csv（csv.writer 转义 + 按问题ID upsert + ID 格式校验）；替代手写 CSV
-│   ├── issue_register.py # 桌面收尾自动登记问题：读证据→headless claude 写描述字段+查重→调 case_issue.py（前缀由终态确定性映射，见 decisions #35）
+│   ├── ai_cli.py       # ★ headless AI 适配层：统一定位/调用 Claude Code 与 Codex CLI；Codex 参数、沙箱、stdin 提示收口在此
+│   ├── tests/test_ai_cli.py # AI 适配层纯单测：默认模型、空串语义、Codex 全局参数顺序
+│   ├── issue_register.py # 桌面收尾自动登记问题：读证据→所选 headless AI 写描述字段+查重→调 case_issue.py（前缀由终态确定性映射，见 decisions #35）
 │   ├── judge_result.py  # 把执行台一格终态确定性映射进账本（pass→通过/fail→失败/app_defect·needs_human→需复核）
 │   ├── run_flow.py      # 固化脚本统一执行入口（自动计时 + attempt 隔离 + 流程日志 tee 落库成 99-run-log 证据，见 decisions #41）
-│   ├── auto_repair.py   # ★「大脑Claude」自愈：run_flow 失败→claude诊断→只改导航/健壮性→重跑(≤3次)
+│   ├── auto_repair.py   # ★ AI 自愈：run_flow 失败→设置页所选 Claude/Codex 诊断→只改导航/健壮性→重跑(≤3次)
 │   ├── new_run.py       # 开一轮新回归（建看板 + 生成 run_id + 归档重置）
 │   ├── sheets_sync.py   # ledger → Google Sheets（单向覆盖，服务账号，瞬时5xx自动重试）；桌面执行台每轮收尾自动调
 │   ├── doc_report.py    # ledger + 证据 → Google Doc 图文报告（OAuth）
@@ -118,7 +120,7 @@ AI_auto_test/
 ├── desktop/             # ★ Tauri2+Vue3 桌面壳（可视化：设置/设备/执行/证据/看板）
 │   ├── src/views/            # 一个 tab 一个文件，App.vue 用 active 字符串切换（keep-alive 只保活 Runner+Recorder：
 │   │                           #   执行状态/录制进度切走不能丢；保活视图内禁用全局 querySelector、初始化走 onActivated）
-│   │   ├── Setup.vue          # 首屏：选活跃 App / 配置 target.json，配置完才进主界面；底部「版本」区块查/装更新
+│   │   ├── Setup.vue          # 首屏：配置项目根；全局切 Claude/Codex + 各自模型（Codex 默认 gpt-5.6-sol）；底部查/装更新
 │   │   ├── Overview.vue       # 总览面板（overview-panel-prd.md）
 │   │   ├── Devices.vue        # 设备列表/选设备
 │   │   ├── Recorder.vue       # ★「录制器」tab（侧栏排在执行台前）：实时视频（canvas+WebCodecs）叠控件框，

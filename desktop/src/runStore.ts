@@ -9,6 +9,10 @@ import { store } from "./store";
 import type { RerunFailureSource, ResolvedRerunPlan } from "./rerunPlan";
 export type { RerunPlan } from "./rerunPlan";
 
+function aiName(): "Claude" | "Codex" {
+  return store.cfg?.ai_provider === "codex" ? "Codex" : "Claude";
+}
+
 // 语言选择器的「自动」哨兵值：不是一个真的 LANG_CODE，选它表示「执行前逐台设备现查系统当前
 // 语言、换算成该 App 语言表里的代号再注入」，而不是场景库里固定选好的一个值。
 export const AUTO_LANG = "__auto__";
@@ -50,7 +54,7 @@ export interface RunCell {
 }
 
 // 问题清单自动登记状态（issue_register.py）：none=不适用（通过格）/未开始；registering=收尾登记中；
-// registered=已登记进 issues.csv；manual=自动登记没完成，需回 Claude Code 手动登记；
+// registered=已登记进 issues.csv；manual=自动登记没完成，需人工登记；
 // skipped=用户在登记前主动勾掉，本条不登记（不算「未完成」，不需要人工处理）。
 export type IssueState = "none" | "registering" | "registered" | "manual" | "skipped";
 
@@ -256,7 +260,7 @@ export const runStore = reactive({
     this.events = [];
     this.pushEvent(
       opts.brain
-        ? "脚本自愈已启用（引擎: on，失败步骤将由 claude 接管诊断+改脚本重跑）"
+        ? `脚本自愈已启用（引擎: ${aiName()}，失败步骤将由 AI 接管诊断+改脚本重跑）`
         : "脚本自愈未启用（引擎: off，失败步骤将诚实判失败）"
     );
     if (opts.noRegister) {
@@ -394,13 +398,13 @@ export const runStore = reactive({
         this.pushEvent(`${st === "pass" || st === "healed" ? "✔" : "✖"} ${s}/${c.case_id} → ${labelOf(st)}（exit ${code} · ${cell.elapsed}s）`, st === "pass" || st === "healed" ? "info" : "error");
 
         // 所有终态（pass/healed/fail/app_defect/needs_human）都必须落账本——纯确定性映射，
-        // 不调 claude：run_flow.py/auto_repair.py 只写 log.csv 和时间戳，从不碰 queue.csv 的
+        // 不调 AI：run_flow.py/auto_repair.py 只写 log.csv 和时间戳，从不碰 queue.csv 的
         // "当前状态"列，这条不调，这条用例会一直停在"待执行"，看起来像完全没跑过（真实踩过：
         // CUT-EDGE-02 明明跑了且失败，因为当时这步被跳过，账本显示"已完成 2"漏了它）。
         if (!this.aborting && (st === "pass" || st === "healed" || st === "fail" || st === "app_defect" || st === "needs_human")) {
           // recording=true 期间这格的 pass/fail 只是"脚本跑没跑崩"的初步状态，落账本还没完成——
           // doneCount()/进度条据此排除它，避免"N/N 完成"却其实还没写进账本的误导。落库是纯本地
-          // 文件写入，几乎瞬时，这个态停留时间很短，不会像以前 claude 判定那样卡 1-2 分钟。
+          // 文件写入，几乎瞬时，这个态停留时间很短，不会像以前 AI 判定那样卡 1-2 分钟。
           cell.recording = true;
           try {
             const jcode = await api.judgeResult(opts.slug, c.case_id, s, st, (l) => {
@@ -469,7 +473,7 @@ export const runStore = reactive({
     const eventsRef = this.events;
     this.completed = false;
     // 全部格子跑完（completed 为真）就立刻存一份执行记录快照，不等收尾——登记问题清单
-    // （issue_register 可能调 claude，慢）→ 同步表格 → 刷新 Doc 报告这条链子跑下来常常要好几分钟，
+    // （issue_register 可能调 AI，慢）→ 同步表格 → 刷新 Doc 报告这条链子跑下来常常要好几分钟，
     // 执行记录本来就是给人看"这轮跑得怎么样"的，没道理让用户为了让快照带上最终登记状态而干等。
     // cellsRef/eventsRef 是 reactive 数组的引用，收尾阶段的 mutate（issue 字段流转、追加日志）
     // 会反映在同一份引用上，所以收尾跑完后用同一个 id 再存一次、把最终登记状态补全（覆盖写，
@@ -553,7 +557,7 @@ export const runStore = reactive({
 
   // 收尾第一步：把本轮所有失败/需复核的格子自动登记进问题清单（issue_register.py）。
   // 必须排在 syncSheets/genDocReport 之前——那两个要读 issues.csv 才能把问题带进「问题清单」tab
-  // 和 Doc 的失败详情。串行逐格调：headless claude 会写同一份 issues.csv，并发会撞车。
+  // 和 Doc 的失败详情。串行逐格调：headless AI 会写同一份 issues.csv，并发会撞车。
   // 中止的这一轮不登记（aborted 不是判定结果，且证据可能不完整）。fire-and-forget 风格：
   // 单格失败只提示、不中断整个收尾。aborted 由 finish() 在重置 this.aborting 前拍下传入，
   // 不能读活的 this.aborting——finish() 早就把它清成 false 了。
@@ -596,7 +600,7 @@ export const runStore = reactive({
         this.pushEvent(
           code === 0
             ? `✔ ${cell.serial}/${cell.caseId} 已登记问题清单`
-            : `⚠ ${cell.serial}/${cell.caseId} 自动登记未完成（exit ${code}），需回 Claude Code 手动登记`,
+            : `⚠ ${cell.serial}/${cell.caseId} 自动登记未完成（exit ${code}），需人工登记`,
           code === 0 ? "info" : "error"
         );
       } catch (e: any) {

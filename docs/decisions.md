@@ -826,8 +826,9 @@
   “全部32个脚本已接入”的状态说明已被后续新增脚本打破。把它从建议升级为交付门禁，避免每次新增
   flow 后再次产生只支持固化时单一语言的回归资产。
 - **当前债务**：2026-09-30 审计 50 个 `flow_*.sh`，47 个加载了 `lang_helper.sh`；
-  `flow_merge_crossfade.sh` 明确不合规，`flow_cut_mark.sh` 的 `Got it` 来源仍需确认。遗留债务不豁免
-  新脚本，也不能作为“当前语言能跑即可”的放行理由。
+  `flow_merge_crossfade.sh` 已于 2026-10-12 接入 `lang_helper.sh`，并将合并首页入口改为稳定的
+  `resource-id=tv_merge` 门控，原审计中的这条债务已不再适用。`flow_cut_mark.sh` 的 `Got it` 来源仍需
+  确认。遗留债务不豁免新脚本，也不能作为“当前语言能跑即可”的放行理由。
 
 ## 71. 失败重跑改为「原设备优先，离线设备由用户确认替代」（2026-10-12）
 
@@ -846,3 +847,16 @@
   账本继续只使用实际执行设备；`RunMonitor` 显示“替代重跑：原设备 → 实际设备”。旧快照没有该字段
   时按普通执行显示，Rust 的整份 JSON 保存协议无需修改。用户确认后若又在场景库用 chips 微调到新设备，
   无法恢复来源的一一映射时按该用例全部原失败来源留痕，并标“场景库调整”，不伪造精确映射。
+
+## 72. headless AI 改成全局 Claude/Codex 双引擎，Codex 默认 GPT-5.6 Sol（2026-10-15）
+
+- **作用域**：`app_config.json` 新增 `ai_provider`、`codex_model`；`ai_provider` 同时控制
+  `auto_repair.py`（脚本自愈）和 `issue_register.py`（问题登记），不是 per-app 设置。Claude/Codex
+  各保留自己的模型字段，来回切换不丢上次选择；Codex 默认 `gpt-5.6-sol`，空串仍表示跟随所选 CLI 默认。
+- **升级策略**：已有配置文件但缺 `ai_provider` 代表旧版只支持 Claude，继续选 Claude，避免升级后静默
+  换引擎；全新配置默认 Codex。设置页切换立即持久化，Runner 展示与运行日志读取同一份全局配置。
+- **调用收口**：新增 `tools/ai_cli.py`，集中处理 CLI 定位、默认模型与命令构造。Claude 继续使用原来的
+  tool allowlist；Codex 使用 `codex -a never exec --sandbox workspace-write --ephemeral --model ... -`，
+  完整提示从 stdin 传入。Rust 只注入 `AI_PROVIDER` 与当前引擎模型，两个 Python 工具不再各自拼 CLI。
+- **状态探测**：统一 Tauri 命令 `check_ai_cli(provider)`；Codex 登录态只信 `codex login status` 的成功
+  退出码与 `Logged in` 文案，不读取/展示凭据内容。保留旧 `check_claude_cli` 命令供兼容调用。

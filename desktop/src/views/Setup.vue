@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { ref, onMounted } from "vue";
+import { computed, ref, onMounted } from "vue";
 import { getVersion } from "@tauri-apps/api/app";
-import { api, type ClaudeCliStatus, type UpdateInfo } from "../api";
+import { api, type AiCliStatus, type UpdateInfo } from "../api";
 import { store } from "../store";
 
 const emit = defineEmits<{ configured: [] }>();
@@ -10,24 +10,48 @@ const python = ref("python3");
 const err = ref("");
 const saving = ref(false);
 
-// ── headless 调 claude 用的模型（「脚本自愈」+ 收尾「问题登记」共用；存 app_config.json 的
-// claude_model；""=跟随 claude CLI 自身默认）──
-const MODEL_OPTIONS = [
+// ── 全局 AI 引擎（「脚本自愈」+ 收尾「问题登记」共用，不随被测 App 切换）──
+type AiProvider = "claude" | "codex";
+const CLAUDE_MODEL_OPTIONS = [
   { value: "claude-sonnet-5", label: "Sonnet 5（推荐 · 默认）" },
   { value: "claude-opus-5", label: "Opus 5（更强，更慢更贵）" },
   { value: "claude-haiku-4-5-20251001", label: "Haiku 4.5（更快更省）" },
   { value: "", label: "跟随 CLI 默认设置" },
 ];
-const model = ref("claude-sonnet-5");
+const CODEX_MODEL_OPTIONS = [
+  { value: "gpt-5.6-sol", label: "GPT-5.6 Sol（推荐 · 默认）" },
+  { value: "gpt-5.6-terra", label: "GPT-5.6 Terra（平衡性能与成本）" },
+  { value: "gpt-5.6-luna", label: "GPT-5.6 Luna（更快更省）" },
+  { value: "", label: "跟随 CLI 默认设置" },
+];
+const provider = ref<AiProvider>("codex");
+const claudeModel = ref("claude-sonnet-5");
+const codexModel = ref("gpt-5.6-sol");
+const providerName = computed(() => provider.value === "codex" ? "Codex" : "Claude");
+const providerCommand = computed(() => provider.value === "codex" ? "codex" : "claude");
+const loginCommand = computed(() => provider.value === "codex" ? "codex login" : "claude");
+const providerDoc = computed(() => provider.value === "codex"
+  ? "https://developers.openai.com/codex/cli"
+  : "https://docs.claude.com/en/docs/claude-code/overview");
+const modelOptions = computed(() => provider.value === "codex" ? CODEX_MODEL_OPTIONS : CLAUDE_MODEL_OPTIONS);
+const model = computed({
+  get: () => provider.value === "codex" ? codexModel.value : claudeModel.value,
+  set: (value: string) => {
+    if (provider.value === "codex") codexModel.value = value;
+    else claudeModel.value = value;
+  },
+});
 const modelSaving = ref(false);
 const modelSaved = ref(false);
 let modelSavedTimer: ReturnType<typeof setTimeout> | undefined;
 
-async function saveModel() {
+async function saveAiSettings() {
   if (!root.value) return; // 项目根还没配好时先不落盘，避免 set_app_config 校验失败
   modelSaving.value = true;
   try {
-    const c = await api.setAppConfig(root.value.trim(), python.value.trim(), model.value);
+    const c = await api.setAppConfig(
+      root.value.trim(), python.value.trim(), provider.value, claudeModel.value, codexModel.value
+    );
     store.cfg = c;
     modelSaved.value = true;
     clearTimeout(modelSavedTimer);
@@ -37,6 +61,14 @@ async function saveModel() {
   } finally {
     modelSaving.value = false;
   }
+}
+
+async function selectProvider(next: AiProvider) {
+  if (provider.value === next) return;
+  provider.value = next;
+  cli.value = null;
+  await saveAiSettings();
+  await refreshCli();
 }
 
 // ── app 版本号 + 检测更新（读本仓库 GitHub Releases 最新 tag，见 src-tauri/src/updater.rs）──
@@ -99,14 +131,14 @@ async function startDownload() {
   }
 }
 
-// ── Claude CLI 状态（「脚本自愈」功能依赖它已装 + 已登录）──
-const cli = ref<ClaudeCliStatus | null>(null);
+// ── 当前全局 AI CLI 状态 ──
+const cli = ref<AiCliStatus | null>(null);
 const cliLoading = ref(false);
 
 async function refreshCli() {
   cliLoading.value = true;
   try {
-    cli.value = await api.checkClaudeCli();
+    cli.value = await api.checkAiCli(provider.value);
   } catch {
     cli.value = null;
   } finally {
@@ -118,7 +150,9 @@ onMounted(() => {
   if (store.cfg) {
     root.value = store.cfg.project_root;
     python.value = store.cfg.python || "python3";
-    model.value = store.cfg.claude_model || "claude-sonnet-5";
+    provider.value = store.cfg.ai_provider || "codex";
+    claudeModel.value = store.cfg.claude_model;
+    codexModel.value = store.cfg.codex_model;
   }
   refreshCli();
 });
@@ -174,24 +208,32 @@ async function save() {
       >
     </div>
 
-    <!-- ── Claude CLI 状态 ── -->
+    <!-- ── 全局 AI CLI ── -->
     <div class="cli-block">
-      <h3>Claude CLI</h3>
+      <h3>AI 引擎</h3>
       <p class="muted cli-sub">
-        App 通过本机 Claude CLI 调用模型（用例失败时「脚本自愈」、执行收尾「问题登记」都由 claude 接管）。
-        这里展示当前 CLI 的安装与登录状态，以及这两处 headless 调用用哪个模型。
+        用例失败时「脚本自愈」与执行收尾「问题登记」都由这里选中的本机 CLI 接管。
+        这是全局设置，切换被测 App 不会改变。
       </p>
+
+      <div class="field provider-field">
+        <label>全局调用引擎</label>
+        <div class="provider-switch" role="group" aria-label="全局 AI 引擎">
+          <button :disabled="modelSaving" :class="{ active: provider === 'claude' }" @click="selectProvider('claude')">Claude</button>
+          <button :disabled="modelSaving" :class="{ active: provider === 'codex' }" @click="selectProvider('codex')">Codex</button>
+        </div>
+      </div>
 
       <div class="field model-field">
         <label>headless 调用模型</label>
         <div class="model-row">
-          <select v-model="model" @change="saveModel">
-            <option v-for="o in MODEL_OPTIONS" :key="o.value" :value="o.value">{{ o.label }}</option>
+          <select v-model="model" :disabled="modelSaving" @change="saveAiSettings">
+            <option v-for="o in modelOptions" :key="o.value" :value="o.value">{{ o.label }}</option>
           </select>
           <span v-if="modelSaving" class="muted sm">保存中…</span>
           <span v-else-if="modelSaved" class="muted sm">已保存</span>
         </div>
-        <span class="hint muted">用于「脚本自愈」诊断改脚本 + 收尾「问题登记」写 issues.csv；不影响你在终端/编辑器里手动用的 claude 会话。</span>
+        <span class="hint muted">用于「脚本自愈」诊断改脚本 + 收尾「问题登记」写 issues.csv；不影响终端/编辑器里的手动会话。</span>
       </div>
 
       <div v-if="cliLoading && !cli" class="cli-banner neutral">
@@ -209,11 +251,7 @@ async function save() {
               <span v-if="cli.subscription" class="pill pill-accent sub-badge">{{ cli.subscription }}</span>
             </div>
             <div class="cli-detail muted">
-              <template v-if="cli.detail_parsed">
-                {{ cli.display_name || cli.email }}<span v-if="cli.display_name && cli.email"> · {{ cli.email }}</span>
-                <span v-if="cli.org_name"> · {{ cli.org_name }}</span>
-              </template>
-              <template v-else>账号信息无法解析（CLI 仍可正常使用）</template>
+              {{ cli.detail || `${providerName} CLI 已通过登录检测` }}
             </div>
           </div>
         </div>
@@ -224,7 +262,7 @@ async function save() {
           <div class="cli-txt">
             <div class="cli-title">未登录</div>
             <div class="cli-detail muted">
-              终端执行 <span class="mono">claude</span> 完成登录后，回来点「刷新」。「脚本自愈」需要已登录才能接管。
+              终端执行 <span class="mono">{{ loginCommand }}</span> 完成登录后，回来点「刷新」。「脚本自愈」需要已登录才能接管。
             </div>
           </div>
         </div>
@@ -233,9 +271,9 @@ async function save() {
         <div v-else class="cli-banner bad">
           <span class="cli-icon">❌</span>
           <div class="cli-txt">
-            <div class="cli-title">未检测到 Claude CLI</div>
+            <div class="cli-title">未检测到 {{ providerName }} CLI</div>
             <div class="cli-detail muted">
-              本机 PATH 与常见安装位置都没找到 <span class="mono">claude</span>。装好后点「刷新」。
+              本机 PATH 与常见安装位置都没找到 <span class="mono">{{ providerCommand }}</span>。装好后点「刷新」。
             </div>
           </div>
         </div>
@@ -251,8 +289,8 @@ async function save() {
         <button class="sm" :disabled="cliLoading" @click="refreshCli">
           {{ cliLoading ? "检测中…" : "刷新" }}
         </button>
-        <a class="muted doc-link" href="https://docs.claude.com/en/docs/claude-code/overview" target="_blank" rel="noreferrer">
-          Claude Code 文档 ↗
+        <a class="muted doc-link" :href="providerDoc" target="_blank" rel="noreferrer">
+          {{ providerName }} CLI 文档 ↗
         </a>
       </div>
     </div>
@@ -334,6 +372,31 @@ h2 {
 .model-field {
   margin: 0 0 20px;
 }
+.provider-field {
+  margin: 0 0 14px;
+}
+.provider-switch {
+  display: inline-flex;
+  align-self: flex-start;
+  padding: 3px;
+  gap: 2px;
+  border: 0.5px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-1);
+}
+.provider-switch button {
+  min-width: 96px;
+  padding: 6px 16px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+}
+.provider-switch button.active {
+  background: var(--surface-2);
+  color: var(--text-primary);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+}
 .model-row {
   display: flex;
   align-items: center;
@@ -363,7 +426,7 @@ label {
   margin-top: 16px;
 }
 
-/* ── Claude CLI 状态 ── */
+/* ── AI CLI 状态 ── */
 .cli-block {
   margin-top: 32px;
   padding-top: 24px;

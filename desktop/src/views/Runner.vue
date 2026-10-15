@@ -143,7 +143,8 @@ function buildPlan(cases: { case_id: string }[]): Record<string, string[]> {
   return plan;
 }
 const boardMode = ref<"current" | "new">("current"); // 关联当前 / 新建看板
-const brainMode = ref(false); // 脚本自愈：失败自动交 claude 诊断+改脚本重跑
+const brainMode = ref(false); // 脚本自愈：失败自动交全局 AI 引擎诊断+改脚本重跑
+const aiName = computed(() => store.cfg?.ai_provider === "codex" ? "Codex" : "Claude");
 // UI dump 后端：shell(默认,纯adb,零依赖) / u2(uiautomator2,整轮实测约快2倍，需设备预装并保活
 // atx-agent，跟 Appium 会抢 UiAutomation 互斥，见 decisions.md #30)。切 App 时随 loadAll 从
 // target.json 读回当前值；执行前若与勾选状态不一致，写回 target.json 再跑（adbkit 按
@@ -845,7 +846,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
               <span class="case-mod muted">{{ f.module }}</span>
               <span v-if="f.purpose" class="case-purpose muted">{{ f.purpose }}</span>
               <span v-if="f.priority" class="pill sm" :class="priorityPill(f.priority)">{{ f.priority }}</span>
-              <span class="pill pill-muted sm">Claude Code</span>
+              <span class="pill pill-muted sm">{{ aiName }}</span>
             </div>
           </template>
         </div>
@@ -912,7 +913,7 @@ onActivated(() => { if (!runStore.running) loadAll(); });
             <span class="brain-txt">脚本自愈</span>
             <button
               type="button" class="help-btn" @click.stop.prevent
-              @mouseenter="showTip($event, { text: '失败时 Claude 接管：诊断→只改导航/健壮性→重跑（至多 3 次）。判为 App 缺陷则停。' })"
+              @mouseenter="showTip($event, { text: `失败时 ${aiName} 接管：诊断→只改导航/健壮性→重跑（至多 3 次）。判为 App 缺陷则停。` })"
               @mousemove="moveTip" @mouseleave="hideTip"
             >?</button>
           </label>

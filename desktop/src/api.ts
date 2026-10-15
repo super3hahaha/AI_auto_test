@@ -7,7 +7,9 @@ import type { RunRecord, RunRecordMeta } from "./runStore";
 export interface AppConfig {
   project_root: string;
   python: string;
-  claude_model: string; // "脚本自愈"调 claude 用的模型；"" = 跟随 claude CLI 自身默认
+  ai_provider: "claude" | "codex"; // 全局 headless 引擎：脚本自愈 + 问题登记共用
+  claude_model: string; // "" = 跟随 Claude CLI 自身默认
+  codex_model: string; // 默认 gpt-5.6-sol；"" = 跟随 Codex CLI 自身默认
   configured: boolean;
 }
 export interface AppInfo {
@@ -178,23 +180,32 @@ export interface DownloadProgress {
   downloaded: number;
   total: number;
 }
-export interface ClaudeCliStatus {
+export interface AiCliStatus {
+  provider: "claude" | "codex";
   installed: boolean;
   path: string;
   version: string;
   logged_in: boolean;
-  detail_parsed: boolean;
-  email: string;
-  display_name: string;
-  org_name: string;
+  detail: string;
   subscription: string;
 }
 
 export const api = {
   // app 自身配置（项目根 + python）——与被测 App 无关
   getAppConfig: () => invoke<AppConfig>("get_app_config"),
-  setAppConfig: (project_root: string, python: string, claude_model?: string) =>
-    invoke<AppConfig>("set_app_config", { projectRoot: project_root, python, claudeModel: claude_model }),
+  setAppConfig: (
+    project_root: string,
+    python: string,
+    ai_provider?: "claude" | "codex",
+    claude_model?: string,
+    codex_model?: string
+  ) => invoke<AppConfig>("set_app_config", {
+    projectRoot: project_root,
+    python,
+    aiProvider: ai_provider,
+    claudeModel: claude_model,
+    codexModel: codex_model,
+  }),
 
   // App 注册表 / 活跃 App
   listApps: () => invoke<AppInfo[]>("list_apps"),
@@ -284,8 +295,9 @@ export const api = {
   upsertTextResource: (key: string, value: string) => invoke<void>("upsert_text_resource", { key, value }),
   deleteTextResource: (key: string) => invoke<void>("delete_text_resource", { key }),
 
-  // Claude CLI 安装/登录状态（「脚本自愈」功能依赖它）
-  checkClaudeCli: () => invoke<ClaudeCliStatus>("check_claude_cli"),
+  // 当前全局 AI CLI 的安装/登录状态（脚本自愈 + 问题登记共用）
+  checkAiCli: (provider: "claude" | "codex") =>
+    invoke<AiCliStatus>("check_ai_cli", { provider }),
 
   // 检测更新：查本仓库 GitHub Releases 最新 tag，有更新返回 UpdateInfo，已是最新返回 null
   checkUpdate: () => invoke<UpdateInfo | null>("check_update"),
@@ -307,7 +319,7 @@ export const api = {
     ch.onmessage = onLine;
     return invoke<number>("run_flow", { appSlug: slug, caseId, script, serial, langCode: langCode || undefined, followDevice, onEvent: ch });
   },
-  // 「脚本自愈」执行（失败自动交 claude 诊断+改脚本重跑，至多 3 次）
+  // 「脚本自愈」执行（失败自动交设置页选中的 AI CLI 诊断+改脚本重跑，至多 3 次）
   runFlowRepair(slug: string, caseId: string, script: string, serial: string, langCode: string | undefined, followDevice: boolean, onLine: (line: string) => void) {
     const ch = new Channel<string>();
     ch.onmessage = onLine;
@@ -336,7 +348,7 @@ export const api = {
   },
   // 落账本（judge_result）：跑完一格 run_flow/run_flow_repair 后必须调——不调的话这条用例的
   // queue.csv「当前状态」永远停在「待执行」（run_flow.py 只写 log.csv/时间戳，不写状态列），
-  // 账本/Doc/Sheet 会把它当成没跑过。纯确定性映射，不调 claude：pass/healed→通过，
+  // 账本/Doc/Sheet 会把它当成没跑过。纯确定性映射，不调 AI：pass/healed→通过，
   // fail→失败（固化脚本自己已按 exit 码判过，不豁免已知缺陷），app_defect/needs_human→需复核。
   judgeResult(
     slug: string,
@@ -349,9 +361,9 @@ export const api = {
     ch.onmessage = onLine;
     return invoke<number>("judge_result", { appSlug: slug, caseId, serial, status, onEvent: ch });
   },
-  // 自动登记问题清单（issue_register）：收尾时对失败/需复核的用例逐条调——headless claude 读证据
+  // 自动登记问题清单（issue_register）：收尾时对失败/需复核的用例逐条调——所选 headless AI 读证据
   // 把一条结构化问题写进 issues.csv（前缀由终态确定性映射：fail/app_defect→BUG-、needs_human→RISK-，
-  // claude 只写描述字段+查重，见 decisions.md #35）。必须排在 syncSheets/docReport 之前（要读 issues.csv）。
+  // AI 只写描述字段+查重，见 decisions.md #35）。必须排在 syncSheets/docReport 之前（要读 issues.csv）。
   registerIssue(
     slug: string,
     caseId: string,

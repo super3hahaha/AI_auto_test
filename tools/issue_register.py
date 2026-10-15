@@ -4,12 +4,12 @@
 【补的是哪个断链】桌面执行台跑固化脚本，判定链路（judge_result.py）只把用例终态写进 queue.csv
 的「执行结果」（失败/需复核）——**没有任何环节往 issues.csv 写问题清单**。问题清单一直靠
 Claude Code 主循环里人工登记，桌面端跑出来的失败因此从不进「问题清单」tab / Doc 的失败详情。
-这个工具在收尾阶段（sheets_sync/doc_report 之前）对每条失败/需复核用例调一次，让 headless
-claude 读本次证据、把一条结构化问题写进 issues.csv。
+这个工具在收尾阶段（sheets_sync/doc_report 之前）对每条失败/需复核用例调一次，让设置页选中的
+headless AI CLI（Claude Code / Codex）读本次证据、把一条结构化问题写进 issues.csv。
 
 【和 #33 的边界——不重蹈覆辙】#33/#34 的定论是「是不是失败、算哪一档」已被固化脚本 exit 码
-确定性决定，不能再让 claude 推翻。所以本工具**不让 claude 重新裁决前缀**：前缀由进来的终态
-确定性映射（见下）。claude 只干做不成确定性代码的活——读证据写「标题/预期/实际/复现/严重级别」
+确定性决定，不能再让 AI 推翻。所以本工具**不让 AI 重新裁决前缀**：前缀由进来的终态
+确定性映射（见下）。AI 只干做不成确定性代码的活——读证据写「标题/预期/实际/复现/严重级别」
 这些描述性字段 + 判断是不是历史已登记过的同一缺陷（复用旧 ID）。这类语义写作/查重必须它来，
 不违反 #33。
 
@@ -20,30 +20,32 @@ claude 读本次证据、把一条结构化问题写进 issues.csv。
 
 去重（按 attempt 证据目录）：同一次执行（同一 attempt 目录）只登记一次——log.csv 里若已有一条
 该 attempt 的「问题登记 [终审]」记录就跳过。自愈重试、用户手动重跑会换新 attempt 目录，才会
-再次触发。UNCERTAIN/超时/claude 不可用记「[未完成]」，不算终审，允许之后重试同一 attempt。
+再次触发。UNCERTAIN/超时/AI CLI 不可用记「[未完成]」，不算终审，允许之后重试同一 attempt。
 
 用法：
   python3 tools/issue_register.py <用例ID> <serial> --status fail|app_defect|needs_human
   （桌面壳 spawn 时设 AITEST_APP=<slug>；serial 必传，多设备并行下没有"默认设备"可退回）
-退出码：0=已登记 / 已跳过（去重命中）/ 判无需登记；2=UNCERTAIN 或需人工；4=claude 不可用/调用失败；
-        3=claude 声称已登记但 issues.csv 无实际改动。
+退出码：0=已登记 / 已跳过（去重命中）/ 判无需登记；2=UNCERTAIN 或需人工；4=AI CLI 不可用/调用失败；
+        3=AI 声称已登记但 issues.csv 无实际改动。
 """
-import csv, os, sys, subprocess, shutil, datetime, argparse
-from pathlib import Path
+import csv, sys, subprocess, datetime, argparse
 
 from _appctx import REPO, LEDGER, CASES, load_cfg, ledger_lock
-from auto_repair import find_claude, newest_attempt_dir  # 复用：定位 claude / 本次证据目录
+from ai_cli import display_name, find_cli, model_from_env, provider_from_env, run_headless
+from auto_repair import newest_attempt_dir  # 复用：定位本次证据目录
 import exec_ledger
 
-CLAUDE_TIMEOUT = 360
-ISSUE_MODEL = os.environ.get("ISSUE_REGISTER_MODEL", "claude-sonnet-5")
+AI_TIMEOUT = 360
+AI_PROVIDER = provider_from_env()
+ISSUE_MODEL = model_from_env("ISSUE_REGISTER_MODEL", AI_PROVIDER)
+AI_NAME = display_name(AI_PROVIDER)
 LOG = LEDGER / "log.csv"
 ISSUES = LEDGER / "issues.csv"
 
-# 终态 → 确定性前缀 + 该前缀的语义（喂给提示词让 claude 知道自己在登记哪一类）
+# 终态 → 确定性前缀 + 该前缀的语义（喂给提示词让 AI 知道自己在登记哪一类）
 PREFIX = {
     "fail":        ("BUG",  "非自愈模式固化脚本 exit≠0，框架已确定性判为「失败」=确认缺陷"),
-    "app_defect":  ("BUG",  "自愈模式大脑 claude 已诊断为疑似 App 缺陷（exit 2）"),
+    "app_defect":  ("BUG",  "自愈模式 AI 已诊断为疑似 App 缺陷（exit 2）"),
     "needs_human": ("RISK", "自愈模式拿不准/自愈耗尽（exit 3/4/5），属「需复核」待确认"),
 }
 
@@ -125,7 +127,7 @@ def already_finalized(case, evidence_rel):
 
 
 def read_case_expected(case):
-    """读用例 yaml 的 goal/expected/steps 原文喂给 claude（不解析成结构，原样给它看即可）。"""
+    """读用例 yaml 的 goal/expected/steps 原文喂给 AI（不解析成结构，原样给它看即可）。"""
     f = CASES / f"{case}.yaml"
     if not f.exists():
         return f"(未找到用例定义 {f.relative_to(REPO)})"
@@ -133,7 +135,7 @@ def read_case_expected(case):
 
 
 def recent_log_notes(case, limit=8):
-    """取该用例最近几行 log.csv（含 run_flow/auto_repair 写的 exit/诊断备注），给 claude 当上下文。"""
+    """取该用例最近几行 log.csv（含 run_flow/auto_repair 写的 exit/诊断备注），给 AI 当上下文。"""
     if not LOG.exists():
         return "(无 log.csv)"
     rows = list(csv.reader(open(LOG, encoding="utf-8")))
@@ -174,27 +176,19 @@ def build_prompt(case, serial, status, prefix, prefix_why, evidence_rel, attempt
 最后按格式输出 ISSUE_VERDICT 标记。"""
 
 
-def run_claude(claude_bin, prompt, prefix):
+def run_ai(cli_bin, prompt, prefix):
     sys_prompt = SYSTEM_PROMPT.replace("<PREFIX>", prefix)
-    cmd = [
-        claude_bin, "-p", prompt,
-        "--append-system-prompt", sys_prompt,
-        "--allowedTools", "Read", "Glob", "Grep", "Bash(python3 tools/case_issue.py:*)",
-        "--permission-mode", "acceptEdits",
-        "--add-dir", str(REPO),
-        "--max-turns", "40",
-        "--output-format", "text",
-    ]
-    if ISSUE_MODEL:
-        cmd += ["--model", ISSUE_MODEL]
     try:
-        r = subprocess.run(cmd, cwd=str(REPO), text=True, stdin=subprocess.DEVNULL,
-                           capture_output=True, timeout=CLAUDE_TIMEOUT, env=os.environ.copy())
+        returncode, out = run_headless(
+            AI_PROVIDER, cli_bin, REPO, ISSUE_MODEL, "issue",
+            prompt, sys_prompt, AI_TIMEOUT,
+        )
     except subprocess.TimeoutExpired:
-        return None, f"claude 登记超时(>{CLAUDE_TIMEOUT}s)"
+        return None, f"{AI_NAME} 登记超时(>{AI_TIMEOUT}s)"
     except Exception as e:
-        return None, f"claude 调用失败:{e}"
-    out = (r.stdout or "") + (("\n" + r.stderr) if r.returncode != 0 and r.stderr else "")
+        return None, f"{AI_NAME} 调用失败:{e}"
+    if returncode != 0:
+        return None, f"{AI_NAME} CLI exit {returncode}: {out}"
     verdict = None
     for line in out.splitlines():
         s = line.strip()
@@ -232,19 +226,19 @@ def main():
         print(f"[issue_register] {a.case} 该 attempt({evidence_rel}) 已登记过，跳过。")
         sys.exit(0)
 
-    claude_bin = find_claude()
-    if not claude_bin:
-        note = "[未完成] 本机找不到 claude CLI，自动登记不可用——请回 Claude Code 手动登记 issues.csv"
+    cli_bin = find_cli(AI_PROVIDER)
+    if not cli_bin:
+        note = f"[未完成] 本机找不到 {AI_NAME} CLI，自动登记不可用——请人工登记 issues.csv"
         append_log(a.case, "需人工登记", evidence_rel, note, serial)
         print(f"[issue_register] ⚠️ {note}")
         sys.exit(4)
 
-    _model_note = ISSUE_MODEL or "claude CLI 默认"
-    print(f"[issue_register] 自动登记 {a.case}（终态 {a.status} → 前缀 {prefix}-；模型 {_model_note}）…")
+    _model_note = ISSUE_MODEL or f"{AI_NAME} CLI 默认"
+    print(f"[issue_register] 自动登记 {a.case}（引擎 {AI_NAME}；终态 {a.status} → 前缀 {prefix}-；模型 {_model_note}）…")
 
     prompt = build_prompt(a.case, serial, a.status, prefix, prefix_why, evidence_rel, attempt_dir)
     before = ISSUES.read_text(encoding="utf-8") if ISSUES.exists() else ""
-    verdict, diag = run_claude(claude_bin, prompt, prefix)
+    verdict, diag = run_ai(cli_bin, prompt, prefix)
 
     print("\n[issue_register] ── 登记助手输出 ──")
     print(diag or "(无输出)")
@@ -255,7 +249,7 @@ def main():
     if verdict == "REGISTERED":
         if before == after:
             # 声称登记了但 issues.csv 没变 —— 视为未落盘，交人工，不打终审（允许重试）
-            note = f"[未完成] claude 声称已登记但 issues.csv 无改动，请人工核实：{diag_oneline(diag)}"
+            note = f"[未完成] {AI_NAME} 声称已登记但 issues.csv 无改动，请人工核实：{diag_oneline(diag)}"
             append_log(a.case, "需人工登记", evidence_rel, note, serial)
             print("[issue_register] ⚠️ 判 REGISTERED 但 issues.csv 未变化——记「需人工登记」。")
             sys.exit(3)
@@ -265,7 +259,7 @@ def main():
         sys.exit(0)
 
     # UNCERTAIN / None(超时/失败)
-    note = f"[未完成] 自动登记未完成({verdict or '无法判定/超时'})，请回 Claude Code 手动登记：{diag_oneline(diag)}"
+    note = f"[未完成] 自动登记未完成({verdict or '无法判定/超时'})，请人工登记：{diag_oneline(diag)}"
     append_log(a.case, "需人工登记", evidence_rel, note, serial)
     print(f"[issue_register] ❓ {a.case} 未能自动登记——记「需人工登记」，交人工。")
     sys.exit(2)

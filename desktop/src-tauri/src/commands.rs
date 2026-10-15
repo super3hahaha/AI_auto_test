@@ -11,7 +11,7 @@ use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 // 当前正在执行的所有 run（run_flow / auto_repair / judge_result）的进程组 id（== 组长 pid）。
-// 中止靠它 kill 整组，把 python→bash→adb→claude 一并带走（子进程默认继承父进程组，见
+// 中止靠它 kill 整组，把 python→bash→adb→AI CLI 一并带走（子进程默认继承父进程组，见
 // stream_child 的 process_group）。多设备并行后每台设备一个 worker 同时各跑一个进程，
 // 单槽会被后启动的覆盖、abort 只能停最后一个——改成 (key=serial, pgid) 多槽登记，
 // abort_run 遍历全杀。用 Vec 而非 HashMap：HashMap::new() 不是 const，static 初始化不了；
@@ -30,10 +30,11 @@ use tauri::{AppHandle, Manager};
 pub struct AppConfig {
     pub project_root: String,
     pub python: String,
-    // headless 调 claude CLI 用的模型（「脚本自愈」run_flow_repair + 收尾「问题登记」register_issue
-    // 共用同一个设置项）；""=跟随 claude CLI 自身默认，见 tools/auto_repair.py 的 AUTO_REPAIR_MODEL
-    // 与 tools/issue_register.py 的 ISSUE_REGISTER_MODEL。
+    // 两处 headless AI 调用（脚本自愈 + 问题登记）共用的全局引擎；不是 per-app 设置。
+    pub ai_provider: String,
+    // 每个引擎各自保留上次选择，切换时不丢；""=跟随对应 CLI 自身默认。
     pub claude_model: String,
+    pub codex_model: String,
     pub configured: bool, // 项目根是否已确认（含 config/target.example.json + tools/adbkit.py 的合法目录）
 }
 
@@ -67,10 +68,14 @@ fn autodetect_root() -> Option<PathBuf> {
 
 fn load_app_config(app: &AppHandle) -> AppConfig {
     let f = app_cfg_file(app);
+    let config_existed = f.exists();
     let mut root = String::new();
     let mut python = String::from("python3");
-    // 键缺失（老配置/从没存过）才落这个默认值；键存在且为 ""（用户显式选"跟随 CLI 默认"）要保留空串。
+    // 升级兼容：已有 app_config.json 但没有 ai_provider 的版本只支持 Claude，继续选 Claude，不能
+    // 静默换引擎；全新安装默认 Codex。两个模型键存在且为 "" 时都必须保留空串语义。
+    let mut ai_provider = if config_existed { "claude" } else { "codex" }.to_string();
     let mut claude_model = String::from("claude-sonnet-5");
+    let mut codex_model = String::from("gpt-5.6-sol");
     if let Ok(txt) = fs::read_to_string(&f) {
         if let Ok(v) = serde_json::from_str::<Value>(&txt) {
             root = v.get("project_root").and_then(|x| x.as_str()).unwrap_or("").to_string();
@@ -82,6 +87,14 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
             if let Some(m) = v.get("claude_model").and_then(|x| x.as_str()) {
                 claude_model = m.to_string();
             }
+            if let Some(p) = v.get("ai_provider").and_then(|x| x.as_str()) {
+                if p == "claude" || p == "codex" {
+                    ai_provider = p.to_string();
+                }
+            }
+            if let Some(m) = v.get("codex_model").and_then(|x| x.as_str()) {
+                codex_model = m.to_string();
+            }
         }
     }
     // 存的根不存在/未设 → 尝试自动探测
@@ -91,7 +104,14 @@ fn load_app_config(app: &AppHandle) -> AppConfig {
         }
     }
     let configured = !root.is_empty() && is_project_root(Path::new(&root));
-    AppConfig { project_root: root, python, claude_model, configured }
+    AppConfig {
+        project_root: root,
+        python,
+        ai_provider,
+        claude_model,
+        codex_model,
+        configured,
+    }
 }
 
 #[tauri::command]
@@ -104,7 +124,9 @@ pub fn set_app_config(
     app: AppHandle,
     project_root: String,
     python: String,
+    ai_provider: Option<String>,
     claude_model: Option<String>,
+    codex_model: Option<String>,
 ) -> Result<AppConfig, String> {
     let p = Path::new(&project_root);
     if !is_project_root(p) {
@@ -112,12 +134,20 @@ pub fn set_app_config(
             "该目录不像 AI_auto_test 项目根（缺 config/target.example.json 或 tools/adbkit.py）：{project_root}"
         ));
     }
-    // 不传 claude_model（旧调用点/仅改 root+python）时沿用已存的值，不覆盖成默认。
-    let model = claude_model.unwrap_or_else(|| load_app_config(&app).claude_model);
+    // 仅改 root+python 的旧调用点不传 AI 三字段：全部沿用旧值，不能把设置页选择冲回默认。
+    let old = load_app_config(&app);
+    let provider = ai_provider.unwrap_or_else(|| old.ai_provider.clone());
+    if provider != "claude" && provider != "codex" {
+        return Err(format!("不支持的 AI 引擎：{provider}"));
+    }
+    let claude = claude_model.unwrap_or(old.claude_model);
+    let codex = codex_model.unwrap_or(old.codex_model);
     let body = serde_json::json!({
         "project_root": project_root,
         "python": if python.is_empty() { "python3".into() } else { python },
-        "claude_model": model,
+        "ai_provider": provider,
+        "claude_model": claude,
+        "codex_model": codex,
     });
     let f = app_cfg_file(&app);
     fs::write(&f, serde_json::to_string_pretty(&body).unwrap()).map_err(|e| e.to_string())?;
@@ -1332,7 +1362,7 @@ fn term_pgid(pid: i32) {
     let _ = Command::new("kill").args(["-TERM", &format!("-{pid}")]).status();
 }
 
-/// 探活（kill -0）+ 仍存活则补 SIGKILL 兜底——SIGTERM 可被忽略或来不及处理（尤其 claude CLI
+/// 探活（kill -0）+ 仍存活则补 SIGKILL 兜底——SIGTERM 可被忽略或来不及处理（尤其 AI CLI
 /// 这类外部二进制，退出行为不受本仓库控制），发完 TERM 不代表进程组真的没了。
 #[cfg(unix)]
 fn kill_pgid_if_alive(pid: i32) {
@@ -1347,7 +1377,7 @@ fn kill_pgid_if_alive(pid: i32) {
 }
 
 /// 应用退出（Cmd+Q / 系统关闭请求，不止是点了「停止执行」）前的兜底清理：把 RUN_PGIDS 里登记的
-/// 进程组全部收掉，避免 python/run_flow/auto_repair/claude 在应用主进程消失后变成孤儿进程继续
+/// 进程组全部收掉，避免 python/run_flow/auto_repair/AI CLI 在应用主进程消失后变成孤儿进程继续
 /// 留在后台。同步阻塞最多 2 秒——应用本就在退出，等这一下换干净收尾是值得的。
 pub fn kill_all_run_pgids_blocking() {
     let entries: Vec<(String, i32)> = RUN_PGIDS.lock().unwrap().clone();
@@ -1367,7 +1397,7 @@ pub fn kill_all_run_pgids_blocking() {
 }
 
 /// 中止当前正在跑的所有 run：向每个已登记的进程组发 SIGTERM（可捕获，让 run_flow/auto_repair
-/// 有机会补记「已中止」日志后退出），整组 python→bash→adb→claude 一起收。多设备并行时每台
+/// 有机会补记「已中止」日志后退出），整组 python→bash→adb→AI CLI 一起收。多设备并行时每台
 /// 设备一个进程组，全部一起停。没有在跑的 run 返回 false。SIGTERM 发出后台延迟探活，
 /// 对未响应的补发 SIGKILL 兜底，不阻塞本次调用返回。
 #[tauri::command]
@@ -1402,7 +1432,7 @@ fn python_cmd(root: &Path, python: &str, args: &[String], slug: Option<&str>) ->
     let mut cmd = Command::new(python);
     cmd.args(args).current_dir(root);
     // stdout 接的是管道（非 tty），CPython 默认走全缓冲（~8KB）而非行缓冲：auto_repair.py
-    // 里"Claude 接管诊断中…"这类关键播报会一直堆在缓冲区，直到诊断结束（可能卡 1-6 分钟）
+    // 里"AI 接管诊断中…"这类关键播报会一直堆在缓冲区，直到诊断结束（可能卡 1-6 分钟）
     // 才一次性冒出来，执行台日志区看起来像"卡住不动"。强制无缓冲让每行 print 立即到达管道。
     cmd.env("PYTHONUNBUFFERED", "1");
     // 注意：这里【不要】注入 LANG/LC_ALL=…UTF-8。中文字段在日志里显示成 ���� 的根因不是
@@ -1456,7 +1486,7 @@ pub async fn run_flow(
     .map_err(|e| e.to_string())?
 }
 
-/// 「Claude」自愈执行 —— 替代 run_flow：spawn auto_repair.py（跑固化脚本，失败则 claude 诊断+
+/// AI 自愈执行 —— 替代 run_flow：spawn auto_repair.py（跑固化脚本，失败则所选 CLI 诊断+
 /// 只改导航/健壮性重跑，至多 3 次；判定 App 缺陷则停并记「需人工介入」）。与 run_flow 一个模子。
 #[tauri::command]
 pub async fn run_flow_repair(
@@ -1478,9 +1508,15 @@ pub async fn run_flow_repair(
             args.push(serial);
         }
         let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
-        // 设置页选的自愈模型：auto_repair.py 用 os.environ.get("AUTO_REPAIR_MODEL", "claude-sonnet-5")，
-        // 这里显式设置（哪怕是空串="跟随 CLI 默认"）会覆盖它自己的默认值，见该文件顶部注释。
-        cmd.env("AUTO_REPAIR_MODEL", &cfg.claude_model);
+        // 全局引擎 + 该引擎的模型，两条 headless 链路必须同源。模型显式设置哪怕是空串也有意义：
+        // 空串表示不加 --model，跟随对应 CLI 默认。
+        let model = if cfg.ai_provider == "codex" {
+            &cfg.codex_model
+        } else {
+            &cfg.claude_model
+        };
+        cmd.env("AI_PROVIDER", &cfg.ai_provider);
+        cmd.env("AUTO_REPAIR_MODEL", model);
         // auto_repair.py 转手调 run_flow.py 时 env=os.environ.copy()，同样会把这里注入的
         // LANG_CODE/AITEST_FOLLOW_DEVICE 一路透传下去，见 run_flow 里的注释。
         if let Some(lc) = lang_code.filter(|s| !s.is_empty()) {
@@ -1647,7 +1683,7 @@ pub async fn sync_sheets(app: AppHandle, app_slug: String, on_event: Channel<Str
 }
 
 /// 把执行台这一格的终态落进账本（judge_result.py）—— 跑完 run_flow/run_flow_repair 后，
-/// 执行台自动对这一格调一次；纯确定性映射，不调 claude：pass/healed→通过，fail→失败
+/// 执行台自动对这一格调一次；纯确定性映射，不调 AI：pass/healed→通过，fail→失败
 /// （固化脚本自己已按 exit 码判过了，不豁免已知缺陷），app_defect/needs_human→需复核。
 /// track=true：随整个 run 一起被「中止任务」杀掉。
 #[tauri::command]
@@ -1677,7 +1713,7 @@ pub async fn judge_result(
 }
 
 /// 自动登记问题清单（issue_register.py）—— 执行台收尾时，对失败/需复核的用例逐条调一次，让
-/// headless claude 读证据把一条结构化问题写进 issues.csv（前缀由终态确定性映射，claude 只写描述
+/// 所选 headless AI CLI 读证据把一条结构化问题写进 issues.csv（前缀由终态确定性映射，AI 只写描述
 /// 字段+查重，见 decisions.md #35）。必须排在 sync_sheets/doc_report 之前（那两个要读 issues.csv）。
 /// track=false：收尾阶段跑，不进「中止」进程组（执行已结束，不需被 abort_run 杀）。
 #[tauri::command]
@@ -1699,9 +1735,13 @@ pub async fn register_issue(
         args.push("--status".to_string());
         args.push(status);
         let mut cmd = python_cmd(&root, &cfg.python, &args, Some(&app_slug));
-        // 与 run_flow_repair 同一个设置项：issue_register.py 用 ISSUE_REGISTER_MODEL 环境变量
-        // （默认 os.environ.get(..., "claude-sonnet-5")），显式设置（含空串）会覆盖其自身默认值。
-        cmd.env("ISSUE_REGISTER_MODEL", &cfg.claude_model);
+        let model = if cfg.ai_provider == "codex" {
+            &cfg.codex_model
+        } else {
+            &cfg.claude_model
+        };
+        cmd.env("AI_PROVIDER", &cfg.ai_provider);
+        cmd.env("ISSUE_REGISTER_MODEL", model);
         stream_child(cmd, on_event, None)
     })
     .await
@@ -2200,27 +2240,46 @@ pub fn fix_gui_app_path() {
     std::env::set_var("PATH", dirs.join(":"));
 }
 
-/// 找 claude 可执行文件：GUI app 的 PATH 常不含用户 shell 里的目录，先显式查常见安装位置，
-/// 再用 which 兜底。
-fn find_claude_bin() -> Option<String> {
+/// 找本机 AI CLI：GUI app 的 PATH 常不含用户 shell 里的目录，先显式查常见安装位置，再用
+/// which/where 兜底。Claude 与 Codex 都可能由 npm、bun 或独立安装器放进这些用户目录。
+fn find_ai_cli_bin(name: &str) -> Option<String> {
     let mut cands: Vec<PathBuf> = vec![];
     if let Ok(home) = std::env::var("HOME") {
-        cands.push(PathBuf::from(&home).join(".local/bin/claude"));
+        cands.push(PathBuf::from(&home).join(".local/bin").join(name));
+        cands.push(PathBuf::from(&home).join(".npm-global/bin").join(name));
+        cands.push(PathBuf::from(&home).join(".bun/bin").join(name));
     }
-    cands.push(PathBuf::from("/opt/homebrew/bin/claude"));
-    cands.push(PathBuf::from("/usr/local/bin/claude"));
+    #[cfg(target_os = "windows")]
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        cands.push(
+            PathBuf::from(appdata)
+                .join("npm")
+                .join(format!("{name}.cmd")),
+        );
+    }
+    cands.push(PathBuf::from("/opt/homebrew/bin").join(name));
+    cands.push(PathBuf::from("/usr/local/bin").join(name));
     for c in &cands {
         if c.exists() {
             return Some(c.to_string_lossy().to_string());
         }
     }
-    if let Ok(o) = Command::new("which").arg("claude").output() {
+    let locator = if cfg!(target_os = "windows") {
+        "where"
+    } else {
+        "which"
+    };
+    if let Ok(o) = Command::new(locator).arg(name).output() {
         let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-        if !s.is_empty() {
-            return Some(s);
+        if let Some(first) = s.lines().next().filter(|line| !line.is_empty()) {
+            return Some(first.to_string());
         }
     }
     None
+}
+
+fn find_claude_bin() -> Option<String> {
+    find_ai_cli_bin("claude")
 }
 
 /// 是否已登录：只查凭据存在性，不解锁/不读密钥（避免打包 app 触发 keychain 授权弹框）。
@@ -2310,6 +2369,92 @@ pub fn check_claude_cli() -> ClaudeCliStatus {
         display_name,
         org_name,
         subscription,
+    }
+}
+
+// 设置页的统一状态协议。Claude 的账号细节来自 ~/.claude.json；Codex 官方 CLI 当前只稳定提供
+// `codex login status` 的登录方式文案，不猜测账号邮箱/订阅档位。
+#[derive(Serialize)]
+pub struct AiCliStatus {
+    pub provider: String,
+    pub installed: bool,
+    pub path: String,
+    pub version: String,
+    pub logged_in: bool,
+    pub detail: String,
+    pub subscription: String,
+}
+
+fn check_codex_cli() -> AiCliStatus {
+    let bin = find_ai_cli_bin("codex");
+    let installed = bin.is_some();
+    let path = bin.clone().unwrap_or_default();
+    let mut version = String::new();
+    if let Some(p) = &bin {
+        if let Ok(output) = Command::new(p).arg("--version").output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            // 当前格式是 "codex-cli 0.158.0"；取末段，同时兼容未来只输出版本号。
+            version = stdout.split_whitespace().last().unwrap_or("").to_string();
+        }
+    }
+
+    let mut logged_in = false;
+    let mut detail = String::new();
+    if let Some(p) = &bin {
+        if let Ok(output) = Command::new(p).args(["login", "status"]).output() {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            logged_in = output.status.success() && combined.contains("Logged in");
+            detail = combined
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with("Logged in"))
+                .unwrap_or("")
+                .to_string();
+        }
+    }
+
+    AiCliStatus {
+        provider: "codex".into(),
+        installed,
+        path,
+        version,
+        logged_in,
+        detail,
+        subscription: String::new(),
+    }
+}
+
+#[tauri::command]
+pub fn check_ai_cli(provider: String) -> Result<AiCliStatus, String> {
+    match provider.as_str() {
+        "codex" => Ok(check_codex_cli()),
+        "claude" => {
+            let status = check_claude_cli();
+            let mut parts = Vec::new();
+            if !status.display_name.is_empty() {
+                parts.push(status.display_name.clone());
+            }
+            if !status.email.is_empty() {
+                parts.push(status.email.clone());
+            }
+            if !status.org_name.is_empty() {
+                parts.push(status.org_name.clone());
+            }
+            Ok(AiCliStatus {
+                provider: "claude".into(),
+                installed: status.installed,
+                path: status.path,
+                version: status.version,
+                logged_in: status.logged_in,
+                detail: parts.join(" · "),
+                subscription: status.subscription,
+            })
+        }
+        _ => Err(format!("不支持的 AI 引擎：{provider}")),
     }
 }
 

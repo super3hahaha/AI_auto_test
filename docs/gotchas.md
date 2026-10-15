@@ -1,5 +1,49 @@
 # gotchas —— 已知坑（踩到直接记 GAP/BLOCK 继续，别卡死）
 
+## Codex headless 的 `-a never` 必须放在 `exec` 前（2026-10-15）
+
+当前本机 `codex-cli 0.158.0` 把 `--ask-for-approval/-a` 定义为全局参数：正确写法是
+`codex -a never exec ...`。写成 `codex exec -a never ...` 会直接 exit 2，因为 `exec` 子命令不认这个
+位置的参数。不要照旧版示例把 approval flag 随手塞到 `exec` 后；命令构造统一走 `tools/ai_cli.py`，
+并由 `tools/tests/test_ai_cli.py` 锁住参数顺序。
+
+## OUT-SEL 退出多选模式用系统 BACK，不依赖 `Navigate up` desc（2026-10-12）
+
+`flow_out_sel.sh` 原先用 `tapdesc "Navigate up"` 退出选择页；当前真机顶部返回按钮不再暴露该英文
+accessibility desc，导致查找超时。改为 `$AK key KEYCODE_BACK`，随后仍以普通列表稳定控件
+`id=multi` 作为退出成功门控。SM-N9600 真机复跑已确认这一步通过并回到普通 Outputs 列表。
+
+同一轮继续执行后暴露两个脚本假设问题，现已补强：
+
+- 长按不能依赖 `recycler_view --child 0,0,1` 这类匿名子节点路径，层级变动就会越界。当前 UI 树
+  每条真实列表行自身都有稳定 `id=item_view` 且 `long-clickable=true`，改用
+  `longpressid item_view --index 0`；adbkit 仍从当屏 bounds 动态计算长按点，跨分辨率不写死坐标。
+- 系统 MediaProvider 的 `dialog_title` 权限框受设备和既有授权状态影响，不保证每次出现。App 内
+  删除确认框必须处理；系统权限框出现就确认，不出现不判失败。删除成败统一由结果闭环判断：回到
+  普通列表、总数从 N 变为 N-1、目标文件从 MediaStore 记录消失。
+
+补强后在 SM-N9600 真机完整复跑通过：`item_view` 长按后计数为 `1/23`；本轮系统权限框未出现，
+删除仍成功完成，总数 `23→22`，目标文件从 MediaStore 消失，随后分享面板及 logscan 均通过，
+脚本最终 `FAILED=0`、`exit=0`。
+
+## 合并首页入口用 `tv_merge`，不要用旧的 `ll_merge` 或固定英文文案（2026-10-12）
+
+合并入口的稳定选择器是 `resource-id=tv_merge`。旧流程若用 `ll_merge` 或首页截图断言固定文本
+`Audio Merger`，在入口改名/语言变化后会在第一张截图就失败，甚至还没执行真正的合并路径。合并
+相关固化脚本统一先 `waitfor id tv_merge`，再用 `tapid tv_merge`；首页门控不再依赖入口显示文案。
+
+## SeekBar 跨分辨率设最大值：bounds 相对滑动后必须读值闭环（2026-10-12）
+
+SM-N9600 上用 `tapid progress_bar` 点控件几何中心只得到 `48.0`，不能假设控件中心在所有设备上
+都精确对应 `50.0`。`MERGE-CROSSFADE-01` 后续目标改为最大值 `100.0`：每次现场读取
+`progress_bar` bounds，起点按录制轨迹取宽度 `48‰`，纵坐标取高度 `713‰`，终点直接取右边界
+内侧 `right-1`；先校验 bounds 和计算坐标没有退化/越界，再通过 `adbkit swipe` 操作。滑动后必须
+读取该 SeekBar 自身的 `text`，不是 `100.0` 就重新取 bounds 再试一次，仍不满足则 `FAILED=1`。
+
+2026-10-12 在 SM-N9600（2400×1080）首次滑动即得到 `100.0`，完整流程 `exit=0`。这只能证明
+该设备已通过，不能数学上保证所有设备；跨分辨率可靠性来自“按 bounds 缩放、操作后读值、有限重试，
+最终不满足即失败”的闭环，而不是宣称某组相对坐标天然适配所有 SeekBar 实现。
+
 来自对原表一次真实跑动的复盘，纯模拟器路径最常见的几个约束：
 
 - **App 必须 debuggable**：`run-as` 才能读 App 私有目录（DB/SP）。用非 debug 包 → `db`/`sp` 命令全失败。装可调试版本。

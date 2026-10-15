@@ -55,6 +55,7 @@ pub fn run() {
             commands::register_issue,
             commands::doc_report,
             commands::check_claude_cli,
+            commands::check_ai_cli,
             commands::probe_apk,
             commands::install_apk,
             commands::register_app,
@@ -71,7 +72,7 @@ pub fn run() {
         .expect("error while building tauri application")
         .run(|_app_handle, event| {
             // 覆盖 Cmd+Q/系统关闭请求等一切退出路径，不止「停止执行」按钮：兜底把还挂着的
-            // run 进程组一起收掉，避免 python/auto_repair/claude 变成孤儿进程留在后台。
+            // run 进程组一起收掉，避免 python/auto_repair/AI CLI 变成孤儿进程留在后台。
             if let tauri::RunEvent::Exit = event {
                 commands::kill_all_run_pgids_blocking();
                 commands::kill_all_rec_sessions_blocking(); // 录制 daemon（含其 scrcpy 子进程）也不留孤儿
